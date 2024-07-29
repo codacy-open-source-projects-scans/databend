@@ -1,0 +1,233 @@
+statement ok
+drop database if exists aggregate_property
+
+statement ok
+create database aggregate_property
+
+statement ok
+use aggregate_property
+
+statement ok
+set max_threads = 1
+
+statement ok
+create table t_10(a int) as select * from numbers(10)
+
+statement ok
+create table t_100(a int) as select * from numbers(100)
+
+statement ok
+create table t_1000(a int) as select * from numbers(1000)
+
+query T
+explain memo
+select sum(t_1000.a) from t_10, t_100, t_1000
+where t_10.a = t_1000.a and t_100.a = t_1000.a
+----
+Memo
+├── root group: #8
+├── estimated memory: 9.00 KiB
+├── Group #0
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 1000.000, children: []
+│   │   └── { dist: Hash(t_1000.a (#2)::Int32 NULL) }: expr: #1, cost: 52000.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   └── #1 Exchange: (Hash(t_1000.a (#2)::Int32 NULL)) [#0]
+├── Group #1
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 100.000, children: []
+│   │   └── { dist: Hash(t_100.a (#1)::Int32 NULL) }: expr: #1, cost: 5200.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   └── #1 Exchange: (Hash(t_100.a (#1)::Int32 NULL)) [#1]
+├── Group #2
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 10.000, children: []
+│   │   ├── { dist: Broadcast }: expr: #1, cost: 1010.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #2, cost: 520.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   ├── #1 Exchange: (Broadcast) [#2]
+│   └── #2 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#2]
+├── Group #3
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 1310.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   │   ├── { dist: Broadcast }: expr: #1, cost: 2310.000, children: [{ dist: Any }]
+│   │   ├── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #2, cost: 1820.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_100.a (#1)::Int32 NULL) }: expr: #0, cost: 6410.000, children: [{ dist: Hash(t_100.a (#1)::Int32 NULL) }, { dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   ├── #0 Join [#1, #2]
+│   ├── #1 Exchange: (Broadcast) [#3]
+│   ├── #2 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#3]
+│   └── #3 Exchange: (Hash(t_100.a (#1)::Int32 NULL)) [#3]
+├── Group #4
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 4410.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   └── #0 Join [#0, #3]
+├── Group #5
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 4420.000, children: [{ dist: Any }]
+│   │   └── { dist: Serial }: expr: #1, cost: 7920.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#4]
+│   └── #1 Exchange: (Merge) [#5]
+├── Group #6
+│   ├── Best properties
+│   │   └── { dist: Serial }: expr: #0, cost: 7970.000, children: [{ dist: Serial }]
+│   ├── #0 Aggregate [#5]
+│   └── #1 Exchange: (Merge) [#6]
+├── Group #7
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 7975.000, children: [{ dist: Serial }]
+│   └── #0 Aggregate [#6]
+└── Group #8
+    ├── Best properties
+    │   └── { dist: Serial }: expr: #0, cost: 7976.000, children: [{ dist: Any }]
+    └── #0 EvalScalar [#7]
+
+query T
+explain memo
+select sum(t_1000.a) from t_10, t_100, t_1000
+where t_10.a = t_1000.a and t_100.a = t_1000.a
+group by t_10.a, t_100.a
+----
+Memo
+├── root group: #8
+├── estimated memory: 22.50 KiB
+├── Group #0
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 1000.000, children: []
+│   │   └── { dist: Hash(t_1000.a (#2)::Int32 NULL) }: expr: #1, cost: 52000.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   └── #1 Exchange: (Hash(t_1000.a (#2)::Int32 NULL)) [#0]
+├── Group #1
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 100.000, children: []
+│   │   └── { dist: Hash(t_100.a (#1)::Int32 NULL) }: expr: #1, cost: 5200.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   └── #1 Exchange: (Hash(t_100.a (#1)::Int32 NULL)) [#1]
+├── Group #2
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 10.000, children: []
+│   │   ├── { dist: Broadcast }: expr: #1, cost: 1010.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #2, cost: 520.000, children: [{ dist: Any }]
+│   ├── #0 Scan []
+│   ├── #1 Exchange: (Broadcast) [#2]
+│   └── #2 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#2]
+├── Group #3
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 1310.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   │   ├── { dist: Broadcast }: expr: #1, cost: 2310.000, children: [{ dist: Any }]
+│   │   ├── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #2, cost: 1820.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_100.a (#1)::Int32 NULL) }: expr: #0, cost: 5920.000, children: [{ dist: Hash(t_100.a (#1)::Int32 NULL) }, { dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   ├── #0 Join [#1, #2]
+│   ├── #1 Exchange: (Broadcast) [#3]
+│   ├── #2 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#3]
+│   └── #3 Exchange: (Hash(t_100.a (#1)::Int32 NULL)) [#3]
+├── Group #4
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 4410.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   └── #0 Join [#0, #3]
+├── Group #5
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 4420.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #1, cost: 4930.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#4]
+│   └── #1 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#5]
+├── Group #6
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 4980.000, children: [{ dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   └── #0 Aggregate [#5]
+├── Group #7
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 5030.000, children: [{ dist: Any }]
+│   └── #0 Aggregate [#6]
+├── Group #8
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 5040.000, children: [{ dist: Any }]
+│   │   └── { dist: Serial }: expr: #4, cost: 8540.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#7]
+│   ├── #1 EvalScalar [#14]
+│   ├── #2 EvalScalar [#20]
+│   ├── #3 EvalScalar [#24]
+│   └── #4 Exchange: (Merge) [#8]
+├── Group #9
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 2000.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_1000.a (#2)::Int32 NULL) }: expr: #1, cost: 53000.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#0]
+│   └── #1 Exchange: (Hash(t_1000.a (#2)::Int32 NULL)) [#9]
+├── Group #10
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 58000.000, children: [{ dist: Hash(t_1000.a (#2)::Int32 NULL) }]
+│   └── #0 Aggregate [#9]
+├── Group #11
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 63000.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_1000.a (#2)::Int32 NULL) }: expr: #1, cost: 114000.000, children: [{ dist: Any }]
+│   ├── #0 Aggregate [#10]
+│   └── #1 Exchange: (Hash(t_1000.a (#2)::Int32 NULL)) [#11]
+├── Group #12
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 66410.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #1, cost: 66920.000, children: [{ dist: Any }]
+│   ├── #0 Join [#11, #3]
+│   └── #1 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#12]
+├── Group #13
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 66970.000, children: [{ dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   └── #0 Aggregate [#12]
+├── Group #14
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 67020.000, children: [{ dist: Any }]
+│   └── #0 Aggregate [#13]
+├── Group #15
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 1870.000, children: [{ dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   └── #0 Aggregate [#3]
+├── Group #16
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 1920.000, children: [{ dist: Any }]
+│   │   ├── { dist: Broadcast }: expr: #3, cost: 2920.000, children: [{ dist: Any }]
+│   │   ├── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #1, cost: 2430.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_100.a (#1)::Int32 NULL) }: expr: #2, cost: 2430.000, children: [{ dist: Any }]
+│   ├── #0 Aggregate [#15]
+│   ├── #1 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#16]
+│   ├── #2 Exchange: (Hash(t_100.a (#1)::Int32 NULL)) [#16]
+│   └── #3 Exchange: (Broadcast) [#16]
+├── Group #17
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 5020.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   └── #0 Join [#0, #16]
+├── Group #18
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 5030.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #1, cost: 5540.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#17]
+│   └── #1 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#18]
+├── Group #19
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 5590.000, children: [{ dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   └── #0 Aggregate [#18]
+├── Group #20
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 5640.000, children: [{ dist: Any }]
+│   └── #0 Aggregate [#19]
+├── Group #21
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 67020.000, children: [{ dist: Any }, { dist: Broadcast }]
+│   └── #0 Join [#11, #16]
+├── Group #22
+│   ├── Best properties
+│   │   ├── { dist: Any }: expr: #0, cost: 67030.000, children: [{ dist: Any }]
+│   │   └── { dist: Hash(t_10.a (#0)::Int32 NULL) }: expr: #1, cost: 67540.000, children: [{ dist: Any }]
+│   ├── #0 EvalScalar [#21]
+│   └── #1 Exchange: (Hash(t_10.a (#0)::Int32 NULL)) [#22]
+├── Group #23
+│   ├── Best properties
+│   │   └── { dist: Any }: expr: #0, cost: 67590.000, children: [{ dist: Hash(t_10.a (#0)::Int32 NULL) }]
+│   └── #0 Aggregate [#22]
+└── Group #24
+    ├── Best properties
+    │   └── { dist: Any }: expr: #0, cost: 67640.000, children: [{ dist: Any }]
+    └── #0 Aggregate [#23]
+
+
+statement ok
+drop database aggregate_property

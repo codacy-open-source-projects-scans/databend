@@ -1,0 +1,1143 @@
+statement ok
+drop table if exists t1 all
+
+statement ok
+drop table if exists t2 all
+
+statement ok
+create table t1 as select number as a, number as b from numbers(1)
+
+statement ok
+create table t2 as select number as a, number as b from numbers(5)
+
+query T
+explain select t1.a from t1 where a > 0
+----
+TableScan
+├── table: default.default.t1
+├── output columns: [a (#0)]
+├── read rows: 0
+├── read size: 0
+├── partitions total: 1
+├── partitions scanned: 0
+├── pruning stats: [segments: <range pruning: 1 to 0>]
+├── push downs: [filters: [t1.a (#0) > 0], limit: NONE]
+└── estimated rows: 0.00
+
+query T
+explain select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a and t2.a > 5 and t1.a > 1)
+----
+Filter
+├── output columns: [t2.a (#2), t2.b (#3), t1.b (#1), t1.a (#0)]
+├── filters: [t1.a (#0) > 3 OR t2.a (#2) > 5 AND t1.a (#0) > 1]
+├── estimated rows: 0.00
+└── HashJoin
+    ├── output columns: [t2.a (#2), t2.b (#3), t1.b (#1), t1.a (#0)]
+    ├── join type: INNER
+    ├── build keys: [t1.a (#0)]
+    ├── probe keys: [t2.a (#2)]
+    ├── filters: []
+    ├── estimated rows: 0.00
+    ├── TableScan(Build)
+    │   ├── table: default.default.t1
+    │   ├── output columns: [a (#0), b (#1)]
+    │   ├── read rows: 0
+    │   ├── read size: 0
+    │   ├── partitions total: 1
+    │   ├── partitions scanned: 0
+    │   ├── pruning stats: [segments: <range pruning: 1 to 0>]
+    │   ├── push downs: [filters: [t1.a (#0) > 3 OR t1.a (#0) > 1], limit: NONE]
+    │   └── estimated rows: 0.00
+    └── TableScan(Probe)
+        ├── table: default.default.t2
+        ├── output columns: [a (#2), b (#3)]
+        ├── read rows: 5
+        ├── read size: < 1 KiB
+        ├── partitions total: 1
+        ├── partitions scanned: 1
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+        ├── push downs: [filters: [t2.a (#2) > 3 OR t2.a (#2) > 1], limit: NONE]
+        └── estimated rows: 3.40
+
+query T
+explain select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a)
+----
+HashJoin
+├── output columns: [t2.a (#2), t2.b (#3), t1.b (#1), t1.a (#0)]
+├── join type: INNER
+├── build keys: [t1.a (#0)]
+├── probe keys: [t2.a (#2)]
+├── filters: []
+├── estimated rows: 1.00
+├── TableScan(Build)
+│   ├── table: default.default.t1
+│   ├── output columns: [a (#0), b (#1)]
+│   ├── read rows: 1
+│   ├── read size: < 1 KiB
+│   ├── partitions total: 1
+│   ├── partitions scanned: 1
+│   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│   ├── push downs: [filters: [], limit: NONE]
+│   └── estimated rows: 1.00
+└── TableScan(Probe)
+    ├── table: default.default.t2
+    ├── output columns: [a (#2), b (#3)]
+    ├── read rows: 5
+    ├── read size: < 1 KiB
+    ├── partitions total: 1
+    ├── partitions scanned: 1
+    ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    ├── push downs: [filters: [], limit: NONE]
+    └── estimated rows: 5.00
+
+query T
+explain raw select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a)
+----
+EvalScalar
+├── scalars: [t1.a (#0) AS (#0), t1.b (#1) AS (#1), t2.a (#2) AS (#2), t2.b (#3) AS (#3)]
+└── Filter
+    ├── filters: [or(and(eq(t1.a (#0), t2.a (#2)), gt(t1.a (#0), 3)), eq(t1.a (#0), t2.a (#2)))]
+    └── Join(Cross)
+        ├── build keys: []
+        ├── probe keys: []
+        ├── other filters: []
+        ├── Scan
+        │   ├── table: default.t1
+        │   ├── filters: []
+        │   ├── order by: []
+        │   └── limit: NONE
+        └── Scan
+            ├── table: default.t2
+            ├── filters: []
+            ├── order by: []
+            └── limit: NONE
+
+query T
+explain raw select * from t1 inner join t2 on t1.a = t2.a and t1.b = t2.b and t1.a > 2
+----
+EvalScalar
+├── scalars: [t1.a (#0) AS (#0), t1.b (#1) AS (#1), t2.a (#2) AS (#2), t2.b (#3) AS (#3)]
+└── Join(Inner)
+    ├── build keys: [t2.a (#2), t2.b (#3)]
+    ├── probe keys: [t1.a (#0), t1.b (#1)]
+    ├── other filters: []
+    ├── Filter
+    │   ├── filters: [gt(t1.a (#0), 2)]
+    │   └── Scan
+    │       ├── table: default.t1
+    │       ├── filters: []
+    │       ├── order by: []
+    │       └── limit: NONE
+    └── Scan
+        ├── table: default.t2
+        ├── filters: []
+        ├── order by: []
+        └── limit: NONE
+
+query T
+explain syntax select 1, 'ab', [1,2,3], (1, 'a')
+----
+SELECT
+    1,
+    'ab',
+    [1, 2, 3],
+    (1, 'a')
+
+query T
+explain syntax select a, sum(b) as sum from t1 where a in (1, 2) and b > 0 and b < 100 group by a order by a
+----
+SELECT
+    a,
+    sum(b) AS sum
+FROM
+    t1
+WHERE
+    (
+        (
+            a IN (1, 2)
+            AND (b > 0)
+        )
+        AND (b < 100)
+    )
+GROUP BY a
+ORDER BY a
+
+query T
+explain syntax select * from t1 inner join t2 on t1.a = t2.a and t1.b = t2.b and t1.a > 2
+----
+SELECT *
+FROM
+    t1
+    INNER JOIN t2 ON (
+        (
+            (t1.a = t2.a)
+            AND (t1.b = t2.b)
+        )
+        AND (t1.a > 2)
+    )
+
+query T
+explain syntax delete from t1 where a > 100 and b > 1 and b < 10
+----
+DELETE FROM
+    t1
+WHERE
+    (
+        (
+            (a > 100)
+            AND (b > 1)
+        )
+        AND (b < 10)
+    )
+
+
+query T
+explain syntax copy into t1 from 's3://mybucket/data.csv' file_format = ( type = CSV field_delimiter = ',' record_delimiter = '\n' skip_header = 1) size_limit=10
+----
+COPY
+INTO t1
+FROM 's3://mybucket/data.csv'
+FILE_FORMAT = (
+    field_delimiter = ',',
+    record_delimiter = '\n',
+    skip_header = 1,
+    type = CSV
+)
+SIZE_LIMIT = 10
+PURGE = false
+DISABLE_VARIANT_CHECK = false
+
+
+query T
+explain syntax copy into 's3://mybucket/data.csv' from t1 file_format = ( type = CSV field_delimiter = ',' record_delimiter = '\n' skip_header = 1)
+----
+COPY
+INTO Uri(UriLocation { protocol: "s3", name: "mybucket", path: "/data.csv", part_prefix: "", connection: Connection { visited_keys: {}, conns: {} } })
+FROM t1
+FILE_FORMAT = (
+    field_delimiter = ',',
+    record_delimiter = '\n',
+    skip_header = 1,
+    type = CSV
+)
+SINGLE = false
+
+query T
+explain syntax create table t3(a int64, b uint64, c float64, d string, e array(int32), f tuple(f1 bool, f2 string)) engine=fuse cluster by (a, b, c) comment='test' compression='LZ4'
+----
+CREATE TABLE t3 (
+    a Int64,
+    b UInt64,
+    c Float64,
+    d STRING,
+    e ARRAY(Int32),
+    f TUPLE(f1 BOOLEAN, f2 STRING)
+) ENGINE = FUSE
+CLUSTER BY (
+    a,
+    b,
+    c
+)
+comment = 'test',
+compression = 'LZ4'
+
+query T
+explain syntax create view v as select number % 3 as a from numbers(100) where number > 10
+----
+CREATE VIEW v
+AS
+    SELECT (number % 3) AS a
+    FROM
+        numbers(100)
+    WHERE
+        (number > 10)
+
+query T
+explain ast select 1, 'ab', [1,2,3] as a, (1, 'a') as t
+----
+Query (children 1)
+└── QueryBody (children 1)
+    └── SelectQuery (children 1)
+        └── SelectList (children 4)
+            ├── Target (children 1)
+            │   └── Literal UInt64(1)
+            ├── Target (children 1)
+            │   └── Literal String("ab")
+            ├── Target (alias a) (children 1)
+            │   └── Literal Array (children 3)
+            │       ├── Literal UInt64(1)
+            │       ├── Literal UInt64(2)
+            │       └── Literal UInt64(3)
+            └── Target (alias t) (children 1)
+                └── Literal Tuple (children 2)
+                    ├── Literal UInt64(1)
+                    └── Literal String("a")
+
+query T
+explain ast select case when a > 1 then 'x' when a < 10 then 'y' else 'z' end from t1
+----
+Query (children 1)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 1)
+        │   └── Target (children 1)
+        │       └── Function Case (children 3)
+        │           ├── Conditions (children 2)
+        │           │   ├── Function > (children 2)
+        │           │   │   ├── ColumnIdentifier a
+        │           │   │   └── Literal UInt64(1)
+        │           │   └── Function < (children 2)
+        │           │       ├── ColumnIdentifier a
+        │           │       └── Literal UInt64(10)
+        │           ├── Results (children 2)
+        │           │   ├── Literal String("x")
+        │           │   └── Literal String("y")
+        │           └── ElseResult (children 1)
+        │               └── Literal String("z")
+        └── TableList (children 1)
+            └── TableIdentifier t1
+
+query T
+explain ast select a, sum(b) as sum from t1 where a in (1, 2) and b > 0 and b < 100 group by a order by a limit 3
+----
+Query (children 3)
+├── QueryBody (children 1)
+│   └── SelectQuery (children 4)
+│       ├── SelectList (children 2)
+│       │   ├── Target (children 1)
+│       │   │   └── ColumnIdentifier a
+│       │   └── Target (alias sum) (children 1)
+│       │       └── Function sum (children 1)
+│       │           └── ColumnIdentifier b
+│       ├── TableList (children 1)
+│       │   └── TableIdentifier t1
+│       ├── Where (children 1)
+│       │   └── Function AND (children 2)
+│       │       ├── Function AND (children 2)
+│       │       │   ├── Function In (children 2)
+│       │       │   │   ├── ColumnIdentifier a
+│       │       │   │   └── List (children 2)
+│       │       │   │       ├── Literal UInt64(1)
+│       │       │   │       └── Literal UInt64(2)
+│       │       │   └── Function > (children 2)
+│       │       │       ├── ColumnIdentifier b
+│       │       │       └── Literal UInt64(0)
+│       │       └── Function < (children 2)
+│       │           ├── ColumnIdentifier b
+│       │           └── Literal UInt64(100)
+│       └── GroupByList (children 1)
+│           └── ColumnIdentifier a
+├── OrderByList (children 1)
+│   └── OrderByElement (children 1)
+│       └── ColumnIdentifier a
+└── LimitList (children 1)
+    └── Literal UInt64(3)
+
+query T
+explain ast select * from t1 inner join t2 on t1.a = t2.a and t1.b = t2.b and t1.a > 2
+----
+Query (children 1)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 1)
+        │   └── Target *
+        └── TableList (children 1)
+            └── TableJoin (children 1)
+                └── Join (children 3)
+                    ├── TableIdentifier t1
+                    ├── TableIdentifier t2
+                    └── ConditionOn (children 1)
+                        └── Function AND (children 2)
+                            ├── Function AND (children 2)
+                            │   ├── Function = (children 2)
+                            │   │   ├── ColumnIdentifier t1.a
+                            │   │   └── ColumnIdentifier t2.a
+                            │   └── Function = (children 2)
+                            │       ├── ColumnIdentifier t1.b
+                            │       └── ColumnIdentifier t2.b
+                            └── Function > (children 2)
+                                ├── ColumnIdentifier t1.a
+                                └── Literal UInt64(2)
+
+query T
+explain ast with cte (a, b) as (select 1, 2 union all select 3, 4) select a, b from cte
+----
+Query (children 2)
+├── With (children 1)
+│   └── CTE (alias cte(a, b)) (children 1)
+│       └── Query (children 1)
+│           └── QueryBody (children 1)
+│               └── SetOperation Union (children 2)
+│                   ├── QueryBody (children 1)
+│                   │   └── SelectQuery (children 1)
+│                   │       └── SelectList (children 2)
+│                   │           ├── Target (children 1)
+│                   │           │   └── Literal UInt64(1)
+│                   │           └── Target (children 1)
+│                   │               └── Literal UInt64(2)
+│                   └── QueryBody (children 1)
+│                       └── SelectQuery (children 1)
+│                           └── SelectList (children 2)
+│                               ├── Target (children 1)
+│                               │   └── Literal UInt64(3)
+│                               └── Target (children 1)
+│                                   └── Literal UInt64(4)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 2)
+        │   ├── Target (children 1)
+        │   │   └── ColumnIdentifier a
+        │   └── Target (children 1)
+        │       └── ColumnIdentifier b
+        └── TableList (children 1)
+            └── TableIdentifier cte
+
+query T
+explain ast with cte (a, b) as (values(1,2),(3,4)) select a, b from cte
+----
+Query (children 2)
+├── With (children 1)
+│   └── CTE (alias cte(a, b)) (children 1)
+│       └── Query (children 1)
+│           └── QueryBody (children 1)
+│               └── Values (children 2)
+│                   ├── Row 0 (children 2)
+│                   │   ├── Literal UInt64(1)
+│                   │   └── Literal UInt64(2)
+│                   └── Row 1 (children 2)
+│                       ├── Literal UInt64(3)
+│                       └── Literal UInt64(4)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 2)
+        │   ├── Target (children 1)
+        │   │   └── ColumnIdentifier a
+        │   └── Target (children 1)
+        │       └── ColumnIdentifier b
+        └── TableList (children 1)
+            └── TableIdentifier cte
+
+query T
+explain ast insert into t1 (a, b) values (1, 2),(3, 4)
+----
+Insert (children 3)
+├── TableIdentifier t1
+├── Columns (children 2)
+│   ├── Identifier a
+│   └── Identifier b
+└── Source (children 1)
+    └── ValueSource
+
+query T
+explain ast delete from t1 where a > 100 and b > 1 and b < 10
+----
+Delete (children 2)
+├── TableIdentifier t1
+└── Function AND (children 2)
+    ├── Function AND (children 2)
+    │   ├── Function > (children 2)
+    │   │   ├── ColumnIdentifier a
+    │   │   └── Literal UInt64(100)
+    │   └── Function > (children 2)
+    │       ├── ColumnIdentifier b
+    │       └── Literal UInt64(1)
+    └── Function < (children 2)
+        ├── ColumnIdentifier b
+        └── Literal UInt64(10)
+
+
+query T
+explain ast copy into t1 from 's3://mybucket/data.csv' file_format = ( type = CSV field_delimiter = ',' record_delimiter = '\n' skip_header = 1) size_limit=10 max_files=10
+----
+CopyIntoTable (children 7)
+├── TO (children 1)
+│   └── TableIdentifier t1
+├── FROM (children 1)
+│   └── Location 's3://mybucket/data.csv'
+├── FileFormats (children 4)
+│   ├── FileFormat field_delimiter = String(",")
+│   ├── FileFormat record_delimiter = String("\n")
+│   ├── FileFormat skip_header = U64(1)
+│   └── FileFormat type = Keyword("CSV")
+├── SizeLimit 10
+├── MaxFiles 10
+├── Purge false
+└── DisableVariantCheck false
+
+query T
+explain ast create database db1 engine=default
+----
+CreateDatabase (children 2)
+├── DatabaseIdentifier db1
+└── DatabaseEngine DEFAULT
+
+query T
+explain ast create table t3(a int64, b uint64, c float64, d string, e array(int32), f tuple(f1 bool, f2 string)) engine=fuse cluster by (a, b, c) comment='test' compression='LZ4'
+----
+CreateTable (children 5)
+├── TableIdentifier t3
+├── ColumnsDefinition (children 6)
+│   ├── ColumnDefinition a (children 1)
+│   │   └── DataType Int64
+│   ├── ColumnDefinition b (children 1)
+│   │   └── DataType UInt64
+│   ├── ColumnDefinition c (children 1)
+│   │   └── DataType Float64
+│   ├── ColumnDefinition d (children 1)
+│   │   └── DataType STRING
+│   ├── ColumnDefinition e (children 1)
+│   │   └── DataType ARRAY(Int32)
+│   └── ColumnDefinition f (children 1)
+│       └── DataType TUPLE(f1 BOOLEAN, f2 STRING)
+├── TableEngine FUSE
+├── ClusterByList (children 3)
+│   ├── ColumnIdentifier a
+│   ├── ColumnIdentifier b
+│   └── ColumnIdentifier c
+└── TableOptions (children 2)
+    ├── TableOption comment = "test"
+    └── TableOption compression = "LZ4"
+
+query T
+explain ast create view v as select number % 3 as a from numbers(100) where number > 10
+----
+CreateView (children 2)
+├── TableIdentifier v
+└── Query (children 1)
+    └── QueryBody (children 1)
+        └── SelectQuery (children 3)
+            ├── SelectList (children 1)
+            │   └── Target (alias a) (children 1)
+            │       └── Function % (children 2)
+            │           ├── ColumnIdentifier number
+            │           └── Literal UInt64(3)
+            ├── TableList (children 1)
+            │   └── TableFunction numbers (children 1)
+            │       └── Literal UInt64(100)
+            └── Where (children 1)
+                └── Function > (children 2)
+                    ├── ColumnIdentifier number
+                    └── Literal UInt64(10)
+
+query T
+explain ast show create table t1
+----
+ShowCreateTable (children 1)
+└── TableIdentifier t1
+
+query T
+explain ast create user 'test' identified with sha256_password by 'new_password'
+----
+CreateUser (children 3)
+├── User 'test'@'%'
+├── AuthType sha256_password
+└── Password "new_password"
+
+query T
+explain ast select unknown_table.a + 1 from unknown_table1
+----
+Query (children 1)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 1)
+        │   └── Target (children 1)
+        │       └── Function + (children 2)
+        │           ├── ColumnIdentifier unknown_table.a
+        │           └── Literal UInt64(1)
+        └── TableList (children 1)
+            └── TableIdentifier unknown_table1
+
+query T
+explain ast SELECT * FROM monthly_sales PIVOT(SUM(amount) FOR MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) ORDER BY EMPID
+----
+Query (children 2)
+├── QueryBody (children 1)
+│   └── SelectQuery (children 2)
+│       ├── SelectList (children 1)
+│       │   └── Target *
+│       └── TableList (children 1)
+│           └── TableIdentifier monthly_sales PIVOT(SUM(amount) FOR MONTH IN ('JAN', 'FEB', 'MAR', 'APR'))
+└── OrderByList (children 1)
+    └── OrderByElement (children 1)
+         └── ColumnIdentifier EMPID
+
+query T
+explain ast SELECT * FROM monthly_sales_1 UNPIVOT(sales FOR month IN (jan, feb, mar, april)) ORDER BY empid
+----
+Query (children 2)
+├── QueryBody (children 1)
+│   └── SelectQuery (children 2)
+│       ├── SelectList (children 1)
+│       │   └── Target *
+│       └── TableList (children 1)
+│           └── TableIdentifier monthly_sales_1 UNPIVOT(sales FOR month IN (jan, feb, mar, april))
+└── OrderByList (children 1)
+     └── OrderByElement (children 1)
+         └── ColumnIdentifier empid
+
+query T
+explain select a from t1 UNION ALL select a from t2
+----
+UnionAll
+├── output columns: [t1.a (#0)]
+├── estimated rows: 6.00
+├── TableScan
+│   ├── table: default.default.t1
+│   ├── output columns: [a (#0)]
+│   ├── read rows: 1
+│   ├── read size: < 1 KiB
+│   ├── partitions total: 1
+│   ├── partitions scanned: 1
+│   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│   ├── push downs: [filters: [], limit: NONE]
+│   └── estimated rows: 1.00
+└── TableScan
+    ├── table: default.default.t2
+    ├── output columns: [a (#2)]
+    ├── read rows: 5
+    ├── read size: < 1 KiB
+    ├── partitions total: 1
+    ├── partitions scanned: 1
+    ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    ├── push downs: [filters: [], limit: NONE]
+    └── estimated rows: 5.00
+
+query T
+explain select * from t1,t2 where (t1.a > 1 and t2.a > 2) or (t1.b < 3 and t2.b < 4)
+----
+Filter
+├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── filters: [t1.a (#0) > 1 AND t2.a (#2) > 2 OR t1.b (#1) < 3 AND t2.b (#3) < 4]
+├── estimated rows: 3.52
+└── HashJoin
+    ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+    ├── join type: CROSS
+    ├── build keys: []
+    ├── probe keys: []
+    ├── filters: []
+    ├── estimated rows: 4.40
+    ├── TableScan(Build)
+    │   ├── table: default.default.t1
+    │   ├── output columns: [a (#0), b (#1)]
+    │   ├── read rows: 1
+    │   ├── read size: < 1 KiB
+    │   ├── partitions total: 1
+    │   ├── partitions scanned: 1
+    │   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    │   ├── push downs: [filters: [t1.a (#0) > 1 OR t1.b (#1) < 3], limit: NONE]
+    │   └── estimated rows: 1.00
+    └── TableScan(Probe)
+        ├── table: default.default.t2
+        ├── output columns: [a (#2), b (#3)]
+        ├── read rows: 5
+        ├── read size: < 1 KiB
+        ├── partitions total: 1
+        ├── partitions scanned: 1
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+        ├── push downs: [filters: [t2.a (#2) > 2 OR t2.b (#3) < 4], limit: NONE]
+        └── estimated rows: 4.40
+
+query T
+explain select * from t1,t2 where (t1.a > 1 and t2.a > 2) or (t1.b < 3 and t2.b < 4) or t1.a = 2
+----
+Filter
+├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── filters: [t1.a (#0) > 1 AND t2.a (#2) > 2 OR t1.b (#1) < 3 AND t2.b (#3) < 4 OR t1.a (#0) = 2]
+├── estimated rows: 4.00
+└── HashJoin
+    ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+    ├── join type: CROSS
+    ├── build keys: []
+    ├── probe keys: []
+    ├── filters: []
+    ├── estimated rows: 5.00
+    ├── TableScan(Build)
+    │   ├── table: default.default.t1
+    │   ├── output columns: [a (#0), b (#1)]
+    │   ├── read rows: 1
+    │   ├── read size: < 1 KiB
+    │   ├── partitions total: 1
+    │   ├── partitions scanned: 1
+    │   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1, bloom pruning: 1 to 1>]
+    │   ├── push downs: [filters: [t1.a (#0) > 1 OR t1.b (#1) < 3 OR t1.a (#0) = 2], limit: NONE]
+    │   └── estimated rows: 1.00
+    └── TableScan(Probe)
+        ├── table: default.default.t2
+        ├── output columns: [a (#2), b (#3)]
+        ├── read rows: 5
+        ├── read size: < 1 KiB
+        ├── partitions total: 1
+        ├── partitions scanned: 1
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+        ├── push downs: [filters: [], limit: NONE]
+        └── estimated rows: 5.00
+
+statement ok
+drop table if exists t3
+
+statement ok
+create table t3 as select number as a, number as b from numbers(10)
+
+query T
+explain select * from t1,t2, t3 where (t1.a > 1 and t2.a > 2) or (t1.b < 3 and t2.b < 4) or t3.a = 2
+----
+HashJoin
+├── output columns: [t3.a (#4), t3.b (#5), t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── join type: INNER
+├── build keys: []
+├── probe keys: []
+├── filters: [t1.a (#0) > 1 AND t2.a (#2) > 2 OR t1.b (#1) < 3 AND t2.b (#3) < 4 OR t3.a (#4) = 2]
+├── estimated rows: 50.00
+├── HashJoin(Build)
+│   ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+│   ├── join type: CROSS
+│   ├── build keys: []
+│   ├── probe keys: []
+│   ├── filters: []
+│   ├── estimated rows: 5.00
+│   ├── TableScan(Build)
+│   │   ├── table: default.default.t1
+│   │   ├── output columns: [a (#0), b (#1)]
+│   │   ├── read rows: 1
+│   │   ├── read size: < 1 KiB
+│   │   ├── partitions total: 1
+│   │   ├── partitions scanned: 1
+│   │   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│   │   ├── push downs: [filters: [], limit: NONE]
+│   │   └── estimated rows: 1.00
+│   └── TableScan(Probe)
+│       ├── table: default.default.t2
+│       ├── output columns: [a (#2), b (#3)]
+│       ├── read rows: 5
+│       ├── read size: < 1 KiB
+│       ├── partitions total: 1
+│       ├── partitions scanned: 1
+│       ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│       ├── push downs: [filters: [], limit: NONE]
+│       └── estimated rows: 5.00
+└── TableScan(Probe)
+    ├── table: default.default.t3
+    ├── output columns: [a (#4), b (#5)]
+    ├── read rows: 10
+    ├── read size: < 1 KiB
+    ├── partitions total: 1
+    ├── partitions scanned: 1
+    ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    ├── push downs: [filters: [], limit: NONE]
+    └── estimated rows: 10.00
+
+query T
+explain select * from t1,t2, t3 where ((t1.a > 1 and t2.a > 2) or (t1.b < 3 and t2.b < 4)) and t3.a > 1
+----
+HashJoin
+├── output columns: [t3.a (#4), t3.b (#5), t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── join type: CROSS
+├── build keys: []
+├── probe keys: []
+├── filters: []
+├── estimated rows: 28.16
+├── Filter(Build)
+│   ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+│   ├── filters: [t1.a (#0) > 1 AND t2.a (#2) > 2 OR t1.b (#1) < 3 AND t2.b (#3) < 4]
+│   ├── estimated rows: 3.52
+│   └── HashJoin
+│       ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+│       ├── join type: CROSS
+│       ├── build keys: []
+│       ├── probe keys: []
+│       ├── filters: []
+│       ├── estimated rows: 4.40
+│       ├── TableScan(Build)
+│       │   ├── table: default.default.t1
+│       │   ├── output columns: [a (#0), b (#1)]
+│       │   ├── read rows: 1
+│       │   ├── read size: < 1 KiB
+│       │   ├── partitions total: 1
+│       │   ├── partitions scanned: 1
+│       │   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│       │   ├── push downs: [filters: [t1.a (#0) > 1 OR t1.b (#1) < 3], limit: NONE]
+│       │   └── estimated rows: 1.00
+│       └── TableScan(Probe)
+│           ├── table: default.default.t2
+│           ├── output columns: [a (#2), b (#3)]
+│           ├── read rows: 5
+│           ├── read size: < 1 KiB
+│           ├── partitions total: 1
+│           ├── partitions scanned: 1
+│           ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│           ├── push downs: [filters: [t2.a (#2) > 2 OR t2.b (#3) < 4], limit: NONE]
+│           └── estimated rows: 4.40
+└── TableScan(Probe)
+    ├── table: default.default.t3
+    ├── output columns: [a (#4), b (#5)]
+    ├── read rows: 10
+    ├── read size: < 1 KiB
+    ├── partitions total: 1
+    ├── partitions scanned: 1
+    ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    ├── push downs: [filters: [t3.a (#4) > 1], limit: NONE]
+    └── estimated rows: 8.00
+
+query T
+explain select * from t1,t2 where ((t1.a > 1 or t1.b < 2) and t2.a > 2) or (t1.b < 3 and t2.b < 4) order by 1 desc limit 3
+----
+Limit
+├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── limit: 3
+├── offset: 0
+├── estimated rows: 3.00
+└── Sort
+    ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+    ├── sort keys: [a DESC NULLS LAST]
+    ├── estimated rows: 3.87
+    └── Filter
+        ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+        ├── filters: [(t1.a (#0) > 1 OR t1.b (#1) < 2) AND t2.a (#2) > 2 OR t1.b (#1) < 3 AND t2.b (#3) < 4]
+        ├── estimated rows: 3.87
+        └── HashJoin
+            ├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+            ├── join type: CROSS
+            ├── build keys: []
+            ├── probe keys: []
+            ├── filters: []
+            ├── estimated rows: 4.40
+            ├── TableScan(Build)
+            │   ├── table: default.default.t1
+            │   ├── output columns: [a (#0), b (#1)]
+            │   ├── read rows: 1
+            │   ├── read size: < 1 KiB
+            │   ├── partitions total: 1
+            │   ├── partitions scanned: 1
+            │   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+            │   ├── push downs: [filters: [t1.a (#0) > 1 OR t1.b (#1) < 2 OR t1.b (#1) < 3], limit: NONE]
+            │   └── estimated rows: 1.00
+            └── TableScan(Probe)
+                ├── table: default.default.t2
+                ├── output columns: [a (#2), b (#3)]
+                ├── read rows: 5
+                ├── read size: < 1 KiB
+                ├── partitions total: 1
+                ├── partitions scanned: 1
+                ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+                ├── push downs: [filters: [t2.a (#2) > 2 OR t2.b (#3) < 4], limit: NONE]
+                └── estimated rows: 4.40
+
+query T
+explain select * from t1,t2 where (t1.a > 1 or t1.b < 2) and (t1.a > 1 or t1.b < 2)
+----
+HashJoin
+├── output columns: [t2.a (#2), t2.b (#3), t1.a (#0), t1.b (#1)]
+├── join type: CROSS
+├── build keys: []
+├── probe keys: []
+├── filters: []
+├── estimated rows: 5.00
+├── TableScan(Build)
+│   ├── table: default.default.t1
+│   ├── output columns: [a (#0), b (#1)]
+│   ├── read rows: 1
+│   ├── read size: < 1 KiB
+│   ├── partitions total: 1
+│   ├── partitions scanned: 1
+│   ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+│   ├── push downs: [filters: [t1.a (#0) > 1 OR t1.b (#1) < 2], limit: NONE]
+│   └── estimated rows: 1.00
+└── TableScan(Probe)
+    ├── table: default.default.t2
+    ├── output columns: [a (#2), b (#3)]
+    ├── read rows: 5
+    ├── read size: < 1 KiB
+    ├── partitions total: 1
+    ├── partitions scanned: 1
+    ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+    ├── push downs: [filters: [], limit: NONE]
+    └── estimated rows: 5.00
+
+query T
+explain select count(distinct a) from t1;
+----
+AggregateFinal
+├── output columns: [count(_1) (#2)]
+├── group by: []
+├── aggregate functions: [count()]
+├── estimated rows: 1.00
+└── AggregatePartial
+    ├── group by: []
+    ├── aggregate functions: [count()]
+    ├── estimated rows: 1.00
+    └── AggregateFinal
+        ├── output columns: [t1.a (#0)]
+        ├── group by: [a]
+        ├── aggregate functions: []
+        ├── estimated rows: 1.00
+        └── AggregatePartial
+            ├── group by: [a]
+            ├── aggregate functions: []
+            ├── estimated rows: 1.00
+            └── TableScan
+                ├── table: default.default.t1
+                ├── output columns: [a (#0)]
+                ├── read rows: 1
+                ├── read size: < 1 KiB
+                ├── partitions total: 1
+                ├── partitions scanned: 1
+                ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+                ├── push downs: [filters: [], limit: NONE]
+                └── estimated rows: 1.00
+
+query T
+explain select count_distinct(a) from t1;
+----
+AggregateFinal
+├── output columns: [count(_1) (#2)]
+├── group by: []
+├── aggregate functions: [count()]
+├── estimated rows: 1.00
+└── AggregatePartial
+    ├── group by: []
+    ├── aggregate functions: [count()]
+    ├── estimated rows: 1.00
+    └── AggregateFinal
+        ├── output columns: [t1.a (#0)]
+        ├── group by: [a]
+        ├── aggregate functions: []
+        ├── estimated rows: 1.00
+        └── AggregatePartial
+            ├── group by: [a]
+            ├── aggregate functions: []
+            ├── estimated rows: 1.00
+            └── TableScan
+                ├── table: default.default.t1
+                ├── output columns: [a (#0)]
+                ├── read rows: 1
+                ├── read size: < 1 KiB
+                ├── partitions total: 1
+                ├── partitions scanned: 1
+                ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+                ├── push downs: [filters: [], limit: NONE]
+                └── estimated rows: 1.00
+
+query 
+explain select * from (values(1, 'a'),(2, 'b')) t(c1,c2)
+----
+ConstantTableScan
+├── output columns: [c1 (#0), c2 (#1)]
+├── column 0: [1, 2]
+└── column 1: ['a', 'b']
+
+statement ok
+drop table t1
+
+statement ok
+drop table t2
+
+query T
+explain syntax select * from read_parquet('p1', 'p2', 'p3');
+----
+SELECT *
+FROM
+    read_parquet('p1', 'p2', 'p3')
+
+query T
+explain syntax select * from read_parquet(prune_page=>true, refresh_meta_cache=>true);
+----
+SELECT *
+FROM
+    read_parquet(prune_page=>TRUE, refresh_meta_cache=>TRUE)
+
+query T
+explain syntax select * from read_parquet('p1', 'p2', 'p3', prune_page=>true, refresh_meta_cache=>true);
+----
+SELECT *
+FROM
+    read_parquet('p1', 'p2', 'p3', prune_page=>TRUE, refresh_meta_cache=>TRUE)
+
+query T
+explain ast select * from read_parquet('p1', 'p2', 'p3', prune_page=>true, refresh_meta_cache=>true);
+----
+Query (children 1)
+└── QueryBody (children 1)
+    └── SelectQuery (children 2)
+        ├── SelectList (children 1)
+        │   └── Target *
+        └── TableList (children 1)
+            └── TableFunction read_parquet (children 5)
+                ├── Literal String("p1")
+                ├── Literal String("p2")
+                ├── Literal String("p3")
+                ├── prune_page=>Literal Boolean(true)
+                └── refresh_meta_cache=>Literal Boolean(true)
+
+statement ok
+drop table if exists t4
+
+statement ok
+create table t4(a int, b string);
+
+query T
+explain select * from t4 where a = 1 and try_cast(get(try_parse_json(b),'bb') as varchar) = 'xx';
+----
+TableScan
+├── table: default.default.t4
+├── output columns: [a (#0), b (#1)]
+├── read rows: 0
+├── read size: 0
+├── partitions total: 0
+├── partitions scanned: 0
+├── push downs: [filters: [and_filters(t4.a (#0) = 1, TRY_CAST(get(try_parse_json(t4.b (#1)), 'bb') AS String NULL) = 'xx')], limit: NONE]
+└── estimated rows: 0.00
+
+statement ok
+drop view if exists v4
+
+statement ok
+create view v4 as select a as a, try_cast(get(try_parse_json(b), 'bb') as varchar) as b from t4;
+
+query T
+explain select * from v4 where b = 'xx';
+----
+EvalScalar
+├── output columns: [t4.a (#0), b (#2)]
+├── expressions: [TRY_CAST(get(try_parse_json(t4.b (#1)), 'bb') AS String NULL)]
+├── estimated rows: 0.00
+└── TableScan
+    ├── table: default.default.t4
+    ├── output columns: [a (#0), b (#1)]
+    ├── read rows: 0
+    ├── read size: 0
+    ├── partitions total: 0
+    ├── partitions scanned: 0
+    ├── push downs: [filters: [is_true(TRY_CAST(get(try_parse_json(t4.b (#1)), 'bb') AS String NULL) = 'xx')], limit: NONE]
+    └── estimated rows: 0.00
+
+query T
+explain select * from v4 where a > 100;
+----
+EvalScalar
+├── output columns: [t4.a (#0), b (#2)]
+├── expressions: [TRY_CAST(get(try_parse_json(t4.b (#1)), 'bb') AS String NULL)]
+├── estimated rows: 0.00
+└── TableScan
+    ├── table: default.default.t4
+    ├── output columns: [a (#0), b (#1)]
+    ├── read rows: 0
+    ├── read size: 0
+    ├── partitions total: 0
+    ├── partitions scanned: 0
+    ├── push downs: [filters: [is_true(t4.a (#0) > 100)], limit: NONE]
+    └── estimated rows: 0.00
+
+statement ok
+drop table if exists t1;
+
+statement ok
+drop table if exists t2;
+
+statement ok
+CREATE TABLE t1(i int, j int);
+
+statement ok
+CREATE TABLE t2(k int, l int);
+
+statement ok
+INSERT INTO t1 VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, 20);
+
+query I
+EXPLAIN SELECT * FROM t1 LEFT OUTER JOIN t2 ON TRUE AND t1.i = t2.k AND FALSE order by i, j;
+----
+Sort
+├── output columns: [t1.i (#0), t1.j (#1), t2.k (#2), t2.l (#3)]
+├── sort keys: [i ASC NULLS LAST, j ASC NULLS LAST]
+├── estimated rows: 3.00
+└── HashJoin
+    ├── output columns: [t1.i (#0), t1.j (#1), t2.k (#2), t2.l (#3)]
+    ├── join type: LEFT OUTER
+    ├── build keys: [t2.k (#2)]
+    ├── probe keys: [t1.i (#0)]
+    ├── filters: []
+    ├── estimated rows: 3.00
+    ├── TableScan(Build)
+    │   ├── table: default.default.t2
+    │   ├── output columns: [k (#2), l (#3)]
+    │   ├── read rows: 0
+    │   ├── read size: 0
+    │   ├── partitions total: 0
+    │   ├── partitions scanned: 0
+    │   ├── push downs: [filters: [false], limit: NONE]
+    │   └── estimated rows: 0.00
+    └── TableScan(Probe)
+        ├── table: default.default.t1
+        ├── output columns: [i (#0), j (#1)]
+        ├── read rows: 3
+        ├── read size: < 1 KiB
+        ├── partitions total: 1
+        ├── partitions scanned: 1
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+        ├── push downs: [filters: [], limit: NONE]
+        └── estimated rows: 3.00
+
+statement ok
+drop table if exists t3;
+
+statement ok
+CREATE TABLE t3(a int, b map(string, string) null, c map(string, variant) null);
+
+statement ok
+INSERT INTO t3 VALUES (1, {'k1':'a', 'k2':'b'}, {'k1':'"a"', 'k2':'100'}), (2, null, null), (3, {'k3':'z'}, {'k3':'"z"'});
+
+statement ok
+INSERT INTO t3 VALUES (4, {'k1':'a', 'k2':'m'}, {'k1':'"a"', 'k2':'"m"'}), (5, null, null), (6, {'k3':'z'}, {'k3':'"v"'});
+
+query T
+EXPLAIN SELECT * FROM t3 WHERE b['k2'] = 'm';
+----
+TableScan
+├── table: default.default.t3
+├── output columns: [a (#0), b (#1), c (#2)]
+├── read rows: 3
+├── read size: < 1 KiB
+├── partitions total: 2
+├── partitions scanned: 1
+├── pruning stats: [segments: <range pruning: 2 to 2>, blocks: <range pruning: 2 to 2, bloom pruning: 2 to 1>]
+├── push downs: [filters: [is_true(get(t3.b (#1), 'k2') = 'm')], limit: NONE]
+└── estimated rows: 1.20
+
+query T
+EXPLAIN SELECT * FROM t3 WHERE c['k3'] = 'v';
+----
+TableScan
+├── table: default.default.t3
+├── output columns: [a (#0), b (#1), c (#2)]
+├── read rows: 3
+├── read size: < 1 KiB
+├── partitions total: 2
+├── partitions scanned: 1
+├── pruning stats: [segments: <range pruning: 2 to 2>, blocks: <range pruning: 2 to 2, bloom pruning: 2 to 1>]
+├── push downs: [filters: [is_true(TRY_CAST(get(t3.c (#2), 'k3') AS String NULL) = 'v')], limit: NONE]
+└── estimated rows: 1.20
+
+query T
+EXPLAIN SELECT * FROM t3 WHERE c['k2'] = 100;
+----
+TableScan
+├── table: default.default.t3
+├── output columns: [a (#0), b (#1), c (#2)]
+├── read rows: 6
+├── read size: < 1 KiB
+├── partitions total: 2
+├── partitions scanned: 2
+├── pruning stats: [segments: <range pruning: 2 to 2>, blocks: <range pruning: 2 to 2>]
+├── push downs: [filters: [is_true(TRY_CAST(get(t3.c (#2), 'k2') AS UInt8 NULL) = 100)], limit: NONE]
+└── estimated rows: 1.20
+
+statement ok
+drop table t1;
+
+statement ok
+drop table t2;
+
+statement ok
+drop table t3;
