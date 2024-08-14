@@ -405,6 +405,8 @@ pub enum TokenKind {
     BROTLI,
     #[token("BZ2", ignore(ascii_case))]
     BZ2,
+    #[token("BLOCK", ignore(ascii_case))]
+    BLOCK,
     #[token("CALL", ignore(ascii_case))]
     CALL,
     #[token("CASE", ignore(ascii_case))]
@@ -892,6 +894,8 @@ pub enum TokenKind {
     PURGE,
     #[token("PUT", ignore(ascii_case))]
     PUT,
+    #[token("PARTIAL", ignore(ascii_case))]
+    PARTIAL,
     #[token("QUARTER", ignore(ascii_case))]
     QUARTER,
     #[token("QUERY", ignore(ascii_case))]
@@ -922,6 +926,8 @@ pub enum TokenKind {
     RETURN_FAILED_ONLY,
     #[token("REVERSE", ignore(ascii_case))]
     REVERSE,
+    #[token("SAMPLE", ignore(ascii_case))]
+    SAMPLE,
     #[token("MERGE", ignore(ascii_case))]
     MERGE,
     #[token("MATCHED", ignore(ascii_case))]
@@ -1565,6 +1571,7 @@ impl TokenKind {
             // | TokenKind::AUTHORIZATION
             // | TokenKind::BINARY
             | TokenKind::BOTH
+            | TokenKind::BLOCK
             | TokenKind::CASE
             | TokenKind::CAST
             // | TokenKind::CHECK
@@ -1622,6 +1629,7 @@ impl TokenKind {
             // | TokenKind::SIMILAR
             | TokenKind::SOME
             | TokenKind::SEMI
+            | TokenKind::SAMPLE
             // | TokenKind::SYMMETRIC
             // | TokenKind::TABLESAMPLE
             | TokenKind::THEN
