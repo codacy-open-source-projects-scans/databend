@@ -193,6 +193,7 @@ impl Binder {
             .with_order_by("name");
 
         select_builder.with_filter(format!("database = '{database}'"));
+        select_builder.with_filter("table_type = 'BASE TABLE'".to_string());
 
         let catalog_name = match catalog {
             None => self.ctx.get_current_catalog(),
@@ -585,7 +586,7 @@ impl Binder {
             let db = catalog
                 .get_database(&self.ctx.get_tenant(), &database)
                 .await?;
-            let db_id = db.get_db_info().ident.db_id;
+            let db_id = db.get_db_info().database_id.db_id;
             options.insert(OPT_KEY_DATABASE_ID.to_owned(), db_id.to_string());
 
             let config = GlobalConfig::instance();
@@ -1385,7 +1386,7 @@ impl Binder {
     }
 
     #[async_backtrace::framed]
-    async fn analyze_create_table_schema_by_columns(
+    pub async fn analyze_create_table_schema_by_columns(
         &self,
         columns: &[ColumnDefinition],
     ) -> Result<(TableSchemaRef, Vec<String>)> {

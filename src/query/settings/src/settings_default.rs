@@ -291,7 +291,7 @@ impl DefaultSettings {
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
                 ("join_spilling_buffer_threshold_per_proc_mb", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1024),
+                    value: UserSettingValue::UInt64(512),
                     desc: "Set the spilling buffer threshold (MB) for each join processor.",
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
@@ -430,7 +430,7 @@ impl DefaultSettings {
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
                 ("aggregate_spilling_memory_ratio", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(60),
+                    value: UserSettingValue::UInt64(0),
                     desc: "Sets the maximum memory ratio in bytes that an aggregator can use before spilling data to storage during query execution.",
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(0..=100)),
@@ -576,6 +576,12 @@ impl DefaultSettings {
                     desc: "Threshold for triggering auto compaction. This occurs when the number of imperfect blocks in a snapshot exceeds this value after write operations.",
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
+                }),
+                ("auto_compaction_segments_limit", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(3),
+                    desc: "The maximum number of segments that can be compacted automatically triggered after write(replace-into/merge-into).",
+                    mode: SettingMode::Both,
+                    range: Some(SettingRange::Numeric(2..=u64::MAX)),
                 }),
                 ("use_parquet2", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
@@ -824,6 +830,12 @@ impl DefaultSettings {
                     desc: "Format NULL as str in query api response",
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("random_function_seed", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Seed for random function",
+                    mode: SettingMode::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
                 })
             ]);
 
@@ -847,7 +859,7 @@ impl DefaultSettings {
     /// The maximum number of days that data can be retained.
     /// The max is read from the global config:data_retention_time_in_days_max
     /// If the global config is not set, the default value is 90 days.
-    fn data_retention_time_in_days_max() -> u64 {
+    pub(crate) fn data_retention_time_in_days_max() -> u64 {
         match GlobalConfig::try_get_instance() {
             None => 90,
             Some(conf) => conf.query.data_retention_time_in_days_max,

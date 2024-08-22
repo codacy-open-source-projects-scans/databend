@@ -36,7 +36,7 @@ use databend_common_tracing::GlobalLogger;
 use databend_common_users::builtin::BuiltIn;
 use databend_common_users::RoleCacheManager;
 use databend_common_users::UserApiProvider;
-use databend_storages_common_cache_manager::CacheManager;
+use databend_storages_common_cache::CacheManager;
 
 use crate::auth::AuthMgr;
 use crate::builtin::BuiltinUDFs;
@@ -49,6 +49,7 @@ use crate::locks::LockManager;
 use crate::pipelines::executor::GlobalQueriesExecutor;
 use crate::servers::flight::v1::exchange::DataExchangeManager;
 use crate::servers::http::v1::HttpQueryManager;
+use crate::servers::http::v1::TokenManager;
 use crate::sessions::QueriesQueueManager;
 use crate::sessions::SessionManager;
 
@@ -110,6 +111,7 @@ impl GlobalServices {
 
         QueriesQueueManager::init(config.query.max_running_queries as usize)?;
         HttpQueryManager::init(config).await?;
+        TokenManager::init(config).await?;
         DataExchangeManager::init()?;
         SessionManager::init(config)?;
         LockManager::init()?;

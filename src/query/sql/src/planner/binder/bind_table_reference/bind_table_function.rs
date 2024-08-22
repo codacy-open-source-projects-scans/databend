@@ -19,6 +19,7 @@ use databend_common_ast::ast::Expr;
 use databend_common_ast::ast::FunctionCall as ASTFunctionCall;
 use databend_common_ast::ast::Identifier;
 use databend_common_ast::ast::Literal;
+use databend_common_ast::ast::Sample;
 use databend_common_ast::ast::SelectStmt;
 use databend_common_ast::ast::SelectTarget;
 use databend_common_ast::ast::TableAlias;
@@ -33,9 +34,7 @@ use databend_common_expression::types::NumberScalar;
 use databend_common_expression::FunctionKind;
 use databend_common_expression::Scalar;
 use databend_common_functions::BUILTIN_FUNCTIONS;
-use databend_common_storage::DataOperator;
 use databend_common_storages_result_cache::ResultCacheMetaManager;
-use databend_common_storages_result_cache::ResultCacheReader;
 use databend_common_storages_result_cache::ResultScan;
 use databend_common_users::UserApiProvider;
 
@@ -63,6 +62,7 @@ impl Binder {
         params: &[Expr],
         named_params: &[(Identifier, Expr)],
         alias: &Option<TableAlias>,
+        sample: &Option<Sample>,
     ) -> Result<(SExpr, BindContext)> {
         let func_name = normalize_identifier(name, &self.name_resolution_ctx);
 
@@ -152,7 +152,7 @@ impl Binder {
             );
 
             let (s_expr, mut bind_context) =
-                self.bind_base_table(bind_context, "system", table_index, None, &None)?;
+                self.bind_base_table(bind_context, "system", table_index, None, sample)?;
             if let Some(alias) = alias {
                 bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
             }
@@ -185,14 +185,8 @@ impl Binder {
         databend_common_base::runtime::block_on(async move {
             let result_cache_mgr = ResultCacheMetaManager::create(kv_store, 0);
             let meta_key = meta_key.unwrap();
-            let (table_schema, block_raw_data) = match result_cache_mgr
-                .get(meta_key.clone())
-                .await?
-            {
-                Some(value) => {
-                    let op = DataOperator::instance().operator();
-                    ResultCacheReader::read_table_schema_and_data(op, &value.location).await?
-                }
+            let location = match result_cache_mgr.get(meta_key.clone()).await? {
+                Some(value) => value.location,
                 None => {
                     return Err(ErrorCode::EmptyData(format!(
                         "`RESULT_SCAN` failed: Unable to fetch cached data for query ID '{}'. The data may have exceeded its TTL or been cleaned up. Cache key: '{}'",
@@ -200,7 +194,7 @@ impl Binder {
                     )).set_span(*span));
                 }
             };
-            let table = ResultScan::try_create(table_schema, query_id, block_raw_data)?;
+            let table = ResultScan::try_create(query_id, location).await?;
 
             let table_alias_name = if let Some(table_alias) = alias {
                 Some(normalize_identifier(&table_alias.name, &self.name_resolution_ctx).name)

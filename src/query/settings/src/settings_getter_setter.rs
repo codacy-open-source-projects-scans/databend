@@ -508,6 +508,10 @@ impl Settings {
         self.try_set_u64("auto_compaction_imperfect_blocks_threshold", val)
     }
 
+    pub fn get_auto_compaction_segments_limit(&self) -> Result<u64> {
+        self.try_get_u64("auto_compaction_segments_limit")
+    }
+
     pub fn get_use_parquet2(&self) -> Result<bool> {
         Ok(self.try_get_u64("use_parquet2")? != 0)
     }
@@ -680,5 +684,13 @@ impl Settings {
 
     pub fn get_enable_last_snapshot_location_hint(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_last_snapshot_location_hint")? == 1)
+    }
+
+    pub fn get_max_data_retention_period_in_days() -> u64 {
+        DefaultSettings::data_retention_time_in_days_max()
+    }
+
+    pub fn get_random_function_seed(&self) -> Result<bool> {
+        Ok(self.try_get_u64("random_function_seed")? == 1)
     }
 }
