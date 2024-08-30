@@ -75,7 +75,7 @@ impl<const T: bool> AsyncSystemTable for StreamsTable<T> {
 
         let catalog_mgr = CatalogManager::instance();
         let ctls = catalog_mgr
-            .list_catalogs(&tenant, ctx.txn_mgr())
+            .list_catalogs(&tenant, ctx.session_state())
             .await?
             .iter()
             .map(|e| (e.name(), e.clone()))
@@ -193,7 +193,7 @@ impl<const T: bool> AsyncSystemTable for StreamsTable<T> {
                         table.name(),
                         db_id,
                         t_id,
-                    ) && table.engine() == "STREAM"
+                    ) && table.is_stream()
                     {
                         let stream_info = table.get_table_info();
                         let stream_table = StreamTable::try_from_table(table.as_ref())?;

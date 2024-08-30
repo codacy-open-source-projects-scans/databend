@@ -39,7 +39,6 @@ use databend_common_meta_app::schema::CreateLockRevReply;
 use databend_common_meta_app::schema::CreateLockRevReq;
 use databend_common_meta_app::schema::CreateSequenceReply;
 use databend_common_meta_app::schema::CreateSequenceReq;
-use databend_common_meta_app::schema::CreateTableIndexReply;
 use databend_common_meta_app::schema::CreateTableIndexReq;
 use databend_common_meta_app::schema::CreateTableReply;
 use databend_common_meta_app::schema::CreateTableReq;
@@ -54,7 +53,6 @@ use databend_common_meta_app::schema::DropIndexReq;
 use databend_common_meta_app::schema::DropSequenceReply;
 use databend_common_meta_app::schema::DropSequenceReq;
 use databend_common_meta_app::schema::DropTableByIdReq;
-use databend_common_meta_app::schema::DropTableIndexReply;
 use databend_common_meta_app::schema::DropTableIndexReq;
 use databend_common_meta_app::schema::DropTableReply;
 use databend_common_meta_app::schema::DropVirtualColumnReply;
@@ -62,7 +60,6 @@ use databend_common_meta_app::schema::DropVirtualColumnReq;
 use databend_common_meta_app::schema::DroppedId;
 use databend_common_meta_app::schema::ExtendLockRevReq;
 use databend_common_meta_app::schema::GcDroppedTableReq;
-use databend_common_meta_app::schema::GcDroppedTableResp;
 use databend_common_meta_app::schema::GetDictionaryReply;
 use databend_common_meta_app::schema::GetIndexReply;
 use databend_common_meta_app::schema::GetIndexReq;
@@ -112,13 +109,14 @@ use databend_common_meta_app::tenant::Tenant;
 use databend_common_meta_app::KeyWithTenant;
 use databend_common_meta_types::MetaId;
 use databend_common_meta_types::SeqV;
+use databend_storages_common_session::SessionState;
 use log::info;
 
 use crate::catalogs::default::ImmutableCatalog;
 use crate::catalogs::default::MutableCatalog;
+use crate::catalogs::default::SessionCatalog;
 use crate::storages::Table;
 use crate::table_functions::TableFunctionFactory;
-
 /// Combine two catalogs together
 /// - read/search like operations are always performed at
 ///   upper layer first, and bottom layer later(if necessary)
@@ -128,7 +126,7 @@ pub struct DatabaseCatalog {
     /// the upper layer, read only
     immutable_catalog: Arc<ImmutableCatalog>,
     /// bottom layer, writing goes here
-    mutable_catalog: Arc<MutableCatalog>,
+    mutable_catalog: Arc<SessionCatalog>,
     /// table function engine factories
     table_function_factory: Arc<TableFunctionFactory>,
 }
@@ -144,10 +142,11 @@ impl DatabaseCatalog {
     pub async fn try_create_with_config(conf: InnerConfig) -> Result<DatabaseCatalog> {
         let immutable_catalog = ImmutableCatalog::try_create_with_config(&conf).await?;
         let mutable_catalog = MutableCatalog::try_create_with_config(conf).await?;
+        let session_catalog = SessionCatalog::create(mutable_catalog, SessionState::default());
         let table_function_factory = TableFunctionFactory::create();
         let res = DatabaseCatalog {
             immutable_catalog: Arc::new(immutable_catalog),
-            mutable_catalog: Arc::new(mutable_catalog),
+            mutable_catalog: Arc::new(session_catalog),
             table_function_factory: Arc::new(table_function_factory),
         };
         Ok(res)
@@ -170,9 +169,9 @@ impl Catalog for DatabaseCatalog {
 
     fn disable_table_info_refresh(self: Arc<Self>) -> Result<Arc<dyn Catalog>> {
         let mut me = self.as_ref().clone();
-        let mut mutable_catalog = me.mutable_catalog.as_ref().clone();
-        mutable_catalog.disable_table_info_refresh();
-        me.mutable_catalog = Arc::new(mutable_catalog);
+        let mut session_catalog = me.mutable_catalog.as_ref().clone();
+        session_catalog.disable_table_info_refresh();
+        me.mutable_catalog = Arc::new(session_catalog);
         Ok(Arc::new(me))
     }
 
@@ -532,12 +531,12 @@ impl Catalog for DatabaseCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn create_table_index(&self, req: CreateTableIndexReq) -> Result<CreateTableIndexReply> {
+    async fn create_table_index(&self, req: CreateTableIndexReq) -> Result<()> {
         self.mutable_catalog.create_table_index(req).await
     }
 
     #[async_backtrace::framed]
-    async fn drop_table_index(&self, req: DropTableIndexReq) -> Result<DropTableIndexReply> {
+    async fn drop_table_index(&self, req: DropTableIndexReq) -> Result<()> {
         self.mutable_catalog.drop_table_index(req).await
     }
 
@@ -719,7 +718,7 @@ impl Catalog for DatabaseCatalog {
         self.mutable_catalog.get_drop_table_infos(req).await
     }
 
-    async fn gc_drop_tables(&self, req: GcDroppedTableReq) -> Result<GcDroppedTableResp> {
+    async fn gc_drop_tables(&self, req: GcDroppedTableReq) -> Result<()> {
         self.mutable_catalog.gc_drop_tables(req).await
     }
 
@@ -739,6 +738,23 @@ impl Catalog for DatabaseCatalog {
 
     async fn drop_sequence(&self, req: DropSequenceReq) -> Result<DropSequenceReply> {
         self.mutable_catalog.drop_sequence(req).await
+    }
+
+    fn set_session_state(&self, state: SessionState) -> Arc<dyn Catalog> {
+        Arc::new(DatabaseCatalog {
+            mutable_catalog: Arc::new(SessionCatalog::create(self.mutable_catalog.inner(), state)),
+            immutable_catalog: self.immutable_catalog.clone(),
+            table_function_factory: self.table_function_factory.clone(),
+        })
+    }
+
+    fn get_stream_source_table(&self, _stream_desc: &str) -> Result<Option<Arc<dyn Table>>> {
+        self.mutable_catalog.get_stream_source_table(_stream_desc)
+    }
+
+    fn cache_stream_source_table(&self, _stream: TableInfo, _source: TableInfo) {
+        self.mutable_catalog
+            .cache_stream_source_table(_stream, _source)
     }
 
     /// Dictionary

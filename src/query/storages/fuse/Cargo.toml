@@ -45,8 +45,8 @@ databend-storages-common-cache = { workspace = true }
 databend-storages-common-index = { workspace = true }
 databend-storages-common-io = { workspace = true }
 databend-storages-common-pruner = { workspace = true }
+databend-storages-common-session = { workspace = true }
 databend-storages-common-table-meta = { workspace = true }
-databend-storages-common-txn = { workspace = true }
 enum-as-inner = "0.5"
 fastrace = { workspace = true }
 futures = { workspace = true }
@@ -60,7 +60,7 @@ parquet = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10.6"
+sha2 = { workspace = true }
 siphasher = "0.3.10"
 sys-info = "0.9"
 tantivy = { workspace = true }

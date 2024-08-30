@@ -380,6 +380,12 @@ impl DefaultSettings {
                     mode: SettingMode::Both,
                     range: None,
                 }),
+                ("enable_planner_cache", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Enables caching logic plan from same query.",
+                    mode: SettingMode::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("enable_query_result_cache", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Enables caching query results to improve performance for identical queries.",
@@ -667,6 +673,12 @@ impl DefaultSettings {
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(1..=u64::MAX)),
                 }),
+                ("external_server_request_retry_times", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(48),
+                    desc: "Request max retry times to external server",
+                    mode: SettingMode::Both,
+                    range: Some(SettingRange::Numeric(1..=1024)),
+                }),
                 ("enable_parquet_prewhere", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Enables parquet prewhere",
@@ -760,7 +772,7 @@ impl DefaultSettings {
                 // this setting will be removed when geometry type stable.
                 ("enable_geo_create_table", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
-                    desc: "Create and alter table with geometry type",
+                    desc: "Create and alter table with geometry/geography type",
                     mode: SettingMode::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),

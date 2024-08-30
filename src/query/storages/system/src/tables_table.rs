@@ -123,7 +123,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
         let tenant = ctx.get_tenant();
         let catalog_mgr = CatalogManager::instance();
         let catalogs = catalog_mgr
-            .list_catalogs(&tenant, ctx.txn_mgr())
+            .list_catalogs(&tenant, ctx.session_state())
             .await?
             .into_iter()
             .map(|cat| cat.disable_table_info_refresh())
@@ -444,7 +444,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                         table.name(),
                         db_id,
                         table_id,
-                    ) && table.engine() != "STREAM"
+                    ) && !table.is_stream()
                     {
                         if !WITHOUT_VIEW && table.get_table_info().engine() == "VIEW" {
                             catalogs.push(ctl_name.as_str());

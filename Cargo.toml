@@ -29,7 +29,6 @@ members = [
     "src/common/license",
     "src/common/parquet2",
     "src/query/ast",
-    "src/query/async_functions",
     "src/query/codegen",
     "src/query/config",
     "src/query/catalog",
@@ -52,7 +51,7 @@ members = [
     "src/query/storages/common/io",
     "src/query/storages/common/pruner",
     "src/query/storages/common/stage",
-    "src/query/storages/common/txn",
+    "src/query/storages/common/session",
     "src/query/storages/common/table_meta",
     "src/query/storages/delta",
     "src/query/storages/factory",
@@ -197,9 +196,9 @@ databend-storages-common-cache = { path = "src/query/storages/common/cache" }
 databend-storages-common-index = { path = "src/query/storages/common/index" }
 databend-storages-common-io = { path = "src/query/storages/common/io" }
 databend-storages-common-pruner = { path = "src/query/storages/common/pruner" }
+databend-storages-common-session = { path = "src/query/storages/common/session" }
 databend-storages-common-stage = { path = "src/query/storages/common/stage" }
 databend-storages-common-table-meta = { path = "src/query/storages/common/table_meta" }
-databend-storages-common-txn = { path = "src/query/storages/common/txn" }
 
 # Crates.io dependencies
 anyerror = { version = "=0.1.10" }
@@ -286,6 +285,7 @@ ordq = "0.2.0"
 parking_lot = "0.12.1"
 parquet = { version = "52", features = ["async"] }
 paste = "1.0.15"
+sha2 = "0.10.8"
 # TODO: let's use native tls instead.
 iceberg = { version = "0.3.0" }
 iceberg-catalog-hms = { version = "0.3.0" }

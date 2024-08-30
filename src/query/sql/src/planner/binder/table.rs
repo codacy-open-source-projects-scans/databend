@@ -208,7 +208,10 @@ impl Binder {
             cte_map_ref: Box::default(),
             in_grouping: false,
             view_info: None,
-            srfs: Default::default(),
+            srfs: vec![],
+            have_async_func: false,
+            have_udf_script: false,
+            have_udf_server: false,
             inverted_index_map: Box::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
@@ -663,7 +666,7 @@ impl Binder {
             self.normalize_object_identifier_triple(catalog, database, name);
         databend_common_base::runtime::block_on(async move {
             let stream = self.ctx.get_table(&catalog, &database, &name).await?;
-            if stream.engine() != "STREAM" {
+            if !stream.is_stream() {
                 return Err(ErrorCode::TableEngineNotSupported(format!(
                     "{database}.{name} is not STREAM",
                 )));
@@ -682,7 +685,7 @@ impl Binder {
     ) -> Result<Vec<(u64, String, IndexMeta)>> {
         let catalog = self
             .catalogs
-            .get_catalog(tenant.tenant_name(), catalog_name, self.ctx.txn_mgr())
+            .get_catalog(tenant.tenant_name(), catalog_name, self.ctx.session_state())
             .await?;
         let index_metas = catalog
             .list_indexes(ListIndexesReq::new(tenant, Some(table_id)))

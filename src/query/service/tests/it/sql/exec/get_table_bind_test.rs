@@ -68,7 +68,6 @@ use databend_common_meta_app::schema::CreateLockRevReply;
 use databend_common_meta_app::schema::CreateLockRevReq;
 use databend_common_meta_app::schema::CreateSequenceReply;
 use databend_common_meta_app::schema::CreateSequenceReq;
-use databend_common_meta_app::schema::CreateTableIndexReply;
 use databend_common_meta_app::schema::CreateTableIndexReq;
 use databend_common_meta_app::schema::CreateTableReply;
 use databend_common_meta_app::schema::CreateTableReq;
@@ -83,7 +82,6 @@ use databend_common_meta_app::schema::DropIndexReq;
 use databend_common_meta_app::schema::DropSequenceReply;
 use databend_common_meta_app::schema::DropSequenceReq;
 use databend_common_meta_app::schema::DropTableByIdReq;
-use databend_common_meta_app::schema::DropTableIndexReply;
 use databend_common_meta_app::schema::DropTableIndexReq;
 use databend_common_meta_app::schema::DropTableReply;
 use databend_common_meta_app::schema::DropVirtualColumnReply;
@@ -131,8 +129,8 @@ use databend_common_meta_app::schema::UpsertTableOptionReply;
 use databend_common_meta_app::schema::UpsertTableOptionReq;
 use databend_common_meta_app::schema::VirtualColumnMeta;
 use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::seq_value::SeqV;
 use databend_common_meta_types::MetaId;
-use databend_common_meta_types::SeqV;
 use databend_common_pipeline_core::InputError;
 use databend_common_pipeline_core::LockGuard;
 use databend_common_pipeline_core::PlanProfile;
@@ -148,9 +146,10 @@ use databend_common_storage::StageFileInfo;
 use databend_common_users::GrantObjectVisibilityChecker;
 use databend_query::sessions::QueryContext;
 use databend_query::test_kits::*;
+use databend_storages_common_session::SessionState;
+use databend_storages_common_session::TxnManagerRef;
 use databend_storages_common_table_meta::meta::Location;
 use databend_storages_common_table_meta::meta::TableSnapshot;
-use databend_storages_common_txn::TxnManagerRef;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use xorf::BinaryFuse16;
@@ -282,12 +281,12 @@ impl Catalog for FakedCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn create_table_index(&self, _req: CreateTableIndexReq) -> Result<CreateTableIndexReply> {
+    async fn create_table_index(&self, _req: CreateTableIndexReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn drop_table_index(&self, _req: DropTableIndexReq) -> Result<DropTableIndexReply> {
+    async fn drop_table_index(&self, _req: DropTableIndexReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -879,6 +878,10 @@ impl TableContext for CtxDelegation {
         None
     }
 
+    fn get_all_variables(&self) -> HashMap<String, Scalar> {
+        HashMap::new()
+    }
+
     fn get_license_key(&self) -> String {
         self.ctx.get_license_key()
     }
@@ -974,6 +977,18 @@ impl TableContext for CtxDelegation {
     ) -> Result<Option<Arc<LockGuard>>> {
         todo!()
     }
+
+    fn get_session_id(&self) -> String {
+        todo!()
+    }
+
+    fn session_state(&self) -> SessionState {
+        todo!()
+    }
+
+    fn is_temp_table(&self, _catalog_name: &str, _database_name: &str, _table_name: &str) -> bool {
+        false
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1005,10 +1020,12 @@ async fn test_get_same_table_once() -> Result<()> {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
-    assert_eq!(
+
+    // plan cache need get table
+    assert!(
         ctx.table_from_cache
-            .load(std::sync::atomic::Ordering::SeqCst),
-        2
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 2
     );
 
     Ok(())

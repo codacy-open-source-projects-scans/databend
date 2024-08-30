@@ -75,6 +75,8 @@ use databend_common_meta_kvapi::kvapi;
 use databend_common_meta_kvapi::kvapi::DirName;
 use databend_common_meta_kvapi::kvapi::Key;
 use databend_common_meta_kvapi::kvapi::UpsertKVReq;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::seq_value::SeqValue;
 use databend_common_meta_types::txn_condition::Target;
 use databend_common_meta_types::ConditionResult;
 use databend_common_meta_types::InvalidArgument;
@@ -83,7 +85,6 @@ use databend_common_meta_types::MatchSeq;
 use databend_common_meta_types::MetaError;
 use databend_common_meta_types::MetaNetworkError;
 use databend_common_meta_types::Operation;
-use databend_common_meta_types::SeqV;
 use databend_common_meta_types::TxnCondition;
 use databend_common_meta_types::TxnGetResponse;
 use databend_common_meta_types::TxnOp;
@@ -181,13 +182,8 @@ where
     K: kvapi::Key,
     K::ValueType: FromToProto,
 {
-    let res = kv_api.get_kv(&k.to_string_key()).await?;
-
-    if let Some(seq_v) = res {
-        Ok((seq_v.seq, Some(deserialize_struct(&seq_v.data)?)))
-    } else {
-        Ok((0, None))
-    }
+    let res = kv_api.get_pb(k).await?;
+    Ok((res.seq(), res.into_value()))
 }
 
 /// Batch get values that are encoded with FromToProto.
@@ -330,9 +326,33 @@ pub async fn send_txn(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     txn_req: TxnRequest,
 ) -> Result<(bool, Vec<TxnOpResponse>), KVAppError> {
+    debug!("send txn: {}", txn_req);
     let tx_reply = kv_api.transaction(txn_req).await?;
     let (succ, responses) = txn_reply_to_api_result(tx_reply)?;
     Ok((succ, responses))
+}
+
+/// Add a delete operation by key and exact seq to [`TxnRequest`].
+pub fn txn_delete_exact(txn: &mut TxnRequest, key: &impl kvapi::Key, seq: u64) {
+    txn.condition.push(txn_cond_eq_seq(key, seq));
+    txn.if_then.push(txn_op_del(key));
+}
+
+/// Add a replace operation by key and exact seq to [`TxnRequest`].
+pub fn txn_replace_exact<K>(
+    txn: &mut TxnRequest,
+    key: &K,
+    seq: u64,
+    value: &K::ValueType,
+) -> Result<(), InvalidArgument>
+where
+    K: kvapi::Key,
+    K::ValueType: FromToProto + 'static,
+{
+    txn.condition.push(txn_cond_eq_seq(key, seq));
+    txn.if_then.push(txn_op_put_pb(key, value)?);
+
+    Ok(())
 }
 
 /// Build a TxnCondition that compares the seq of a record.
@@ -347,6 +367,19 @@ pub fn txn_cond_seq(key: &impl kvapi::Key, op: ConditionResult, seq: u64) -> Txn
         expected: op as i32,
         target: Some(Target::Seq(seq)),
     }
+}
+
+pub fn txn_op_put_pb<K>(key: &K, value: &K::ValueType) -> Result<TxnOp, InvalidArgument>
+where
+    K: kvapi::Key,
+    K::ValueType: FromToProto + 'static,
+{
+    let p = value.to_pb().map_err(|e| InvalidArgument::new(e, ""))?;
+
+    let mut buf = vec![];
+    prost::Message::encode(&p, &mut buf).map_err(|e| InvalidArgument::new(e, ""))?;
+
+    Ok(TxnOp::put(key.to_string_key(), buf))
 }
 
 /// Build a txn operation that puts a record.
@@ -375,15 +408,22 @@ pub fn db_has_to_exist(
     if seq == 0 {
         debug!(seq = seq, db_name_ident :? =(db_name_ident); "db does not exist");
 
-        Err(KVAppError::AppError(AppError::UnknownDatabase(
-            UnknownDatabase::new(
-                db_name_ident.database_name(),
-                format!("{}: {}", msg, db_name_ident.display()),
-            ),
+        Err(KVAppError::AppError(unknown_database_error(
+            db_name_ident,
+            msg,
         )))
     } else {
         Ok(())
     }
+}
+
+pub fn unknown_database_error(db_name_ident: &DatabaseNameIdent, msg: impl Display) -> AppError {
+    let e = UnknownDatabase::new(
+        db_name_ident.database_name(),
+        format!("{}: {}", msg, db_name_ident.display()),
+    );
+
+    AppError::UnknownDatabase(e)
 }
 
 /// Return OK if a db_id to db_meta exists by checking the seq.
