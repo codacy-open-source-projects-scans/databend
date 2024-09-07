@@ -14,6 +14,7 @@
 
 use databend_common_meta_kvapi::kvapi;
 
+pub(crate) const ID_GEN_GENERIC: &str = "generic";
 pub(crate) const ID_GEN_TABLE: &str = "table_id";
 pub(crate) const ID_GEN_DATABASE: &str = "database_id";
 pub(crate) const ID_GEN_TABLE_LOCK: &str = "table_lock_id";
@@ -28,6 +29,8 @@ pub(crate) const ID_GEN_SHARE_ENDPOINT: &str = "share_endpoint_id";
 pub(crate) const ID_GEN_DATA_MASK: &str = "data_mask";
 pub(crate) const ID_GEN_BACKGROUND_JOB: &str = "background_job";
 
+pub(crate) const ID_GEN_PROCEDURE: &str = "procedure_id";
+
 /// Key for resource id generator
 ///
 /// This is a special key for an application to generate unique id with kvapi::KVApi.
@@ -39,6 +42,13 @@ pub struct IdGenerator {
 }
 
 impl IdGenerator {
+    /// Create a key for generating generic id
+    pub fn generic() -> Self {
+        Self {
+            resource: ID_GEN_GENERIC.to_string(),
+        }
+    }
+
     /// Create a key for generating table id with kvapi::KVApi
     pub fn table_id() -> Self {
         Self {
@@ -101,6 +111,13 @@ impl IdGenerator {
     pub fn catalog_id() -> Self {
         Self {
             resource: ID_GEN_CATALOG.to_string(),
+        }
+    }
+
+    /// Create a key for generating procedure id with kvapi::KVApi
+    pub fn procedure_id() -> Self {
+        Self {
+            resource: ID_GEN_PROCEDURE.to_string(),
         }
     }
 }
@@ -215,6 +232,16 @@ mod t {
 
             let g2 = IdGenerator::from_str_key(&k)?;
             assert_eq!(g1, g2);
+        }
+
+        // Procedure id generator
+        {
+            let g = IdGenerator::procedure_id();
+            let k = g.to_string_key();
+            assert_eq!("__fd_id_gen/procedure_id", k);
+
+            let t2 = IdGenerator::from_str_key(&k)?;
+            assert_eq!(g, t2);
         }
 
         Ok(())
