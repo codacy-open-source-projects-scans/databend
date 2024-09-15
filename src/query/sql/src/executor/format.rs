@@ -159,11 +159,11 @@ impl PhysicalPlan {
             }
             PhysicalPlan::CteScan(cte_scan) => cte_scan_to_format_tree(cte_scan),
             PhysicalPlan::MaterializedCte(materialized_cte) => {
-                let left_child = materialized_cte.left.format_join(metadata)?;
                 let right_child = materialized_cte.right.format_join(metadata)?;
+                let left_child = materialized_cte.left.format_join(metadata)?;
                 let children = vec![
-                    FormatTreeNode::with_children("Left".to_string(), vec![left_child]),
                     FormatTreeNode::with_children("Right".to_string(), vec![right_child]),
+                    FormatTreeNode::with_children("Left".to_string(), vec![left_child]),
                 ];
                 Ok(FormatTreeNode::with_children(
                     format!("MaterializedCte: {}", materialized_cte.cte_idx),
@@ -840,6 +840,10 @@ fn constant_table_scan_to_format_tree(
     plan: &ConstantTableScan,
     metadata: &Metadata,
 ) -> Result<FormatTreeNode<String>> {
+    if plan.num_rows == 0 {
+        return Ok(FormatTreeNode::new(plan.name().to_string()));
+    }
+
     let mut children = Vec::with_capacity(plan.values.len() + 1);
     children.push(FormatTreeNode::new(format!(
         "output columns: [{}]",
@@ -850,7 +854,7 @@ fn constant_table_scan_to_format_tree(
         children.push(FormatTreeNode::new(format!("column {}: [{}]", i, column)));
     }
     Ok(FormatTreeNode::with_children(
-        "ConstantTableScan".to_string(),
+        plan.name().to_string(),
         children,
     ))
 }
@@ -1762,8 +1766,8 @@ fn materialized_cte_to_format_tree(
             "output columns: [{}]",
             format_output_columns(plan.output_schema()?, metadata, true)
         )),
-        to_format_tree(&plan.left, metadata, profs)?,
         to_format_tree(&plan.right, metadata, profs)?,
+        to_format_tree(&plan.left, metadata, profs)?,
     ];
     Ok(FormatTreeNode::with_children(
         "MaterializedCTE".to_string(),

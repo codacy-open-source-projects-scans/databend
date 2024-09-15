@@ -24,6 +24,7 @@ use databend_common_metrics::storage::metrics_inc_recluster_block_bytes_to_read;
 use databend_common_metrics::storage::metrics_inc_recluster_block_nums_to_read;
 use databend_common_metrics::storage::metrics_inc_recluster_row_nums_to_read;
 use databend_common_pipeline_sources::EmptySource;
+use databend_common_pipeline_transforms::processors::build_compact_block_no_split_pipeline;
 use databend_common_pipeline_transforms::processors::TransformPipelineHelper;
 use databend_common_sql::evaluator::CompoundBlockOperator;
 use databend_common_sql::executor::physical_plans::MutationKind;
@@ -82,7 +83,6 @@ impl PipelineBuilder {
 
                 self.ctx.set_partitions(plan.parts.clone())?;
 
-                // ReadDataKind to avoid OOM.
                 table.read_data(self.ctx.clone(), &plan, &mut self.main_pipeline, false)?;
 
                 let num_input_columns = schema.fields().len();
@@ -150,12 +150,14 @@ impl PipelineBuilder {
                         .remove_order_col_at_last();
                 sort_pipeline_builder.build_merge_sort_pipeline(&mut self.main_pipeline, false)?;
 
-                let output_block_num = task.total_rows.div_ceil(final_block_size);
-                let max_threads = std::cmp::min(
-                    self.ctx.get_settings().get_max_threads()? as usize,
-                    output_block_num,
-                );
-                self.main_pipeline.try_resize(max_threads)?;
+                // Compact after merge sort.
+                let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
+                build_compact_block_no_split_pipeline(
+                    &mut self.main_pipeline,
+                    block_thresholds,
+                    max_threads,
+                )?;
+
                 self.main_pipeline
                     .add_transform(|transform_input_port, transform_output_port| {
                         let proc = TransformSerializeBlock::try_create(

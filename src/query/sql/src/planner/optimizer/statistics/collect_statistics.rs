@@ -22,7 +22,6 @@ use databend_common_expression::types::NumberScalar;
 use databend_common_expression::types::F64;
 use databend_common_expression::ColumnId;
 use databend_common_expression::Scalar;
-use log::info;
 
 use crate::optimizer::RelExpr;
 use crate::optimizer::SExpr;
@@ -91,9 +90,6 @@ impl CollectStatisticsOptimizer {
                             if let Some(col_id) = *leaf_index {
                                 let col_stat = column_statistics_provider
                                     .column_statistics(col_id as ColumnId);
-                                if col_stat.is_none() {
-                                    info!("column {} doesn't have global statistics", col_id);
-                                }
                                 column_stats.insert(*column_index, col_stat.cloned());
                                 let histogram =
                                     column_statistics_provider.histogram(col_id as ColumnId);
@@ -154,11 +150,11 @@ impl CollectStatisticsOptimizer {
             }
             RelOperator::MaterializedCte(materialized_cte) => {
                 // Collect the common table expression statistics first.
-                let left = Box::pin(self.collect(s_expr.child(0)?)).await?;
-                let cte_stat_info = RelExpr::with_s_expr(&left).derive_cardinality_child(0)?;
+                let right = Box::pin(self.collect(s_expr.child(1)?)).await?;
+                let cte_stat_info = RelExpr::with_s_expr(&right).derive_cardinality_child(0)?;
                 self.cte_statistics
                     .insert(materialized_cte.cte_idx, cte_stat_info);
-                let right = Box::pin(self.collect(s_expr.child(1)?)).await?;
+                let left = Box::pin(self.collect(s_expr.child(0)?)).await?;
                 Ok(s_expr.replace_children(vec![Arc::new(left), Arc::new(right)]))
             }
             RelOperator::CteScan(cte_scan) => {
