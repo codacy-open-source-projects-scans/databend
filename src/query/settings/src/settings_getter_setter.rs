@@ -399,6 +399,18 @@ impl Settings {
         Ok(self.try_get_u64("window_partition_spilling_memory_ratio")? as usize)
     }
 
+    pub fn get_window_num_partitions(&self) -> Result<usize> {
+        Ok(self.try_get_u64("window_num_partitions")? as usize)
+    }
+
+    pub fn get_window_spill_unit_size_mb(&self) -> Result<usize> {
+        Ok(self.try_get_u64("window_spill_unit_size_mb")? as usize)
+    }
+
+    pub fn get_window_partition_sort_block_size(&self) -> Result<u64> {
+        self.try_get_u64("window_partition_sort_block_size")
+    }
+
     pub fn get_sort_spilling_bytes_threshold_per_proc(&self) -> Result<usize> {
         Ok(self.try_get_u64("sort_spilling_bytes_threshold_per_proc")? as usize)
     }
@@ -589,6 +601,21 @@ impl Settings {
         self.try_get_string("numeric_cast_option")
     }
 
+    pub fn get_nulls_first(&self) -> impl Fn(bool) -> bool {
+        match self
+            .try_get_string("default_order_by_null")
+            .unwrap_or("nulls_last".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "nulls_last" => |_| false,
+            "nulls_first" => |_| true,
+            "nulls_first_on_asc_last_on_desc" => |asc: bool| asc,
+            "nulls_last_on_asc_first_on_desc" => |asc: bool| !asc,
+            _ => |_| false,
+        }
+    }
+
     pub fn get_external_server_connect_timeout_secs(&self) -> Result<u64> {
         self.try_get_u64("external_server_connect_timeout_secs")
     }
@@ -692,6 +719,10 @@ impl Settings {
 
     pub fn get_enable_loser_tree_merge_sort(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_loser_tree_merge_sort")? == 1)
+    }
+
+    pub fn get_enable_parallel_multi_merge_sort(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_parallel_multi_merge_sort")? == 1)
     }
 
     pub fn get_format_null_as_str(&self) -> Result<bool> {
