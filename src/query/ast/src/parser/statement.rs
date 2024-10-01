@@ -2067,10 +2067,25 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
     // [ COMMENT = '<string_literal>' ] AS <procedure_definition>
     let create_procedure = map_res(
         rule! {
-            CREATE ~ ( OR ~ ^REPLACE )? ~ PROCEDURE ~ #ident ~ #procedure_arg ~ RETURNS ~ #procedure_return ~ LANGUAGE ~ SQL  ~ (COMMENT ~ "=" ~ #literal_string)? ~ AS ~ #code_string
+            CREATE ~ ( OR ~ ^REPLACE )? ~ PROCEDURE ~ ( IF ~ ^NOT ~ ^EXISTS )? ~ #ident ~ #procedure_arg ~ RETURNS ~ #procedure_return ~ LANGUAGE ~ SQL  ~ (COMMENT ~ "=" ~ #literal_string)? ~ AS ~ #code_string
         },
-        |(_, opt_or_replace, _, name, args, _, return_type, _, _, opt_comment, _, script)| {
-            let create_option = parse_create_option(opt_or_replace.is_some(), false)?;
+        |(
+            _,
+            opt_or_replace,
+            _,
+            opt_if_not_exists,
+            name,
+            args,
+            _,
+            return_type,
+            _,
+            _,
+            opt_comment,
+            _,
+            script,
+        )| {
+            let create_option =
+                parse_create_option(opt_or_replace.is_some(), opt_if_not_exists.is_some())?;
 
             let name = ProcedureIdentity {
                 name: name.to_string(),
@@ -2137,10 +2152,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
 
     let drop_procedure = map(
         rule! {
-            DROP ~ PROCEDURE ~ #ident ~ #procedure_type_name
+            DROP ~ PROCEDURE ~ ( IF ~ ^EXISTS )? ~ #ident ~ #procedure_type_name
         },
-        |(_, _, name, args)| {
+        |(_, _, opt_if_exists, name, args)| {
             Statement::DropProcedure(DropProcedureStmt {
+                if_exists: opt_if_exists.is_some(),
                 name: ProcedureIdentity {
                     name: name.to_string(),
                     args_type: if args.is_empty() {
@@ -3445,6 +3461,13 @@ pub fn alter_table_action(i: Input) -> IResult<AlterTableAction> {
         |(_, _, _, set_options, _)| AlterTableAction::SetOptions { set_options },
     );
 
+    let unset_table_options = map(
+        rule! {
+            UNSET ~ OPTIONS ~ #unset_source
+        },
+        |(_, _, targets)| AlterTableAction::UnsetOptions { targets },
+    );
+
     rule!(
         #alter_table_cluster_key
         | #drop_table_cluster_key
@@ -3457,6 +3480,7 @@ pub fn alter_table_action(i: Input) -> IResult<AlterTableAction> {
         | #recluster_table
         | #revert_table
         | #set_table_options
+        | #unset_table_options
     )(i)
 }
 
