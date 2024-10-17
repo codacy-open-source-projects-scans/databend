@@ -351,11 +351,14 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
 
     let unset_stmt = map(
         rule! {
-            UNSET ~ #unset_type ~ #unset_source
+            UNSET ~ #set_type ~ #unset_source
         },
         |(_, unset_type, identifiers)| Statement::UnSetStmt {
-            unset_type,
-            identifiers,
+            settings: Settings {
+                set_type: unset_type,
+                identifiers,
+                values: SetValues::None,
+            },
         },
     );
 
@@ -389,9 +392,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ #ident ~ "=" ~ #subexpr(0)
             },
             |(_, set_type, var, _, value)| Statement::SetStmt {
-                set_type,
-                identifiers: vec![var],
-                values: SetValues::Expr(vec![Box::new(value)]),
+                settings: Settings {
+                    set_type,
+                    identifiers: vec![var],
+                    values: SetValues::Expr(vec![Box::new(value)]),
+                },
             },
         ),
         map_res(
@@ -402,9 +407,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             |(_, set_type, _, ids, _, _, _, values, _)| {
                 if ids.len() == values.len() {
                     Ok(Statement::SetStmt {
-                        set_type,
-                        identifiers: ids,
-                        values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+                        settings: Settings {
+                            set_type,
+                            identifiers: ids,
+                            values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+                        },
                     })
                 } else {
                     Err(nom::Err::Failure(ErrorKind::Other(
@@ -418,9 +425,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ #ident ~ "=" ~ #query
             },
             |(_, set_type, var, _, query)| Statement::SetStmt {
-                set_type,
-                identifiers: vec![var],
-                values: SetValues::Query(Box::new(query)),
+                settings: Settings {
+                    set_type,
+                    identifiers: vec![var],
+                    values: SetValues::Query(Box::new(query)),
+                },
             },
         ),
         map(
@@ -428,9 +437,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ "(" ~ #comma_separated_list0(ident) ~ ")" ~ "=" ~ #query
             },
             |(_, set_type, _, vars, _, _, query)| Statement::SetStmt {
-                set_type,
-                identifiers: vars,
-                values: SetValues::Query(Box::new(query)),
+                settings: Settings {
+                    set_type,
+                    identifiers: vars,
+                    values: SetValues::Query(Box::new(query)),
+                },
             },
         ),
     ));
@@ -957,9 +968,15 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
     );
     let show_dictionaries = map(
         rule! {
-            SHOW ~ DICTIONARIES ~ #show_options?
+            SHOW ~ DICTIONARIES ~ ((FROM|IN) ~ #ident)? ~ #show_limit?
         },
-        |(_, _, show_options)| Statement::ShowDictionaries { show_options },
+        |(_, _, db, limit)| {
+            let database = match db {
+                Some((_, d)) => Some(d),
+                _ => None,
+            };
+            Statement::ShowDictionaries(ShowDictionariesStmt { database, limit })
+        },
     );
     let show_create_dictionary = map(
         rule! {
@@ -1285,6 +1302,12 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
     );
 
     let show_users = value(Statement::ShowUsers, rule! { SHOW ~ USERS });
+    let describe_user = map(
+        rule! {
+            ( DESC | DESCRIBE ) ~ USER ~ ^#user_identity
+        },
+        |(_, _, user)| Statement::DescribeUser { user },
+    );
     let create_user = map_res(
         rule! {
             CREATE ~  ( OR ~ ^REPLACE )? ~ USER ~ ( IF ~ ^NOT ~ ^EXISTS )?
@@ -2241,6 +2264,22 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #abort
         ),
         rule!(
+            #show_users : "`SHOW USERS`"
+            | #describe_user: "`DESCRIBE USER <user_name>`"
+            | #create_user : "`CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`"
+            | #alter_user : "`ALTER USER ('<username>' | USER()) [IDENTIFIED [WITH <auth_type>] [BY <password>]] [WITH <user_option>, ...]`"
+            | #drop_user : "`DROP USER [IF EXISTS] '<username>'`"
+            | #show_roles : "`SHOW ROLES`"
+            | #create_role : "`CREATE ROLE [IF NOT EXISTS] <role_name>`"
+            | #drop_role : "`DROP ROLE [IF EXISTS] <role_name>`"
+            | #create_udf : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <name> {AS (<parameter>, ...) -> <definition expr> | (<arg_type>, ...) RETURNS <return_type> LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address>} [DESC = <description>]`"
+            | #drop_udf : "`DROP FUNCTION [IF EXISTS] <udf_name>`"
+            | #alter_udf : "`ALTER FUNCTION <udf_name> (<parameter>, ...) -> <definition_expr> [DESC = <description>]`"
+            | #set_role: "`SET [DEFAULT] ROLE <role>`"
+            | #set_secondary_roles: "`SET SECONDARY ROLES (ALL | NONE)`"
+            | #show_user_functions : "`SHOW USER FUNCTIONS [<show_limit>]`"
+        ),
+        rule!(
             #show_tables : "`SHOW [FULL] TABLES [FROM <database>] [<show_limit>]`"
             | #show_columns : "`SHOW [FULL] COLUMNS FROM <table> [FROM|IN <catalog>.<database>] [<show_limit>]`"
             | #show_create_table : "`SHOW CREATE TABLE [<database>.]<table>`"
@@ -2290,21 +2329,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #refresh_virtual_column: "`REFRESH VIRTUAL COLUMN FOR [<database>.]<table>`"
             | #show_virtual_columns : "`SHOW VIRTUAL COLUMNS FROM <table> [FROM|IN <catalog>.<database>] [<show_limit>]`"
             | #sequence
-        ),
-        rule!(
-            #show_users : "`SHOW USERS`"
-            | #create_user : "`CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>'@'hostname' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`"
-            | #alter_user : "`ALTER USER ('<username>'@'hostname' | USER()) [IDENTIFIED [WITH <auth_type>] [BY <password>]] [WITH <user_option>, ...]`"
-            | #drop_user : "`DROP USER [IF EXISTS] '<username>'@'hostname'`"
-            | #show_roles : "`SHOW ROLES`"
-            | #create_role : "`CREATE ROLE [IF NOT EXISTS] <role_name>`"
-            | #drop_role : "`DROP ROLE [IF EXISTS] <role_name>`"
-            | #create_udf : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <name> {AS (<parameter>, ...) -> <definition expr> | (<arg_type>, ...) RETURNS <return_type> LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address>} [DESC = <description>]`"
-            | #drop_udf : "`DROP FUNCTION [IF EXISTS] <udf_name>`"
-            | #alter_udf : "`ALTER FUNCTION <udf_name> (<parameter>, ...) -> <definition_expr> [DESC = <description>]`"
-            | #set_role: "`SET [DEFAULT] ROLE <role>`"
-            | #set_secondary_roles: "`SET SECONDARY ROLES (ALL | NONE)`"
-            | #show_user_functions : "`SHOW USER FUNCTIONS [<show_limit>]`"
         ),
         rule!(
             #create_stage: "`CREATE [OR REPLACE] STAGE [ IF NOT EXISTS ] <stage_name>
