@@ -41,11 +41,11 @@ use crate::optimizer::join::SingleToInnerOptimizer;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::statistics::CollectStatisticsOptimizer;
 use crate::optimizer::util::contains_local_table_scan;
-use crate::optimizer::QuerySampleExecutor;
 use crate::optimizer::RuleFactory;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::optimizer::DEFAULT_REWRITE_RULES;
+use crate::planner::query_executor::QueryExecutor;
 use crate::plans::CopyIntoLocationPlan;
 use crate::plans::Join;
 use crate::plans::JoinType;
@@ -72,7 +72,7 @@ pub struct OptimizerContext {
     enable_dphyp: bool,
     planning_agg_index: bool,
     #[educe(Debug(ignore))]
-    sample_executor: Option<Arc<dyn QuerySampleExecutor>>,
+    sample_executor: Option<Arc<dyn QueryExecutor>>,
 }
 
 impl OptimizerContext {
@@ -104,10 +104,7 @@ impl OptimizerContext {
         self
     }
 
-    pub fn with_sample_executor(
-        mut self,
-        sample_executor: Option<Arc<dyn QuerySampleExecutor>>,
-    ) -> Self {
+    pub fn with_sample_executor(mut self, sample_executor: Option<Arc<dyn QueryExecutor>>) -> Self {
         self.sample_executor = sample_executor;
         self
     }
@@ -207,6 +204,41 @@ pub async fn optimize(mut opt_ctx: OptimizerContext, plan: Plan) -> Result<Plan>
             ExplainKind::Ast(_) | ExplainKind::Syntax(_) => {
                 Ok(Plan::Explain { config, kind, plan })
             }
+            ExplainKind::Decorrelated => {
+                if let Plan::Query {
+                    s_expr,
+                    metadata,
+                    bind_context,
+                    rewrite_kind,
+                    formatted_ast,
+                    ignore_result,
+                } = *plan
+                {
+                    let mut s_expr = s_expr;
+                    if s_expr.contain_subquery() {
+                        s_expr = Box::new(decorrelate_subquery(
+                            opt_ctx.metadata.clone(),
+                            *s_expr.clone(),
+                        )?);
+                    }
+                    Ok(Plan::Explain {
+                        kind,
+                        config,
+                        plan: Box::new(Plan::Query {
+                            s_expr,
+                            bind_context,
+                            metadata,
+                            rewrite_kind,
+                            formatted_ast,
+                            ignore_result,
+                        }),
+                    })
+                } else {
+                    Err(ErrorCode::BadArguments(
+                        "Cannot use EXPLAIN DECORRELATED with a non-query statement",
+                    ))
+                }
+            }
             ExplainKind::Memo(_) => {
                 if let box Plan::Query { ref s_expr, .. } = plan {
                     let memo = get_optimized_memo(opt_ctx, *s_expr.clone()).await?;
@@ -234,8 +266,13 @@ pub async fn optimize(mut opt_ctx: OptimizerContext, plan: Plan) -> Result<Plan>
                 }
             }
         },
-        Plan::ExplainAnalyze { plan, partial } => Ok(Plan::ExplainAnalyze {
+        Plan::ExplainAnalyze {
+            plan,
             partial,
+            graphical,
+        } => Ok(Plan::ExplainAnalyze {
+            partial,
+            graphical,
             plan: Box::new(Box::pin(optimize(opt_ctx, *plan)).await?),
         }),
         Plan::CopyIntoLocation(CopyIntoLocationPlan {

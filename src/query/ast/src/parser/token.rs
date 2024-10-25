@@ -65,6 +65,16 @@ impl<'a> Tokenizer<'a> {
             prev_token: None,
         }
     }
+
+    pub fn contains_token(query: &str, target_kind: TokenKind) -> bool {
+        let mut tokenizer = Tokenizer::new(query);
+        while let Some(Ok(token)) = tokenizer.next() {
+            if token.kind == target_kind {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl<'a> Iterator for Tokenizer<'a> {
@@ -1004,6 +1014,8 @@ pub enum TokenKind {
     RAW,
     #[token("OPTIMIZED", ignore(ascii_case))]
     OPTIMIZED,
+    #[token("DECORRELATED", ignore(ascii_case))]
+    DECORRELATED,
     #[token("SCHEMA", ignore(ascii_case))]
     SCHEMA,
     #[token("SCHEMAS", ignore(ascii_case))]
@@ -1204,6 +1216,8 @@ pub enum TokenKind {
     VARIABLE,
     #[token("VERBOSE", ignore(ascii_case))]
     VERBOSE,
+    #[token("GRAPHICAL", ignore(ascii_case))]
+    GRAPHICAL,
     #[token("VIEW", ignore(ascii_case))]
     VIEW,
     #[token("VIEWS", ignore(ascii_case))]
