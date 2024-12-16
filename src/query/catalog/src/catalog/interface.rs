@@ -74,6 +74,7 @@ use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::RenameDatabaseReply;
 use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
 use databend_common_meta_app::schema::RenameTableReply;
 use databend_common_meta_app::schema::RenameTableReq;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
@@ -132,8 +133,6 @@ pub trait CatalogCreator: Send + Sync + Debug {
 
 #[async_trait::async_trait]
 pub trait Catalog: DynClone + Send + Sync + Debug {
-    /// Catalog itself
-
     // Get the name of the catalog.
     fn name(&self) -> String;
     // Get the info of the catalog.
@@ -146,10 +145,11 @@ pub trait Catalog: DynClone + Send + Sync + Debug {
         )))
     }
 
-    /// Database.
-
     // Get the database by name.
     async fn get_database(&self, tenant: &Tenant, db_name: &str) -> Result<Arc<dyn Database>>;
+
+    // List all databases history
+    async fn list_databases_history(&self, tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>>;
 
     // Get all the databases.
     async fn list_databases(&self, tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>>;
@@ -204,8 +204,6 @@ pub trait Catalog: DynClone + Send + Sync + Debug {
     }
 
     async fn rename_database(&self, req: RenameDatabaseReq) -> Result<RenameDatabaseReply>;
-
-    /// Table.
 
     // Build a `Arc<dyn Table>` from `TableInfo`.
     fn get_table_by_info(&self, table_info: &TableInfo) -> Result<Arc<dyn Table>>;
@@ -448,8 +446,6 @@ pub trait Catalog: DynClone + Send + Sync + Debug {
 
     async fn list_locks(&self, req: ListLocksReq) -> Result<Vec<LockInfo>>;
 
-    /// Table function
-
     // Get function by name.
     fn get_table_function(
         &self,
@@ -526,4 +522,6 @@ pub trait Catalog: DynClone + Send + Sync + Debug {
         &self,
         req: ListDictionaryReq,
     ) -> Result<Vec<(String, DictionaryMeta)>>;
+
+    async fn rename_dictionary(&self, req: RenameDictionaryReq) -> Result<()>;
 }

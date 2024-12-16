@@ -22,6 +22,7 @@ use dashmap::DashMap;
 use databend_common_base::base::tokio;
 use databend_common_base::base::Progress;
 use databend_common_base::base::ProgressValues;
+use databend_common_base::runtime::Runtime;
 use databend_common_catalog::catalog::Catalog;
 use databend_common_catalog::cluster_info::Cluster;
 use databend_common_catalog::database::Database;
@@ -32,18 +33,17 @@ use databend_common_catalog::plan::PartInfoPtr;
 use databend_common_catalog::plan::Partitions;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::runtime_filter_info::RuntimeFilterInfo;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterReady;
 use databend_common_catalog::statistics::data_cache_statistics::DataCacheMetrics;
 use databend_common_catalog::table::Table;
 use databend_common_catalog::table_context::ContextError;
 use databend_common_catalog::table_context::FilteredCopyFiles;
-use databend_common_catalog::table_context::MaterializedCtesBlocks;
 use databend_common_catalog::table_context::ProcessInfo;
 use databend_common_catalog::table_context::StageAttachment;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockThresholds;
-use databend_common_expression::DataBlock;
 use databend_common_expression::Expr;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::Scalar;
@@ -106,6 +106,7 @@ use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::RenameDatabaseReply;
 use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
 use databend_common_meta_app::schema::RenameTableReply;
 use databend_common_meta_app::schema::RenameTableReq;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
@@ -146,7 +147,6 @@ use databend_query::test_kits::*;
 use databend_storages_common_session::SessionState;
 use databend_storages_common_session::TxnManagerRef;
 use databend_storages_common_table_meta::meta::Location;
-use databend_storages_common_table_meta::meta::TableSnapshot;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use xorf::BinaryFuse16;
@@ -169,6 +169,10 @@ impl Catalog for FakedCatalog {
     }
 
     async fn get_database(&self, _tenant: &Tenant, _db_name: &str) -> Result<Arc<dyn Database>> {
+        todo!()
+    }
+
+    async fn list_databases_history(&self, _tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
         todo!()
     }
 
@@ -456,6 +460,10 @@ impl Catalog for FakedCatalog {
     ) -> Result<Vec<(String, DictionaryMeta)>> {
         todo!()
     }
+
+    async fn rename_dictionary(&self, _req: RenameDictionaryReq) -> Result<()> {
+        todo!()
+    }
 }
 
 struct CtxDelegation {
@@ -489,7 +497,7 @@ impl TableContext for CtxDelegation {
     }
 
     fn txn_mgr(&self) -> TxnManagerRef {
-        todo!()
+        self.ctx.txn_mgr()
     }
 
     fn incr_total_scan_value(&self, _value: ProgressValues) {
@@ -571,22 +579,6 @@ impl TableContext for CtxDelegation {
     }
 
     fn set_partitions(&self, _partitions: Partitions) -> Result<()> {
-        todo!()
-    }
-
-    fn set_table_snapshot(&self, _snapshot: Arc<TableSnapshot>) {
-        todo!()
-    }
-
-    fn get_table_snapshot(&self) -> Option<Arc<TableSnapshot>> {
-        todo!()
-    }
-
-    fn set_lazy_mutation_delete(&self, _lazy: bool) {
-        todo!()
-    }
-
-    fn get_lazy_mutation_delete(&self) -> bool {
         todo!()
     }
 
@@ -696,7 +688,10 @@ impl TableContext for CtxDelegation {
         todo!()
     }
 
-    async fn get_visibility_checker(&self) -> Result<GrantObjectVisibilityChecker> {
+    async fn get_visibility_checker(
+        &self,
+        _ignore_ownership: bool,
+    ) -> Result<GrantObjectVisibilityChecker> {
         todo!()
     }
 
@@ -729,6 +724,10 @@ impl TableContext for CtxDelegation {
     }
 
     fn get_shared_settings(&self) -> Arc<Settings> {
+        Settings::create(Tenant::new_literal("fake_shared_settings"))
+    }
+
+    fn get_session_settings(&self) -> Arc<Settings> {
         todo!()
     }
 
@@ -819,6 +818,10 @@ impl TableContext for CtxDelegation {
         }
     }
 
+    fn evict_table_from_cache(&self, _catalog: &str, _database: &str, _table: &str) -> Result<()> {
+        todo!()
+    }
+
     async fn get_table_with_batch(
         &self,
         catalog: &str,
@@ -837,25 +840,6 @@ impl TableContext for CtxDelegation {
         _files: &[StageFileInfo],
         _max_files: Option<usize>,
     ) -> Result<FilteredCopyFiles> {
-        todo!()
-    }
-
-    fn set_materialized_cte(
-        &self,
-        _idx: (usize, usize),
-        _blocks: Arc<RwLock<Vec<DataBlock>>>,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    fn get_materialized_cte(
-        &self,
-        _idx: (usize, usize),
-    ) -> Result<Option<Arc<RwLock<Vec<DataBlock>>>>> {
-        todo!()
-    }
-
-    fn get_materialized_ctes(&self) -> MaterializedCtesBlocks {
         todo!()
     }
 
@@ -931,6 +915,22 @@ impl TableContext for CtxDelegation {
         todo!()
     }
 
+    fn set_runtime_filter_ready(&self, _table_index: usize, _ready: Arc<RuntimeFilterReady>) {
+        todo!()
+    }
+
+    fn get_runtime_filter_ready(&self, _table_index: usize) -> Vec<Arc<RuntimeFilterReady>> {
+        todo!()
+    }
+
+    fn set_wait_runtime_filter(&self, _table_index: usize, _need_to_wait: bool) {
+        todo!()
+    }
+
+    fn get_wait_runtime_filter(&self, _table_index: usize) -> bool {
+        todo!()
+    }
+
     fn clear_runtime_filter(&self) {
         todo!()
     }
@@ -995,6 +995,18 @@ impl TableContext for CtxDelegation {
 
     fn is_temp_table(&self, _catalog_name: &str, _database_name: &str, _table_name: &str) -> bool {
         false
+    }
+
+    fn get_runtime(&self) -> Result<Arc<Runtime>> {
+        todo!()
+    }
+
+    fn add_m_cte_temp_table(&self, _database_name: &str, _table_name: &str) {
+        todo!()
+    }
+
+    async fn drop_m_cte_temp_table(&self) -> Result<()> {
+        todo!()
     }
 }
 

@@ -30,11 +30,13 @@ use opendal::services::Fs;
 use opendal::Operator;
 
 use crate::pipelines::processors::transforms::FrameBound;
+use crate::pipelines::processors::transforms::TransformWindow;
 use crate::pipelines::processors::transforms::TransformWindowPartitionCollect;
 use crate::pipelines::processors::transforms::WindowFunctionInfo;
 use crate::pipelines::processors::transforms::WindowPartitionExchange;
+use crate::pipelines::processors::transforms::WindowPartitionTopNExchange;
+use crate::pipelines::processors::transforms::WindowSortDesc;
 use crate::pipelines::processors::transforms::WindowSpillSettings;
-use crate::pipelines::processors::TransformWindow;
 use crate::pipelines::PipelineBuilder;
 use crate::spillers::SpillerDiskConfig;
 
@@ -56,11 +58,11 @@ impl PipelineBuilder {
             .iter()
             .map(|o| {
                 let offset = input_schema.index_of(&o.order_by.to_string())?;
-                Ok(SortColumnDescription {
+                Ok(WindowSortDesc {
                     offset,
                     asc: o.asc,
                     nulls_first: o.nulls_first,
-                    is_nullable: input_schema.field(offset).is_nullable(), // Used for check null frame.
+                    is_nullable: input_schema.field(offset).is_nullable(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -164,15 +166,27 @@ impl PipelineBuilder {
                     offset,
                     asc: desc.asc,
                     nulls_first: desc.nulls_first,
-                    is_nullable: plan_schema.field(offset).is_nullable(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.main_pipeline.exchange(
-            num_processors,
-            WindowPartitionExchange::create(partition_by.clone(), num_partitions),
-        );
+        if let Some(top_n) = &window_partition.top_n {
+            self.main_pipeline.exchange(
+                num_processors,
+                WindowPartitionTopNExchange::create(
+                    partition_by.clone(),
+                    sort_desc.clone(),
+                    top_n.top,
+                    top_n.func,
+                    num_partitions as u64,
+                ),
+            )
+        } else {
+            self.main_pipeline.exchange(
+                num_processors,
+                WindowPartitionExchange::create(partition_by.clone(), num_partitions),
+            );
+        }
 
         let disk_bytes_limit = settings.get_window_partition_spilling_to_disk_bytes_limit()?;
         let temp_dir_manager = TempDirManager::instance();

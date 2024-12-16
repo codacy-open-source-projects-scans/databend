@@ -85,6 +85,18 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+
+    let query_setting = map_res(
+        rule! {
+            SETTINGS ~ #query_statement_setting? ~ #statement_body
+        },
+        |(_, opt_settings, statement)| {
+            Ok(Statement::StatementWithSettings {
+                settings: opt_settings,
+                stmt: Box::new(statement),
+            })
+        },
+    );
     let explain_analyze = map(
         rule! {
             EXPLAIN ~ ANALYZE ~ (PARTIAL|GRAPHICAL)? ~ #statement
@@ -504,6 +516,12 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+    let use_catalog = map(
+        rule! {
+            USE ~ CATALOG ~ #ident
+        },
+        |(_, _, catalog)| Statement::UseCatalog { catalog },
+    );
 
     let show_databases = map(
         rule! {
@@ -517,6 +535,19 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+
+    let show_drop_databases = map(
+        rule! {
+            SHOW ~ DROP ~ ( DATABASES | DATABASES ) ~ ( FROM ~ ^#ident )? ~ #show_limit?
+        },
+        |(_, _, _, opt_catalog, limit)| {
+            Statement::ShowDropDatabases(ShowDropDatabasesStmt {
+                catalog: opt_catalog.map(|(_, catalog)| catalog),
+                limit,
+            })
+        },
+    );
+
     let show_create_database = map(
         rule! {
             SHOW ~ CREATE ~ ( DATABASE | SCHEMA ) ~ #dot_separated_idents_1_to_2
@@ -1003,6 +1034,29 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 catalog,
                 database,
                 dictionary_name,
+            })
+        },
+    );
+    let rename_dictionary = map(
+        rule! {
+            RENAME ~ DICTIONARY ~ ( IF ~ ^EXISTS )? ~ #dot_separated_idents_1_to_3 ~ TO ~ #dot_separated_idents_1_to_3
+        },
+        |(
+            _,
+            _,
+            opt_if_exists,
+            (catalog, database, dictionary),
+            _,
+            (new_catalog, new_database, new_dictionary),
+        )| {
+            Statement::RenameDictionary(RenameDictionaryStmt {
+                if_exists: opt_if_exists.is_some(),
+                catalog,
+                database,
+                dictionary,
+                new_catalog,
+                new_database,
+                new_dictionary,
             })
         },
     );
@@ -1509,9 +1563,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             ~ ( #stage_name )
             ~ ( (URL ~ ^"=")? ~ #uri_location )?
             ~ ( #file_format_clause )?
-            ~ ( ON_ERROR ~ ^"=" ~ ^#ident )?
-            ~ ( SIZE_LIMIT ~ ^"=" ~ ^#literal_u64 )?
-            ~ ( VALIDATION_MODE ~ ^"=" ~ ^#ident )?
             ~ ( (COMMENT | COMMENTS) ~ ^"=" ~ ^#literal_string )?
         },
         |(
@@ -1522,9 +1573,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             stage,
             url_opt,
             file_format_opt,
-            on_error_opt,
-            size_limit_opt,
-            validation_mode_opt,
             comment_opt,
         )| {
             let create_option =
@@ -1534,11 +1582,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 stage_name: stage.to_string(),
                 location: url_opt.map(|(_, location)| location),
                 file_format_options: file_format_opt.unwrap_or_default(),
-                on_error: on_error_opt.map(|v| v.2.to_string()).unwrap_or_default(),
-                size_limit: size_limit_opt.map(|v| v.2 as usize).unwrap_or_default(),
-                validation_mode: validation_mode_opt
-                    .map(|v| v.2.to_string())
-                    .unwrap_or_default(),
                 comments: comment_opt.map(|v| v.2).unwrap_or_default(),
             }))
         },
@@ -2244,15 +2287,20 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #set_priority: "`SET PRIORITY (HIGH | MEDIUM | LOW) <object_id>`"
             | #system_action: "`SYSTEM (ENABLE | DISABLE) EXCEPTION_BACKTRACE`"
         ),
+        // use
+        rule!(
+                #use_catalog: "`USE CATALOG <catalog>`"
+                | #use_database : "`USE <database>`"
+        ),
         // database
         rule!(
             #show_databases : "`SHOW [FULL] DATABASES [(FROM | IN) <catalog>] [<show_limit>]`"
             | #undrop_database : "`UNDROP DATABASE <database>`"
             | #show_create_database : "`SHOW CREATE DATABASE <database>`"
+            | #show_drop_databases : "`SHOW DROP DATABASES [FROM <database>] [<show_limit>]`"
             | #create_database : "`CREATE [OR REPLACE] DATABASE [IF NOT EXISTS] <database> [ENGINE = <engine>]`"
             | #drop_database : "`DROP DATABASE [IF EXISTS] <database>`"
             | #alter_database : "`ALTER DATABASE [IF EXISTS] <action>`"
-            | #use_database : "`USE <database>`"
         ),
         // network policy / password policy
         rule!(
@@ -2324,6 +2372,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #drop_dictionary : "`DROP DICTIONARY [IF EXISTS] <dictionary_name>`"
             | #show_create_dictionary : "`SHOW CREATE DICTIONARY <dictionary_name> `"
             | #show_dictionaries : "`SHOW DICTIONARIES [<show_option>, ...]`"
+            | #rename_dictionary: "`RENAME DICTIONARY [<database>.]<old_dict_name> TO <new_dict_name>`"
         ),
         // view,index
         rule!(
@@ -2375,6 +2424,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
         rule!(
             #set_stmt : "`SET [variable] {<name> = <value> | (<name>, ...) = (<value>, ...)}`"
             | #unset_stmt : "`UNSET [variable] {<name> | (<name>, ...)}`"
+            | #query_setting : "SETTINGS ( {<name> = <value> | (<name>, ...) = (<value>, ...)} )  Statement"
         ),
         // catalog
         rule!(
@@ -2782,6 +2832,36 @@ pub fn hint(i: Input) -> IResult<Hint> {
     rule!(#hint|#invalid_hint)(i)
 }
 
+pub fn query_setting(i: Input) -> IResult<(Identifier, Expr)> {
+    map(
+        rule! {
+            #ident ~ "=" ~ #subexpr(0)
+        },
+        |(id, _, value)| (id, value),
+    )(i)
+}
+
+pub fn query_statement_setting(i: Input) -> IResult<Settings> {
+    let query_set = map(
+        rule! {
+            "(" ~ #comma_separated_list0(query_setting) ~ ")"
+        },
+        |(_, query_setting, _)| {
+            let mut ids = Vec::with_capacity(query_setting.len());
+            let mut values = Vec::with_capacity(query_setting.len());
+            for (id, value) in query_setting {
+                ids.push(id);
+                values.push(value);
+            }
+            Settings {
+                set_type: SetType::SettingsQuery,
+                identifiers: ids,
+                values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+            }
+        },
+    );
+    rule!(#query_set: "(SETTING_NAME = VALUE, ...)")(i)
+}
 pub fn top_n(i: Input) -> IResult<u64> {
     map(
         rule! {
@@ -3004,9 +3084,31 @@ pub fn grant_source(i: Input) -> IResult<AccountMgrSource> {
         },
     );
 
+    let warehouse_privs = map(
+        rule! {
+            USAGE ~ ON ~ WAREHOUSE ~ #ident
+        },
+        |(_, _, _, w)| AccountMgrSource::Privs {
+            privileges: vec![UserPrivilegeType::Usage],
+            level: AccountMgrLevel::Warehouse(w.to_string()),
+        },
+    );
+
+    let warehouse_all_privs = map(
+        rule! {
+            ALL ~ PRIVILEGES? ~ ON ~ WAREHOUSE ~ #ident
+        },
+        |(_, _, _, _, w)| AccountMgrSource::Privs {
+            privileges: vec![UserPrivilegeType::Usage],
+            level: AccountMgrLevel::Warehouse(w.to_string()),
+        },
+    );
+
     rule!(
         #role : "ROLE <role_name>"
+        | #warehouse_all_privs: "ALL [ PRIVILEGES ] ON WAREHOUSE <warehouse_name>"
         | #udf_privs: "USAGE ON UDF <udf_name>"
+        | #warehouse_privs: "USAGE ON WAREHOUSE <warehouse_name>"
         | #privs : "<privileges> ON <privileges_level>"
         | #stage_privs : "<stage_privileges> ON STAGE <stage_name>"
         | #udf_all_privs: "ALL [ PRIVILEGES ] ON UDF <udf_name>"
@@ -3149,11 +3251,16 @@ pub fn grant_all_level(i: Input) -> IResult<AccountMgrLevel> {
     let stage = map(rule! { STAGE ~ #ident}, |(_, stage_name)| {
         AccountMgrLevel::Stage(stage_name.to_string())
     });
+
+    let warehouse = map(rule! { WAREHOUSE ~ #ident}, |(_, w)| {
+        AccountMgrLevel::Warehouse(w.to_string())
+    });
     rule!(
         #global : "*.*"
         | #db : "<database>.*"
         | #table : "<database>.<table>"
         | #stage : "STAGE <stage_name>"
+        | #warehouse : "WAREHOUSE <warehouse_name>"
     )(i)
 }
 
@@ -3670,11 +3777,12 @@ pub fn literal_duration(i: Input) -> IResult<Duration> {
 pub fn vacuum_drop_table_option(i: Input) -> IResult<VacuumDropTableOption> {
     alt((map(
         rule! {
-            (DRY ~ ^RUN ~ SUMMARY?)? ~ (LIMIT ~ #literal_u64)?
+            (DRY ~ ^RUN ~ SUMMARY?)? ~ (LIMIT ~ #literal_u64)? ~ FORCE?
         },
-        |(opt_dry_run, opt_limit)| VacuumDropTableOption {
+        |(opt_dry_run, opt_limit, opt_force)| VacuumDropTableOption {
             dry_run: opt_dry_run.map(|dry_run| dry_run.2.is_some()),
             limit: opt_limit.map(|(_, limit)| limit as usize),
+            force: opt_force.is_some(),
         },
     ),))(i)
 }

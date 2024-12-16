@@ -243,7 +243,8 @@ impl HiveTable {
         if partition_num < 100000 {
             trace!(
                 "get {} partitions from hive metastore:{:?}",
-                partition_num, partition_names
+                partition_num,
+                partition_names
             );
         } else {
             trace!("get {} partitions from hive metastore", partition_num);
@@ -612,6 +613,10 @@ async fn do_list_files_from_dir(
         let path = de.path();
         let file_offset = path.rfind('/').unwrap_or_default() + 1;
         if path[file_offset..].starts_with('.') || path[file_offset..].starts_with('_') {
+            continue;
+        }
+        // Ignore the location itself
+        if path.trim_matches('/') == location.trim_matches('/') {
             continue;
         }
 

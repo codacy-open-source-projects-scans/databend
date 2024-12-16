@@ -34,6 +34,7 @@ use databend_common_storage::DataOperator;
 use databend_common_storages_fuse::TableContext;
 
 use crate::pipelines::processors::transforms::create_transform_sort_spill;
+use crate::pipelines::processors::transforms::create_transform_stream_sort_spill;
 use crate::pipelines::PipelineBuilder;
 use crate::sessions::QueryContext;
 use crate::spillers::Spiller;
@@ -83,7 +84,6 @@ impl PipelineBuilder {
                     offset,
                     asc: desc.asc,
                     nulls_first: desc.nulls_first,
-                    is_nullable: plan_schema.field(offset).is_nullable(),  // This information is not needed here.
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -286,19 +286,35 @@ impl SortPipelineBuilder {
                 disk_spill: None,
                 use_parquet: settings.get_spilling_file_format()?.is_parquet(),
             };
+            let settings = self.ctx.get_settings();
+            let enable_experimental_stream_sort_spilling =
+                settings.get_enable_experimental_stream_sort_spilling()?;
             pipeline.add_transform(|input, output| {
                 let op = DataOperator::instance().operator();
                 let spiller = Spiller::create(self.ctx.clone(), op, config.clone())?;
-                Ok(ProcessorPtr::create(create_transform_sort_spill(
-                    input,
-                    output,
-                    schema.clone(),
-                    self.sort_desc.clone(),
-                    self.limit,
-                    spiller,
-                    output_order_col,
-                    enable_loser_tree,
-                )))
+                if enable_experimental_stream_sort_spilling {
+                    Ok(ProcessorPtr::create(create_transform_stream_sort_spill(
+                        input,
+                        output,
+                        schema.clone(),
+                        self.sort_desc.clone(),
+                        self.limit,
+                        spiller,
+                        output_order_col,
+                        enable_loser_tree,
+                    )))
+                } else {
+                    Ok(ProcessorPtr::create(create_transform_sort_spill(
+                        input,
+                        output,
+                        schema.clone(),
+                        self.sort_desc.clone(),
+                        self.limit,
+                        spiller,
+                        output_order_col,
+                        enable_loser_tree,
+                    )))
+                }
             })?;
         }
 

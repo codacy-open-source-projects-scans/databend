@@ -162,22 +162,23 @@ impl SubqueryRewriter {
 
             RelOperator::Sort(mut sort) => {
                 let mut input = self.rewrite(s_expr.child(0)?)?;
-                for item in sort.window_partition.iter_mut() {
-                    let res = self.try_rewrite_subquery(&item.scalar, &input, false)?;
-                    input = res.1;
-                    item.scalar = res.0;
+
+                if let Some(window) = &mut sort.window_partition {
+                    for item in window.partition_by.iter_mut() {
+                        let res = self.try_rewrite_subquery(&item.scalar, &input, false)?;
+                        input = res.1;
+                        item.scalar = res.0;
+                    }
                 }
 
                 Ok(SExpr::create_unary(Arc::new(sort.into()), Arc::new(input)))
             }
 
-            RelOperator::Join(_) | RelOperator::UnionAll(_) | RelOperator::MaterializedCte(_) => {
-                Ok(SExpr::create_binary(
-                    Arc::new(s_expr.plan().clone()),
-                    Arc::new(self.rewrite(s_expr.child(0)?)?),
-                    Arc::new(self.rewrite(s_expr.child(1)?)?),
-                ))
-            }
+            RelOperator::Join(_) | RelOperator::UnionAll(_) => Ok(SExpr::create_binary(
+                Arc::new(s_expr.plan().clone()),
+                Arc::new(self.rewrite(s_expr.child(0)?)?),
+                Arc::new(self.rewrite(s_expr.child(1)?)?),
+            )),
 
             RelOperator::Limit(_) | RelOperator::Udf(_) | RelOperator::AsyncFunction(_) => {
                 Ok(SExpr::create_unary(
@@ -188,7 +189,6 @@ impl SubqueryRewriter {
 
             RelOperator::DummyTableScan(_)
             | RelOperator::Scan(_)
-            | RelOperator::CteScan(_)
             | RelOperator::ConstantTableScan(_)
             | RelOperator::ExpressionScan(_)
             | RelOperator::CacheScan(_)

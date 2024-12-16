@@ -50,7 +50,6 @@ pub struct CreateTablePlan {
     pub engine: Engine,
     pub engine_options: TableOptions,
     pub storage_params: Option<StorageParams>,
-    pub part_prefix: String,
     pub options: TableOptions,
     pub field_comments: Vec<String>,
     pub cluster_key: Option<String>,
@@ -189,6 +188,7 @@ pub struct VacuumDropTableOption {
     // Some(true) means dry run with summary option
     pub dry_run: Option<bool>,
     pub limit: Option<usize>,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone)]

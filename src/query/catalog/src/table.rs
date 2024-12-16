@@ -20,7 +20,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::AbortChecker;
 use databend_common_expression::BlockThresholds;
 use databend_common_expression::ColumnId;
 use databend_common_expression::RemoteExpr;
@@ -53,6 +52,7 @@ use crate::plan::ReclusterParts;
 use crate::plan::StreamColumn;
 use crate::statistics::BasicColumnStatistics;
 use crate::table_args::TableArgs;
+use crate::table_context::AbortChecker;
 use crate::table_context::TableContext;
 
 #[async_trait::async_trait]
@@ -108,6 +108,10 @@ pub trait Table: Sync + Send {
         false
     }
 
+    fn support_distributed_insert(&self) -> bool {
+        false
+    }
+
     /// whether table has the exact number of total rows
     fn has_exact_total_row_count(&self) -> bool {
         false
@@ -148,6 +152,10 @@ pub trait Table: Sync + Send {
 
     /// Whether the table engine supports virtual columns optimization.
     fn support_virtual_columns(&self) -> bool {
+        false
+    }
+
+    fn storage_format_as_parquet(&self) -> bool {
         false
     }
 
@@ -212,6 +220,17 @@ pub trait Table: Sync + Send {
             self.name(),
             self.get_table_info().meta.engine
         )))
+    }
+
+    fn build_prune_pipeline(
+        &self,
+        table_ctx: Arc<dyn TableContext>,
+        plan: &DataSourcePlan,
+        source_pipeline: &mut Pipeline,
+    ) -> Result<Option<Pipeline>> {
+        let (_, _, _) = (table_ctx, plan, source_pipeline);
+
+        Ok(None)
     }
 
     /// Assembly the pipeline of appending data to storage

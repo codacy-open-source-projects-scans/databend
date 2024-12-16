@@ -88,6 +88,7 @@ use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::RenameDatabaseReply;
 use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
 use databend_common_meta_app::schema::RenameTableReply;
 use databend_common_meta_app::schema::RenameTableReq;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
@@ -240,6 +241,33 @@ impl Catalog for MutableCatalog {
             .await?;
 
         self.build_db_instance(&db_info)
+    }
+
+    #[async_backtrace::framed]
+    async fn list_databases_history(&self, tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
+        let dbs = self
+            .ctx
+            .meta
+            .get_tenant_history_databases(
+                ListDatabaseReq {
+                    tenant: tenant.clone(),
+                },
+                false,
+            )
+            .await?;
+
+        dbs.iter()
+            .try_fold(vec![], |mut acc, item: &Arc<DatabaseInfo>| {
+                let db_result = self.build_db_instance(item);
+                match db_result {
+                    Ok(db) => acc.push(db),
+                    Err(err) => {
+                        // Ignore the error and continue, allow partial failure.
+                        warn!("Failed to build database '{:?}': {:?}", item, err);
+                    }
+                }
+                Ok(acc)
+            })
     }
 
     #[async_backtrace::framed]
@@ -406,7 +434,7 @@ impl Catalog for MutableCatalog {
 
     fn get_table_by_info(&self, table_info: &TableInfo) -> Result<Arc<dyn Table>> {
         let storage = self.ctx.storage_factory.clone();
-        storage.get_table(table_info)
+        storage.get_table(table_info, self.disable_table_info_refresh)
     }
 
     #[async_backtrace::framed]
@@ -538,7 +566,7 @@ impl Catalog for MutableCatalog {
                 self.info(),
                 DatabaseType::NormalDB,
             );
-            tables.push(storage.get_table(&table_info)?);
+            tables.push(storage.get_table(&table_info, ctx.disable_table_info_refresh)?);
         }
         Ok((tables, drop_ids))
     }
@@ -763,5 +791,11 @@ impl Catalog for MutableCatalog {
         req: ListDictionaryReq,
     ) -> Result<Vec<(String, DictionaryMeta)>> {
         Ok(self.ctx.meta.list_dictionaries(req).await?)
+    }
+
+    #[async_backtrace::framed]
+    async fn rename_dictionary(&self, req: RenameDictionaryReq) -> Result<()> {
+        let res = self.ctx.meta.rename_dictionary(req).await?;
+        Ok(res)
     }
 }

@@ -174,6 +174,9 @@ impl InterpreterFactory {
             Plan::DropCatalog(plan) => {
                 Ok(Arc::new(DropCatalogInterpreter::create(ctx, *plan.clone())))
             }
+            Plan::UseCatalog(plan) => {
+                Ok(Arc::new(UseCatalogInterpreter::create(ctx, *plan.clone())))
+            }
 
             // Databases
             Plan::ShowCreateDatabase(show_create_database) => Ok(Arc::new(
@@ -607,6 +610,9 @@ impl InterpreterFactory {
                 ctx,
                 *drop_dict.clone(),
             )?)),
+            Plan::RenameDictionary(rename_dictionary) => Ok(Arc::new(
+                RenameDictionaryInterpreter::try_create(ctx, *rename_dictionary.clone())?,
+            )),
             Plan::CreateProcedure(p) => Ok(Arc::new(CreateProcedureInterpreter::try_create(
                 ctx,
                 *p.clone(),

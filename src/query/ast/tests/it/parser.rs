@@ -87,6 +87,8 @@ fn test_statement() {
     let file = &mut mint.new_goldenfile("stmt.txt").unwrap();
     let cases = &[
         r#"show databases"#,
+        r#"show drop databases"#,
+        r#"show drop databases like 'db%'"#,
         r#"show databases format TabSeparatedWithNamesAndTypes;"#,
         r#"show tables"#,
         r#"show drop tables"#,
@@ -129,17 +131,14 @@ fn test_statement() {
         r#"create table a.b like c.d;"#,
         r#"create table t like t2 engine = memory;"#,
         r#"create table if not exists a.b (a int) 's3://testbucket/admin/data/' connection=(aws_key_id='minioadmin' aws_secret_key='minioadmin' endpoint_url='http://127.0.0.1:9900');"#,
-        r#"
-            create table if not exists a.b (a int) 's3://testbucket/admin/data/'
-                connection=(aws_key_id='minioadmin' aws_secret_key='minioadmin' endpoint_url='http://127.0.0.1:9900')
-                location_prefix = 'db';
-        "#,
         r#"truncate table a;"#,
         r#"truncate table "a".b;"#,
         r#"drop table a;"#,
         r#"drop table if exists a."b";"#,
         r#"use "a";"#,
         r#"create catalog ctl type=hive connection=(url='<hive-meta-store>' thrift_protocol='binary');"#,
+        r#"select current_catalog();"#,
+        r#"use catalog ctl;"#,
         r#"create database if not exists a;"#,
         r#"create database ctl.t engine = Default;"#,
         r#"create database t engine = Default;"#,
@@ -200,6 +199,8 @@ fn test_statement() {
         r#"select * from a semi join b on a.a = b.a;"#,
         r#"select * from a left anti join b on a.a = b.a;"#,
         r#"select * from a anti join b on a.a = b.a;"#,
+        r#"SETTINGS (max_thread=1, timezone='Asia/Shanghai') select 1;"#,
+        r#"SETTINGS (max_thread=1) select * from a anti join b on a.a = b.a;"#,
         r#"select * from a right semi join b on a.a = b.a;"#,
         r#"select * from a right anti join b on a.a = b.a;"#,
         r#"select * from a full outer join b on a.a = b.a;"#,
@@ -552,6 +553,10 @@ fn test_statement() {
         r#"GRANT usage ON UDF a TO 'test-grant';"#,
         r#"REVOKE usage ON UDF a FROM 'test-grant';"#,
         r#"REVOKE all ON UDF a FROM 'test-grant';"#,
+        r#"GRANT all ON warehouse a TO role 'test-grant';"#,
+        r#"GRANT usage ON warehouse a TO role 'test-grant';"#,
+        r#"REVOKE usage ON warehouse a FROM role 'test-grant';"#,
+        r#"REVOKE all ON warehouse a FROM role 'test-grant';"#,
         r#"SHOW GRANTS ON TABLE db1.tb1;"#,
         r#"SHOW GRANTS ON DATABASE db;"#,
         r#"UPDATE db1.tb1 set a = a + 1, b = 2 WHERE c > 3;"#,
@@ -590,12 +595,16 @@ fn test_statement() {
         "#,
         r#"SHOW FILE FORMATS"#,
         r#"DROP FILE FORMAT my_csv"#,
+        r#"SELECT * FROM t GROUP BY all"#,
+        r#"SELECT * FROM t GROUP BY a, b, c, d"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS (a, b, c, d)"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS (a, b, (c, d))"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b), (c), (d, e))"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b), (), (d, e))"#,
         r#"SELECT * FROM t GROUP BY CUBE (a, b, c)"#,
         r#"SELECT * FROM t GROUP BY ROLLUP (a, b, c)"#,
+        r#"SELECT * FROM t GROUP BY a, ROLLUP (b, c)"#,
+        r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b)), a, ROLLUP (b, c)"#,
         r#"CREATE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN ('ANALYST') THEN VAL ELSE '*********'END comment = 'this is a masking policy'"#,
         r#"CREATE OR REPLACE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN ('ANALYST') THEN VAL ELSE '*********'END comment = 'this is a masking policy'"#,
         r#"DESC MASKING POLICY email_mask"#,
@@ -1225,6 +1234,9 @@ fn test_expr() {
         r#"ARRAY_FILTER(col, y -> y % 2 = 0)"#,
         r#"(current_timestamp, current_timestamp(), now())"#,
         r#"ARRAY_REDUCE([1,2,3], (acc,t) -> acc + t)"#,
+        r#"MAP_FILTER({1:1,2:2,3:4}, (k, v) -> k > v)"#,
+        r#"MAP_TRANSFORM_KEYS({1:10,2:20,3:30}, (k, v) -> k + 1)"#,
+        r#"MAP_TRANSFORM_VALUES({1:10,2:20,3:30}, (k, v) -> v + 1)"#,
     ];
 
     for case in cases {

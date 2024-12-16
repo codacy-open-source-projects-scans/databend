@@ -85,8 +85,6 @@ pub struct TransformSortSpill<A: SortAlgorithm> {
     /// If `ummerged_blocks.len()` < `num_merge`,
     /// we can use a final merger to merge the last few sorted streams to reduce IO.
     final_merger: Option<Merger<A, BlockStream>>,
-
-    sort_desc: Arc<Vec<SortColumnDescription>>,
 }
 
 #[inline(always)]
@@ -129,13 +127,13 @@ where
         }
 
         if let Some(block) = self.output_data.take() {
-            debug_assert!(matches!(self.state, State::MergeFinal | State::Finish));
+            assert!(matches!(self.state, State::MergeFinal | State::Finish));
             self.output_block(block);
             return Ok(Event::NeedConsume);
         }
 
         if matches!(self.state, State::Finish) {
-            debug_assert!(self.input.is_finished());
+            assert!(self.input.is_finished());
             self.output.finish();
             return Ok(Event::Finished);
         }
@@ -179,6 +177,7 @@ where
                     if meta.is_none() {
                         // It means we get the last block.
                         // We can launch external merge sort now.
+                        self.input.finish();
                         self.state = State::Merging;
                     }
                     self.input_data = Some(block);
@@ -243,7 +242,7 @@ where
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
         schema: DataSchemaRef,
-        sort_desc: Arc<Vec<SortColumnDescription>>,
+        _sort_desc: Arc<Vec<SortColumnDescription>>,
         limit: Option<usize>,
         spiller: Spiller,
         output_order_col: bool,
@@ -262,7 +261,6 @@ where
             unmerged_blocks: VecDeque::new(),
             final_merger: None,
             batch_rows: 0,
-            sort_desc,
         }
     }
 
@@ -305,13 +303,7 @@ where
             streams.push(stream);
         }
 
-        Merger::<A, BlockStream>::create(
-            self.schema.clone(),
-            streams,
-            self.sort_desc.clone(),
-            self.batch_rows,
-            self.limit,
-        )
+        Merger::<A, BlockStream>::create(self.schema.clone(), streams, self.batch_rows, self.limit)
     }
 
     /// Do an external merge sort until there is only one sorted stream.
@@ -511,7 +503,6 @@ mod tests {
             offset: 0,
             asc: true,
             nulls_first: true,
-            is_nullable: false,
         }]);
 
         let transform = TransformSortSpill::<A>::create(

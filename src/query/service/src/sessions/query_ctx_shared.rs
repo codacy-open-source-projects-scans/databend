@@ -31,9 +31,9 @@ use databend_common_catalog::catalog::CatalogManager;
 use databend_common_catalog::merge_into_join::MergeIntoJoin;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::runtime_filter_info::RuntimeFilterInfo;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterReady;
 use databend_common_catalog::statistics::data_cache_statistics::DataCacheMetrics;
 use databend_common_catalog::table_context::ContextError;
-use databend_common_catalog::table_context::MaterializedCtesBlocks;
 use databend_common_catalog::table_context::StageAttachment;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -67,6 +67,8 @@ type DatabaseAndTable = (String, String, String);
 
 /// Data that needs to be shared in a query context.
 pub struct QueryContextShared {
+    // Query level
+    pub(crate) query_settings: Arc<Settings>,
     /// total_scan_values for scan stats
     pub(in crate::sessions) total_scan_values: Arc<Progress>,
     /// scan_progress for scan metrics of datablocks (uncompressed)
@@ -123,12 +125,15 @@ pub struct QueryContextShared {
 
     // Client User-Agent
     pub(in crate::sessions) user_agent: Arc<RwLock<String>>,
-    /// Key is (cte index, used_count), value contains cte's materialized blocks
-    pub(in crate::sessions) materialized_cte_tables: MaterializedCtesBlocks,
 
     pub(in crate::sessions) query_profiles: Arc<RwLock<HashMap<Option<u32>, PlanProfile>>>,
 
     pub(in crate::sessions) runtime_filters: Arc<RwLock<HashMap<IndexType, RuntimeFilterInfo>>>,
+
+    pub(in crate::sessions) runtime_filter_ready:
+        Arc<RwLock<HashMap<IndexType, Vec<Arc<RuntimeFilterReady>>>>>,
+
+    pub(in crate::sessions) wait_runtime_filter: Arc<RwLock<HashMap<IndexType, bool>>>,
 
     pub(in crate::sessions) merge_into_join: Arc<RwLock<MergeIntoJoin>>,
 
@@ -144,6 +149,7 @@ impl QueryContextShared {
         cluster_cache: Arc<Cluster>,
     ) -> Result<Arc<QueryContextShared>> {
         Ok(Arc::new(QueryContextShared {
+            query_settings: Settings::create(session.get_current_tenant()),
             catalog_manager: CatalogManager::instance(),
             session,
             cluster_cache,
@@ -178,7 +184,6 @@ impl QueryContextShared {
             enable_sort_spill: Arc::new(AtomicBool::new(true)),
             status: Arc::new(RwLock::new("null".to_string())),
             user_agent: Arc::new(RwLock::new("null".to_string())),
-            materialized_cte_tables: Arc::new(Default::default()),
             join_spill_progress: Arc::new(Progress::create()),
             agg_spill_progress: Arc::new(Progress::create()),
             group_by_spill_progress: Arc::new(Progress::create()),
@@ -186,6 +191,8 @@ impl QueryContextShared {
             query_cache_metrics: DataCacheMetrics::new(),
             query_profiles: Arc::new(RwLock::new(HashMap::new())),
             runtime_filters: Default::default(),
+            runtime_filter_ready: Default::default(),
+            wait_runtime_filter: Default::default(),
             merge_into_join: Default::default(),
             multi_table_insert_status: Default::default(),
             query_queued_duration: Arc::new(RwLock::new(Duration::from_secs(0))),
@@ -252,6 +259,10 @@ impl QueryContextShared {
 
     pub fn get_current_catalog(&self) -> String {
         self.session.get_current_catalog()
+    }
+
+    pub fn set_current_catalog(&self, catalog_name: String) {
+        self.session.set_current_catalog(catalog_name)
     }
 
     pub fn get_aborting(&self) -> Arc<AtomicBool> {

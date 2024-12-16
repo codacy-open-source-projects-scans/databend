@@ -26,6 +26,7 @@ use databend_common_expression::DataSchemaRefExt;
 
 use super::CreateDictionaryPlan;
 use super::DropDictionaryPlan;
+use super::RenameDictionaryPlan;
 use super::ShowCreateDictionaryPlan;
 use crate::binder::ExplainConfig;
 use crate::optimizer::SExpr;
@@ -143,6 +144,7 @@ use crate::plans::UndropDatabasePlan;
 use crate::plans::UndropTablePlan;
 use crate::plans::UnsetOptionsPlan;
 use crate::plans::UnsetPlan;
+use crate::plans::UseCatalogPlan;
 use crate::plans::UseDatabasePlan;
 use crate::plans::VacuumDropTablePlan;
 use crate::plans::VacuumTablePlan;
@@ -187,6 +189,7 @@ pub enum Plan {
     ShowCreateCatalog(Box<ShowCreateCatalogPlan>),
     CreateCatalog(Box<CreateCatalogPlan>),
     DropCatalog(Box<DropCatalogPlan>),
+    UseCatalog(Box<UseCatalogPlan>),
 
     // Databases
     ShowCreateDatabase(Box<ShowCreateDatabasePlan>),
@@ -372,6 +375,7 @@ pub enum Plan {
     CreateDictionary(Box<CreateDictionaryPlan>),
     DropDictionary(Box<DropDictionaryPlan>),
     ShowCreateDictionary(Box<ShowCreateDictionaryPlan>),
+    RenameDictionary(Box<RenameDictionaryPlan>),
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +391,7 @@ pub enum RewriteKind {
 
     ShowCatalogs,
     ShowDatabases,
+    ShowDropDatabases,
     ShowTables(String, String),
     ShowColumns(String, String, String),
     ShowTablesStatus,
@@ -489,6 +494,7 @@ impl Plan {
             Plan::CallProcedure(plan) => plan.schema(),
             Plan::InsertMultiTable(plan) => plan.schema(),
             Plan::DescUser(plan) => plan.schema(),
+            Plan::Insert(plan) => plan.schema(),
 
             _ => Arc::new(DataSchema::empty()),
         }

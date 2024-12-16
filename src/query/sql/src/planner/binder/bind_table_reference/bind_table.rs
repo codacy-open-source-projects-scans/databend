@@ -70,8 +70,10 @@ impl Binder {
         };
 
         // Check and bind common table expression
-        let ctes_map = self.ctes_map.clone();
-        if let Some(cte_info) = ctes_map.get(&table_name) {
+        let cte_map = bind_context.cte_context.cte_map.clone();
+        if let Some(cte_info) = cte_map.get(&table_name)
+            && !cte_info.materialized
+        {
             if self
                 .metadata
                 .read()
@@ -84,13 +86,11 @@ impl Binder {
                 ))
                 .set_span(*span));
             }
-            return if cte_info.materialized {
-                self.bind_m_cte(bind_context, cte_info, &table_name, alias, span)
-            } else if cte_info.recursive {
+            return if cte_info.recursive {
                 if self.bind_recursive_cte {
                     self.bind_r_cte_scan(bind_context, cte_info, &table_name, alias)
                 } else {
-                    self.bind_r_cte(bind_context, cte_info, &table_name, alias)
+                    self.bind_r_cte(*span, bind_context, cte_info, &table_name, alias)
                 }
             } else {
                 self.bind_cte(*span, bind_context, &table_name, alias, cte_info)
@@ -117,13 +117,15 @@ impl Binder {
                             break;
                         }
                         let bind_context = parent.unwrap().as_mut();
-                        let ctes_map = self.ctes_map.clone();
-                        if let Some(cte_info) = ctes_map.get(&table_name) {
-                            return if !cte_info.materialized {
-                                self.bind_cte(*span, bind_context, &table_name, alias, cte_info)
-                            } else {
-                                self.bind_m_cte(bind_context, cte_info, &table_name, alias, span)
-                            };
+                        let cte_map = bind_context.cte_context.cte_map.clone();
+                        if let Some(cte_info) = cte_map.get(&table_name) {
+                            return self.bind_cte(
+                                *span,
+                                bind_context,
+                                &table_name,
+                                alias,
+                                cte_info,
+                            );
                         }
                         parent = bind_context.parent.as_mut();
                     }

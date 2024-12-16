@@ -19,16 +19,16 @@ use tokio::net::TcpStream;
 
 pub async fn run_redis_source() {
     // Bind the listener to the address
-    let listener = TcpListener::bind("0.0.0.0:6379").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:6179").await.unwrap();
 
     loop {
-        let (socket, _) = listener.accept().await.unwrap();
-
-        // A new task is spawned for each inbound socket. The socket is
-        // moved to the new task and processed there.
-        databend_common_base::runtime::spawn(async move {
-            process(socket).await;
-        });
+        if let Ok((socket, _)) = listener.accept().await {
+            // A new task is spawned for each inbound socket. The socket is
+            // moved to the new task and processed there.
+            databend_common_base::runtime::spawn(async move {
+                process(socket).await;
+            });
+        }
     }
 }
 
@@ -46,19 +46,44 @@ async fn process(stream: TcpStream) {
                 let request = String::from_utf8(buf.clone()).unwrap();
                 let cmds = parse_resp(request);
                 for cmd in cmds {
-                    if let Command::Get(key) = cmd {
-                        // Return a value if the first character of the key is ASCII alphanumeric,
-                        // otherwise treat it as the key does not exist.
-                        let ret_value = if key.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-                            let v = format!("{}_value", key);
-                            format!("${}\r\n{}\r\n", v.len(), v)
-                        } else {
-                            "$-1\r\n".to_string()
-                        };
-                        ret_values.push_back(ret_value);
-                    } else {
-                        let ret_value = "+OK\r\n".to_string();
-                        ret_values.push_back(ret_value);
+                    match cmd {
+                        Command::Get(key) => {
+                            // Return a value if the first character of the key is ASCII alphanumeric,
+                            // otherwise treat it as the key does not exist.
+                            let ret_value = if key.starts_with(|c: char| c.is_ascii_alphanumeric())
+                            {
+                                let v = format!("{}_value", key);
+                                format!("${}\r\n{}\r\n", v.len(), v)
+                            } else {
+                                "$-1\r\n".to_string()
+                            };
+                            ret_values.push_back(ret_value);
+                        }
+                        Command::MGet(keys) => {
+                            // Process a batch of keys, and each key is handled in the same way as Get above.
+                            let mut responses = Vec::new();
+                            for key in keys {
+                                let response =
+                                    if key.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                                        let v = format!("{}_value", key);
+                                        format!("${}\r\n{}\r\n", v.len(), v)
+                                    } else {
+                                        "$-1\r\n".to_string()
+                                    };
+                                responses.push(response);
+                            }
+                            let ret_value =
+                                format!("*{}\r\n{}", responses.len(), responses.concat());
+                            ret_values.push_back(ret_value);
+                        }
+                        Command::Ping => {
+                            let ret_value = "+PONG\r\n".to_string();
+                            ret_values.push_back(ret_value);
+                        }
+                        _ => {
+                            let ret_value = "+OK\r\n".to_string();
+                            ret_values.push_back(ret_value);
+                        }
                     }
                 }
             }
@@ -88,9 +113,11 @@ async fn process(stream: TcpStream) {
     }
 }
 
-// Redis command, only support get, other commands are ignored.
+// Redis command, only support get and mget, other commands are ignored.
 enum Command {
     Get(String),
+    MGet(Vec<String>),
+    Ping,
     Invalid,
     Other,
 }
@@ -111,10 +138,21 @@ fn parse_resp(request: String) -> Vec<Command> {
             cmds.push(Command::Invalid);
             return cmds;
         }
-        // only parse GET command and ingore other commands
+        // only parse GET & MGET and ingore other commands
         if lines[2] == "GET" {
             let cmd = Command::Get(lines[4].to_string());
             cmds.push(cmd);
+        } else if lines[2] == "MGET" {
+            let args: Vec<String> = lines
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index >= 4 && (index - 4) % 2 == 0)
+                .map(|(_, &line)| line.to_string())
+                .collect();
+            let cmd = Command::MGet(args);
+            cmds.push(cmd);
+        } else if lines[2] == "PING" {
+            cmds.push(Command::Ping)
         } else {
             cmds.push(Command::Other);
         }

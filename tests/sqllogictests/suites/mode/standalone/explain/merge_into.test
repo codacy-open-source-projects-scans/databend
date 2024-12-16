@@ -122,7 +122,7 @@ CommitSink
             ├── build keys: [employees2.employee_id (#0)]
             ├── probe keys: [salaries2.employee_id (#3)]
             ├── filters: []
-            ├── estimated rows: 6.00
+            ├── estimated rows: 4.00
             ├── TableScan(Build)
             │   ├── table: default.default.employees2
             │   ├── output columns: [employee_id (#0), employee_name (#1), department (#2)]
@@ -137,7 +137,7 @@ CommitSink
                 ├── table: default.default.salaries2
                 ├── output columns: [employee_id (#3), _row_id (#5)]
                 ├── read rows: 6
-                ├── read size: 1.31 KiB
+                ├── read size: 1.19 KiB
                 ├── partitions total: 2
                 ├── partitions scanned: 2
                 ├── push downs: [filters: [], limit: NONE]
@@ -161,7 +161,7 @@ CommitSink
             ├── build keys: [employees2.employee_id (#0)]
             ├── probe keys: [salaries2.employee_id (#3)]
             ├── filters: []
-            ├── estimated rows: 6.00
+            ├── estimated rows: 4.00
             ├── TableScan(Build)
             │   ├── table: default.default.employees2
             │   ├── output columns: [employee_id (#0), employee_name (#1), department (#2)]
@@ -176,7 +176,7 @@ CommitSink
                 ├── table: default.default.salaries2
                 ├── output columns: [employee_id (#3), _row_id (#5)]
                 ├── read rows: 6
-                ├── read size: 1.31 KiB
+                ├── read size: 1.19 KiB
                 ├── partitions total: 2
                 ├── partitions scanned: 2
                 ├── push downs: [filters: [], limit: NONE]

@@ -63,6 +63,8 @@ use crate::pruning::BloomPrunerCreator;
 use crate::pruning::FusePruningStatistics;
 use crate::pruning::InvertedIndexPruner;
 use crate::pruning::SegmentLocation;
+use crate::pruning::VirtualColumnPruner;
+use crate::FuseStorageFormat;
 
 const SMALL_DATASET_SAMPLE_THRESHOLD: usize = 100;
 
@@ -78,6 +80,7 @@ pub struct PruningContext {
     pub page_pruner: Arc<dyn PagePruner + Send + Sync>,
     pub internal_column_pruner: Option<Arc<InternalColumnPruner>>,
     pub inverted_index_pruner: Option<Arc<InvertedIndexPruner>>,
+    pub virtual_column_pruner: Option<Arc<VirtualColumnPruner>>,
 
     pub pruning_stats: Arc<FusePruningStatistics>,
 }
@@ -94,6 +97,7 @@ impl PruningContext {
         bloom_index_cols: BloomIndexColumns,
         max_concurrency: usize,
         bloom_index_builder: Option<BloomIndexBuilder>,
+        storage_format: FuseStorageFormat,
     ) -> Result<Arc<PruningContext>> {
         let func_ctx = ctx.get_function_context()?;
 
@@ -160,6 +164,10 @@ impl PruningContext {
         // inverted index pruner, used to search matched rows in block
         let inverted_index_pruner = InvertedIndexPruner::try_create(ctx, dal.clone(), push_down)?;
 
+        // virtual column pruner, used to read virtual column metas and ignore source columns.
+        let virtual_column_pruner =
+            VirtualColumnPruner::try_create(dal.clone(), push_down, storage_format)?;
+
         // Internal column pruner, if there are predicates using internal columns,
         // we can use them to prune segments and blocks.
         let internal_column_pruner =
@@ -187,6 +195,7 @@ impl PruningContext {
             page_pruner,
             internal_column_pruner,
             inverted_index_pruner,
+            virtual_column_pruner,
             pruning_stats,
         });
         Ok(pruning_ctx)
@@ -212,6 +221,7 @@ impl FusePruner {
         push_down: &Option<PushDownInfo>,
         bloom_index_cols: BloomIndexColumns,
         bloom_index_builder: Option<BloomIndexBuilder>,
+        storage_format: FuseStorageFormat,
     ) -> Result<Self> {
         Self::create_with_pages(
             ctx,
@@ -222,6 +232,7 @@ impl FusePruner {
             vec![],
             bloom_index_cols,
             bloom_index_builder,
+            storage_format,
         )
     }
 
@@ -235,6 +246,7 @@ impl FusePruner {
         cluster_keys: Vec<RemoteExpr<String>>,
         bloom_index_cols: BloomIndexColumns,
         bloom_index_builder: Option<BloomIndexBuilder>,
+        storage_format: FuseStorageFormat,
     ) -> Result<Self> {
         let max_concurrency = {
             let max_io_requests = ctx.get_settings().get_max_storage_io_requests()? as usize;
@@ -261,6 +273,7 @@ impl FusePruner {
             bloom_index_cols,
             max_concurrency,
             bloom_index_builder,
+            storage_format,
         )?;
 
         Ok(FusePruner {
@@ -430,6 +443,53 @@ impl FusePruner {
         }
     }
 
+    // Temporarily using, will remove after finish pruning refactor.
+    pub async fn segment_pruning(
+        &self,
+        mut segment_locs: Vec<SegmentLocation>,
+    ) -> Result<Vec<(SegmentLocation, Arc<CompactSegmentInfo>)>> {
+        // Segment pruner.
+        let segment_pruner =
+            SegmentPruner::create(self.pruning_ctx.clone(), self.table_schema.clone())?;
+
+        let mut remain = segment_locs.len() % self.max_concurrency;
+        let batch_size = segment_locs.len() / self.max_concurrency;
+        let mut works = Vec::with_capacity(self.max_concurrency);
+        while !segment_locs.is_empty() {
+            let gap_size = std::cmp::min(1, remain);
+            let batch_size = batch_size + gap_size;
+            remain -= gap_size;
+
+            let mut batch = segment_locs.drain(0..batch_size).collect::<Vec<_>>();
+            works.push(self.pruning_ctx.pruning_runtime.spawn({
+                let segment_pruner = segment_pruner.clone();
+                let pruning_ctx = self.pruning_ctx.clone();
+                async move {
+                    // Build pruning tasks.
+                    if let Some(internal_column_pruner) = &pruning_ctx.internal_column_pruner {
+                        batch = batch
+                            .into_iter()
+                            .filter(|segment| {
+                                internal_column_pruner
+                                    .should_keep(SEGMENT_NAME_COL_NAME, &segment.location.0)
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                    let pruned_segments = segment_pruner.pruning(batch).await?;
+                    Result::<_>::Ok(pruned_segments)
+                }
+            }));
+        }
+
+        let workers = futures::future::try_join_all(works).await?;
+        let mut pruned_segments = vec![];
+        for worker in workers {
+            let res = worker?;
+            pruned_segments.extend(res);
+        }
+        Ok(pruned_segments)
+    }
+
     fn extract_block_metas(
         segment_path: &str,
         segment: &CompactSegmentInfo,
@@ -562,7 +622,7 @@ impl FusePruner {
     }
 }
 
-fn table_sample(push_down_info: &Option<PushDownInfo>) -> Result<Option<f64>> {
+pub fn table_sample(push_down_info: &Option<PushDownInfo>) -> Result<Option<f64>> {
     let mut sample_probability = None;
     if let Some(sample) = push_down_info
         .as_ref()

@@ -68,6 +68,7 @@ impl PipelineBuilder {
                     update_stream_columns: table.change_tracking_enabled(),
                     data_mask_policy: None,
                     table_index: usize::MAX,
+                    scan_id: usize::MAX,
                 };
 
                 {
@@ -126,7 +127,6 @@ impl PipelineBuilder {
                         offset: *offset,
                         asc: true,
                         nulls_first: false,
-                        is_nullable: false, // This information is not needed here.
                     })
                     .collect();
 

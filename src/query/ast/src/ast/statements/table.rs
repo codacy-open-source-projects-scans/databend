@@ -116,7 +116,7 @@ pub struct ShowDropTablesStmt {
 
 impl Display for ShowDropTablesStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "SHOW DROP TABLE")?;
+        write!(f, "SHOW DROP TABLES")?;
         if let Some(database) = &self.database {
             write!(f, " FROM {database}")?;
         }
@@ -774,6 +774,7 @@ pub struct VacuumDropTableOption {
     // Some(true) means dry run with summary option
     pub dry_run: Option<bool>,
     pub limit: Option<usize>,
+    pub force: bool,
 }
 
 impl Display for VacuumDropTableOption {
@@ -786,6 +787,9 @@ impl Display for VacuumDropTableOption {
         }
         if let Some(limit) = self.limit {
             write!(f, " LIMIT {}", limit)?;
+        }
+        if self.force {
+            write!(f, " FORCE")?;
         }
         Ok(())
     }
