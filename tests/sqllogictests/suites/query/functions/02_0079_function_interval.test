@@ -1,0 +1,315 @@
+onlyif http
+query T
+select interval '1 month 1 hour 1 microsecond ago'
+----
+-1 month -1:00:00.000001
+
+onlyif http
+query T
+select interval  (number::string) month  a , a * 3, -3 * a  from numbers(4) where number > 0;
+----
+1 month 3 months -3 months
+2 months 6 months -6 months
+3 months 9 months -9 months
+
+
+onlyif http
+statement ok
+create or replace table t(c1 interval, c2 interval);
+
+onlyif http
+statement ok
+insert into t values('1 year 1 month ago', '1'),('1 month 1 hour ago', '1000');
+
+onlyif http
+query TT
+select * from t order by c1;
+----
+-1 year -1 month 0:00:00.000001
+-1 month -1:00:00 0:00:00.001
+
+onlyif http
+query TT
+select * from t where c1 > to_interval('-1 year');
+----
+-1 month -1:00:00 0:00:00.001
+
+onlyif http
+query TT
+select * from t where c1 > '-1 year';
+----
+-1 month -1:00:00 0:00:00.001
+
+onlyif http
+statement error 1006
+select to_interval('1 month 1 hour ago 1 micros');
+
+onlyif http
+query T
+select to_interval('1 month 1 hour 1 microsecond');
+----
+1 month 1:00:00.000001
+
+onlyif http
+query T
+select to_interval('1 month 1 hour 1 microsecond ago');
+----
+-1 month -1:00:00.000001
+
+onlyif http
+query T
+select to_interval('1 month 1 hour 1 microsecond ago');
+----
+-1 month -1:00:00.000001
+
+onlyif http
+query T
+select to_interval('12 month') = to_interval('360 days')
+----
+1
+
+onlyif http
+query T
+select to_interval('12 month') = to_interval('1 year');
+----
+1
+
+onlyif http
+query TT
+select to_month(to_interval('12 month')), to_month(to_interval('1 year'));
+----
+0 0
+
+onlyif http
+query T
+select to_interval('1 hours') = to_interval('3600 seconds') as eq, to_interval('2 hours') > to_interval('3600 seconds');
+----
+1 1
+
+onlyif http
+query T
+SELECT to_centuries(2);
+----
+200 years
+
+onlyif http
+query T
+SELECT to_days(5);
+----
+5 days
+
+onlyif http
+query T
+SELECT to_decades(3);
+----
+30 years
+
+onlyif http
+query T
+SELECT TIMESTAMP '2024-12-20 10:00:00' + to_hours(4);
+----
+2024-12-20 14:00:00.000000
+
+onlyif http
+query T
+SELECT TIMESTAMP '2024-12-20 10:00:00' + to_microseconds(500000);
+----
+2024-12-20 10:00:00.500000
+
+onlyif http
+query T
+SELECT to_millennia(1);
+----
+1000 years
+
+onlyif http
+query T
+SELECT TIMESTAMP '2024-12-20 10:00:00' + to_milliseconds(750);
+----
+2024-12-20 10:00:00.750000
+
+onlyif http
+query T
+SELECT TIMESTAMP '2024-12-20 10:00:00' + to_minutes(30);
+----
+2024-12-20 10:30:00.000000
+
+onlyif http
+query T
+SELECT to_months(3);
+----
+3 months
+
+onlyif http
+query T
+SELECT TIMESTAMP '2024-12-20 10:00:00' + to_seconds(60);
+----
+2024-12-20 10:01:00.000000
+
+onlyif http
+query T
+SELECT to_weeks(2);
+----
+14 days
+
+onlyif http
+query T
+SELECT to_years(10);
+----
+10 years
+
+onlyif http
+query T
+select to_interval('1200000000 months');
+----
+100000000 years
+
+onlyif http
+query T
+select to_interval('120000000000 months');
+----
+00:00:00
+
+onlyif http
+query T
+select '2022-01-01'::timestamp - '2021-01-01'::timestamp
+----
+31536000000000
+
+onlyif http
+query T
+select timestamp_diff('2022-01-01'::timestamp,'2021-01-01'::timestamp);
+----
+8760:00:00
+
+onlyif http
+query T
+select timestamp_diff('2021-01-01'::timestamp, '2022-01-01'::timestamp);
+----
+-8760:00:00
+
+onlyif http
+query T
+select timestamp_diff('2022-01-01'::timestamp,'2021-12-01'::timestamp);
+----
+744:00:00
+
+onlyif http
+query T
+select '2022-01-01'::timestamp-'2021-12-01'::timestamp;
+----
+2678400000000
+
+onlyif http
+query TT
+select '1 days'::INTERVAL::String, '11 days'::INTERVAL::String;
+----
+1 day 11 days
+
+statement ok
+set timezone='America/New_York';
+
+query T
+select age(today(), '2022-02-02'::date)=age('2022-02-02'::date);
+----
+1
+
+query T
+WITH sample_dates(name, birth_date) AS (
+VALUES
+('Alice', '1990-05-15'::DATE),
+('Alice', '1990-04-15'::DATE),
+('Alice', '1990-06-15'::DATE),
+('Bob', '1985-11-30'::DATE),
+('Charlie', '1995-07-22'::DATE)
+)
+SELECT
+name,
+birth_date,
+birth_date::timestamp as birth_date_ts,
+age('2025-06-12'::date, birth_date),
+EXTRACT(YEAR FROM age('2025-06-12'::date, birth_date)) AS years,
+EXTRACT(MONTH FROM age('2025-06-12'::date, birth_date)) AS months,
+EXTRACT(DAY FROM age('2025-06-12'::date, birth_date)) AS days
+FROM sample_dates order by name, birth_date;
+----
+Alice 1990-04-15 1990-04-15 00:00:00.000000 35 years 1 month 27 days 35 1 27
+Alice 1990-05-15 1990-05-15 00:00:00.000000 35 years 28 days 35 0 28
+Alice 1990-06-15 1990-06-15 00:00:00.000000 34 years 11 months 27 days 34 11 27
+Bob 1985-11-30 1985-11-30 00:00:00.000000 39 years 6 months 12 days 39 6 12
+Charlie 1995-07-22 1995-07-22 00:00:00.000000 29 years 10 months 21 days 29 10 21
+
+statement ok
+set timezone='Asia/Shanghai';
+
+query T
+select age(today(), '2022-02-02'::date)=age('2022-02-02'::date);
+----
+1
+
+query T
+WITH sample_dates(name, birth_date) AS (
+VALUES
+('Alice', '1990-05-15'::DATE),
+('Alice', '1990-04-15'::DATE),
+('Alice', '1990-06-15'::DATE),
+('Bob', '1985-11-30'::DATE),
+('Charlie', '1995-07-22'::DATE)
+)
+SELECT
+name,
+birth_date,
+birth_date::timestamp as birth_date_ts,
+age('2025-06-12'::date, birth_date),
+EXTRACT(YEAR FROM age('2025-06-12'::date, birth_date)) AS years,
+EXTRACT(MONTH FROM age('2025-06-12'::date, birth_date)) AS months,
+EXTRACT(DAY FROM age('2025-06-12'::date, birth_date)) AS days
+FROM sample_dates order by name, birth_date;
+----
+Alice 1990-04-15 1990-04-15 00:00:00.000000 35 years 1 month 27 days 35 1 27
+Alice 1990-05-15 1990-05-15 00:00:00.000000 35 years 28 days 35 0 28
+Alice 1990-06-15 1990-06-15 00:00:00.000000 34 years 11 months 27 days 34 11 27
+Bob 1985-11-30 1985-11-30 00:00:00.000000 39 years 6 months 12 days 39 6 12
+Charlie 1995-07-22 1995-07-22 00:00:00.000000 29 years 10 months 21 days 29 10 21
+
+
+statement ok
+set timezone='UTC';
+
+query T
+select age(today(), '2022-02-02'::date)=age('2022-02-02'::date);
+----
+1
+
+query T
+WITH sample_dates(name, birth_date) AS (
+VALUES
+('Alice', '1990-05-15'::DATE),
+('Alice', '1990-04-15'::DATE),
+('Alice', '1990-06-15'::DATE),
+('Bob', '1985-11-30'::DATE),
+('Charlie', '1995-07-22'::DATE)
+)
+SELECT
+name,
+birth_date,
+birth_date::timestamp as birth_date_ts,
+age('2025-06-12'::date, birth_date),
+EXTRACT(YEAR FROM age('2025-06-12'::date, birth_date)) AS years,
+EXTRACT(MONTH FROM age('2025-06-12'::date, birth_date)) AS months,
+EXTRACT(DAY FROM age('2025-06-12'::date, birth_date)) AS days
+FROM sample_dates order by name, birth_date;
+----
+Alice 1990-04-15 1990-04-15 00:00:00.000000 35 years 1 month 27 days 35 1 27
+Alice 1990-05-15 1990-05-15 00:00:00.000000 35 years 28 days 35 0 28
+Alice 1990-06-15 1990-06-15 00:00:00.000000 34 years 11 months 27 days 34 11 27
+Bob 1985-11-30 1985-11-30 00:00:00.000000 39 years 6 months 12 days  39 6 12
+Charlie 1995-07-22 1995-07-22 00:00:00.000000 29 years 10 months 21 days 29 10 21
+
+statement ok
+unset timezone;
+
+query T
+select age(to_timestamp_tz(today()), '2022-02-02 01:00:00 +0800'::timestamp_tz)=age('2022-02-02 01:00:00 +0800'::timestamp_tz);
+----
+1

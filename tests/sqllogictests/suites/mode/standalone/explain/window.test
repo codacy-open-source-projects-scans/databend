@@ -1,0 +1,1132 @@
+statement ok
+set enable_auto_materialize_cte = 0;
+
+statement ok
+CREATE DATABASE IF NOT EXISTS test_explain_window
+
+statement ok
+USE test_explain_window
+
+statement ok
+DROP TABLE IF EXISTS empsalary
+
+statement ok
+CREATE TABLE empsalary (depname string, empno bigint, salary int, enroll_date date)
+
+query T
+explain SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname ORDER BY empno) FROM empsalary ORDER BY depname, empno
+----
+Sort(Single)
+├── output columns: [empsalary.depname (#0), empsalary.empno (#1), empsalary.salary (#2), sum(salary) OVER (PARTITION BY depname ORDER BY empno) (#4)]
+├── sort keys: [depname ASC NULLS LAST, empno ASC NULLS LAST]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [empsalary.depname (#0), empsalary.empno (#1), empsalary.salary (#2), sum(salary) OVER (PARTITION BY depname ORDER BY empno) (#4)]
+    ├── aggregate function: [sum(salary)]
+    ├── partition by: [depname]
+    ├── order by: [empno]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── WindowPartition
+        ├── output columns: [empsalary.depname (#0), empsalary.empno (#1), empsalary.salary (#2)]
+        ├── hash keys: [depname]
+        ├── estimated rows: 0.00
+        └── TableScan
+            ├── table: default.test_explain_window.empsalary
+            ├── output columns: [depname (#0), empno (#1), salary (#2)]
+            ├── read rows: 0
+            ├── read size: 0
+            ├── partitions total: 0
+            ├── partitions scanned: 0
+            ├── push downs: [filters: [], limit: NONE]
+            └── estimated rows: 0.00
+
+statement ok
+set max_threads=4;
+
+# Disable sort spilling
+statement ok
+set sort_spilling_memory_ratio = 0;
+
+query T
+explain pipeline SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname ORDER BY empno) FROM empsalary ORDER BY depname, empno;
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "Resize" ]
+    8 [ label = "SortPartialTransform" ]
+    9 [ label = "SortPartialTransform" ]
+    10 [ label = "SortPartialTransform" ]
+    11 [ label = "SortPartialTransform" ]
+    12 [ label = "TransformSortMerge" ]
+    13 [ label = "TransformSortMerge" ]
+    14 [ label = "TransformSortMerge" ]
+    15 [ label = "TransformSortMerge" ]
+    16 [ label = "KWayMergePartitioner" ]
+    17 [ label = "KWayMergeWorker" ]
+    18 [ label = "KWayMergeWorker" ]
+    19 [ label = "KWayMergeWorker" ]
+    20 [ label = "KWayMergeWorker" ]
+    21 [ label = "KWayMergeCombiner" ]
+    22 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "from: 0, to: 0" ]
+    7 -> 9 [ label = "from: 1, to: 0" ]
+    7 -> 10 [ label = "from: 2, to: 0" ]
+    7 -> 11 [ label = "from: 3, to: 0" ]
+    8 -> 12 [ label = "" ]
+    9 -> 13 [ label = "" ]
+    10 -> 14 [ label = "" ]
+    11 -> 15 [ label = "" ]
+    12 -> 16 [ label = "from: 0, to: 0" ]
+    13 -> 16 [ label = "from: 0, to: 1" ]
+    14 -> 16 [ label = "from: 0, to: 2" ]
+    15 -> 16 [ label = "from: 0, to: 3" ]
+    16 -> 17 [ label = "from: 0, to: 0" ]
+    16 -> 18 [ label = "from: 1, to: 0" ]
+    16 -> 19 [ label = "from: 2, to: 0" ]
+    16 -> 20 [ label = "from: 3, to: 0" ]
+    17 -> 21 [ label = "from: 0, to: 0" ]
+    18 -> 21 [ label = "from: 0, to: 1" ]
+    19 -> 21 [ label = "from: 0, to: 2" ]
+    20 -> 21 [ label = "from: 0, to: 3" ]
+    21 -> 22 [ label = "" ]
+}
+
+
+# Enable sort spilling
+statement ok
+set sort_spilling_memory_ratio = 60;
+
+query T
+explain pipeline SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname ORDER BY empno) FROM empsalary ORDER BY depname, empno;
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "Resize" ]
+    8 [ label = "SortPartialTransform" ]
+    9 [ label = "SortPartialTransform" ]
+    10 [ label = "SortPartialTransform" ]
+    11 [ label = "SortPartialTransform" ]
+    12 [ label = "TransformSortMerge" ]
+    13 [ label = "TransformSortMerge" ]
+    14 [ label = "TransformSortMerge" ]
+    15 [ label = "TransformSortMerge" ]
+    16 [ label = "KWayMergePartitioner" ]
+    17 [ label = "KWayMergeWorker" ]
+    18 [ label = "KWayMergeWorker" ]
+    19 [ label = "KWayMergeWorker" ]
+    20 [ label = "KWayMergeWorker" ]
+    21 [ label = "KWayMergeCombiner" ]
+    22 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "from: 0, to: 0" ]
+    7 -> 9 [ label = "from: 1, to: 0" ]
+    7 -> 10 [ label = "from: 2, to: 0" ]
+    7 -> 11 [ label = "from: 3, to: 0" ]
+    8 -> 12 [ label = "" ]
+    9 -> 13 [ label = "" ]
+    10 -> 14 [ label = "" ]
+    11 -> 15 [ label = "" ]
+    12 -> 16 [ label = "from: 0, to: 0" ]
+    13 -> 16 [ label = "from: 0, to: 1" ]
+    14 -> 16 [ label = "from: 0, to: 2" ]
+    15 -> 16 [ label = "from: 0, to: 3" ]
+    16 -> 17 [ label = "from: 0, to: 0" ]
+    16 -> 18 [ label = "from: 1, to: 0" ]
+    16 -> 19 [ label = "from: 2, to: 0" ]
+    16 -> 20 [ label = "from: 3, to: 0" ]
+    17 -> 21 [ label = "from: 0, to: 0" ]
+    18 -> 21 [ label = "from: 0, to: 1" ]
+    19 -> 21 [ label = "from: 0, to: 2" ]
+    20 -> 21 [ label = "from: 0, to: 3" ]
+    21 -> 22 [ label = "" ]
+}
+
+
+statement ok
+DROP TABLE IF EXISTS Test
+
+statement ok
+CREATE TABLE Test (k int, v int);
+
+# push down filter in window function
+query T
+explain SELECT k, v FROM (SELECT *, rank() OVER (PARTITION BY k ORDER BY v DESC) AS rank FROM ((SELECT k, v FROM Test) UNION ALL (SELECT k, v FROM Test) ) t1 ) t2 WHERE rank = 1 AND k = 12;
+----
+Filter
+├── output columns: [k (#4), v (#5)]
+├── filters: [t2.rank (#6) = 1]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [k (#4), v (#5), rank() OVER (PARTITION BY k ORDER BY v DESC) (#6)]
+    ├── aggregate function: [rank]
+    ├── partition by: [k]
+    ├── order by: [v]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── WindowPartition
+        ├── output columns: [k (#4), v (#5)]
+        ├── hash keys: [k]
+        ├── top: 1
+        ├── estimated rows: 0.00
+        └── UnionAll
+            ├── output columns: [k (#4), v (#5)]
+            ├── estimated rows: 0.00
+            ├── Filter
+            │   ├── output columns: [test.k (#0), test.v (#1)]
+            │   ├── filters: [is_true(test.k (#0) = 12)]
+            │   ├── estimated rows: 0.00
+            │   └── TableScan
+            │       ├── table: default.test_explain_window.test
+            │       ├── output columns: [k (#0), v (#1)]
+            │       ├── read rows: 0
+            │       ├── read size: 0
+            │       ├── partitions total: 0
+            │       ├── partitions scanned: 0
+            │       ├── push downs: [filters: [is_true(test.k (#0) = 12)], limit: NONE]
+            │       └── estimated rows: 0.00
+            └── Filter
+                ├── output columns: [test.k (#2), test.v (#3)]
+                ├── filters: [is_true(test.k (#2) = 12)]
+                ├── estimated rows: 0.00
+                └── TableScan
+                    ├── table: default.test_explain_window.test
+                    ├── output columns: [k (#2), v (#3)]
+                    ├── read rows: 0
+                    ├── read size: 0
+                    ├── partitions total: 0
+                    ├── partitions scanned: 0
+                    ├── push downs: [filters: [is_true(test.k (#2) = 12)], limit: NONE]
+                    └── estimated rows: 0.00
+
+# cannot push down filter in window function
+query T
+explain SELECT k, v FROM (SELECT *, rank() OVER (PARTITION BY v ORDER BY v DESC) AS rank FROM ((SELECT k, v FROM Test) UNION ALL (SELECT k, v FROM Test) ) t1 ) t2 WHERE rank = 1 AND k = 12;
+----
+Filter
+├── output columns: [k (#4), v (#5)]
+├── filters: [t2.rank (#6) = 1, is_true(t2.k (#4) = 12)]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [k (#4), v (#5), rank() OVER (PARTITION BY v ORDER BY v DESC) (#6)]
+    ├── aggregate function: [rank]
+    ├── partition by: [v]
+    ├── order by: [v]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── WindowPartition
+        ├── output columns: [k (#4), v (#5)]
+        ├── hash keys: [v]
+        ├── top: 1
+        ├── estimated rows: 0.00
+        └── UnionAll
+            ├── output columns: [k (#4), v (#5)]
+            ├── estimated rows: 0.00
+            ├── TableScan
+            │   ├── table: default.test_explain_window.test
+            │   ├── output columns: [k (#0), v (#1)]
+            │   ├── read rows: 0
+            │   ├── read size: 0
+            │   ├── partitions total: 0
+            │   ├── partitions scanned: 0
+            │   ├── push downs: [filters: [], limit: NONE]
+            │   └── estimated rows: 0.00
+            └── TableScan
+                ├── table: default.test_explain_window.test
+                ├── output columns: [k (#2), v (#3)]
+                ├── read rows: 0
+                ├── read size: 0
+                ├── partitions total: 0
+                ├── partitions scanned: 0
+                ├── push downs: [filters: [], limit: NONE]
+                └── estimated rows: 0.00
+
+# cannot push down filter in window function
+query T
+explain SELECT k, v FROM (SELECT *, rank() OVER (ORDER BY v DESC) AS rank FROM ((SELECT k, v FROM Test) UNION ALL (SELECT k, v FROM Test) ) t1 ) t2 WHERE rank = 1 AND k = 12;
+----
+Filter
+├── output columns: [k (#4), v (#5)]
+├── filters: [t2.rank (#6) = 1, is_true(t2.k (#4) = 12)]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [k (#4), v (#5), rank() OVER (ORDER BY v DESC) (#6)]
+    ├── aggregate function: [rank]
+    ├── partition by: []
+    ├── order by: [v]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── Sort(Single)
+        ├── output columns: [k (#4), v (#5)]
+        ├── sort keys: [v DESC NULLS LAST]
+        ├── estimated rows: 0.00
+        └── UnionAll
+            ├── output columns: [k (#4), v (#5)]
+            ├── estimated rows: 0.00
+            ├── TableScan
+            │   ├── table: default.test_explain_window.test
+            │   ├── output columns: [k (#0), v (#1)]
+            │   ├── read rows: 0
+            │   ├── read size: 0
+            │   ├── partitions total: 0
+            │   ├── partitions scanned: 0
+            │   ├── push downs: [filters: [], limit: NONE]
+            │   └── estimated rows: 0.00
+            └── TableScan
+                ├── table: default.test_explain_window.test
+                ├── output columns: [k (#2), v (#3)]
+                ├── read rows: 0
+                ├── read size: 0
+                ├── partitions total: 0
+                ├── partitions scanned: 0
+                ├── push downs: [filters: [], limit: NONE]
+                └── estimated rows: 0.00
+
+statement ok
+drop table if exists t
+
+statement ok
+create table t(a int)
+
+query T
+explain select max(a) OVER (partition by a) FROM t qualify max(a) OVER (partition by a) > 3;
+----
+Filter
+├── output columns: [max(a) OVER (PARTITION BY a) (#1)]
+├── filters: [is_true(max(a) OVER (PARTITION BY a) (#1) > 3)]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [t.a (#0), max(a) OVER (PARTITION BY a) (#1)]
+    ├── aggregate function: [max(a)]
+    ├── partition by: [a]
+    ├── order by: []
+    ├── frame: [Range: Preceding(None) ~ Following(None)]
+    └── WindowPartition
+        ├── output columns: [t.a (#0)]
+        ├── hash keys: [a]
+        ├── estimated rows: 0.00
+        └── TableScan
+            ├── table: default.test_explain_window.t
+            ├── output columns: [a (#0)]
+            ├── read rows: 0
+            ├── read size: 0
+            ├── partitions total: 0
+            ├── partitions scanned: 0
+            ├── push downs: [filters: [], limit: NONE]
+            └── estimated rows: 0.00
+
+## example from: https://community.snowflake.com/s/article/Pushdown-or-Not-Pushdown
+statement ok
+DROP TABLE IF EXISTS tbpush
+
+statement ok
+create table tbpush(b int);
+
+statement ok
+DROP view IF EXISTS vwpush
+
+statement ok
+create view vwpush (b, rnum) as select b, row_number() over (order by b) from tbpush
+
+query T
+explain select b, row_number() over (order by b) from tbpush where b > 3;
+----
+Window
+├── output columns: [tbpush.b (#0), row_number() OVER (ORDER BY b) (#1)]
+├── aggregate function: [row_number]
+├── partition by: []
+├── order by: [b]
+├── frame: [Range: Preceding(None) ~ CurrentRow]
+└── Sort(Single)
+    ├── output columns: [tbpush.b (#0)]
+    ├── sort keys: [b ASC NULLS LAST]
+    ├── estimated rows: 0.00
+    └── Filter
+        ├── output columns: [tbpush.b (#0)]
+        ├── filters: [is_true(tbpush.b (#0) > 3)]
+        ├── estimated rows: 0.00
+        └── TableScan
+            ├── table: default.test_explain_window.tbpush
+            ├── output columns: [b (#0)]
+            ├── read rows: 0
+            ├── read size: 0
+            ├── partitions total: 0
+            ├── partitions scanned: 0
+            ├── push downs: [filters: [is_true(tbpush.b (#0) > 3)], limit: NONE]
+            └── estimated rows: 0.00
+
+query T
+explain select * from vwpush where b > 3;
+----
+Filter
+├── output columns: [tbpush.b (#0), rnum (#1)]
+├── filters: [is_true(vwpush.b (#0) > 3)]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [tbpush.b (#0), rnum (#1)]
+    ├── aggregate function: [row_number]
+    ├── partition by: []
+    ├── order by: [b]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── Sort(Single)
+        ├── output columns: [tbpush.b (#0)]
+        ├── sort keys: [b ASC NULLS LAST]
+        ├── estimated rows: 0.00
+        └── TableScan
+            ├── table: default.test_explain_window.tbpush
+            ├── output columns: [b (#0)]
+            ├── read rows: 0
+            ├── read size: 0
+            ├── partitions total: 0
+            ├── partitions scanned: 0
+            ├── push downs: [filters: [], limit: NONE]
+            └── estimated rows: 0.00
+
+query T
+explain select * from (select b, row_number() over (order by b) from tbpush) where b > 3;
+----
+Filter
+├── output columns: [tbpush.b (#0), row_number() OVER (ORDER BY b) (#1)]
+├── filters: [is_true(tbpush.b (#0) > 3)]
+├── estimated rows: 0.00
+└── Window
+    ├── output columns: [tbpush.b (#0), row_number() OVER (ORDER BY b) (#1)]
+    ├── aggregate function: [row_number]
+    ├── partition by: []
+    ├── order by: [b]
+    ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    └── Sort(Single)
+        ├── output columns: [tbpush.b (#0)]
+        ├── sort keys: [b ASC NULLS LAST]
+        ├── estimated rows: 0.00
+        └── TableScan
+            ├── table: default.test_explain_window.tbpush
+            ├── output columns: [b (#0)]
+            ├── read rows: 0
+            ├── read size: 0
+            ├── partitions total: 0
+            ├── partitions scanned: 0
+            ├── push downs: [filters: [], limit: NONE]
+            └── estimated rows: 0.00
+
+# test push down limit to window function
+statement ok
+drop table if exists t
+
+statement ok
+create table t (a int, b int, c string, d int, e int, f string)
+
+
+# Disable sort spilling
+statement ok
+set sort_spilling_memory_ratio = 0;
+
+# range frame (can not push down limit)
+query T
+explain pipeline select a, sum(a) over (partition by a order by a desc) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "LimitTransform" ]
+    8 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+}
+
+# Enable sort spilling
+statement ok
+set sort_spilling_memory_ratio = 60;
+
+# range frame (can not push down limit)
+query T
+explain pipeline select a, sum(a) over (partition by a order by a desc) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "LimitTransform" ]
+    8 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+}
+
+
+# Disable sort spilling
+statement ok
+set sort_spilling_memory_ratio = 0;
+
+# range frame with ranking function (can push down limit)
+query T
+explain pipeline select a, dense_rank() over (partition by a order by a desc) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "LimitTransform" ]
+    8 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+}
+
+# rows frame single window (can push down limit)
+query T
+explain pipeline select a, sum(a) over (partition by a order by a desc rows between unbounded preceding and current row) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "LimitTransform" ]
+    8 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+}
+
+# rows frame single window (can not push down limit)
+query T
+explain pipeline select a, sum(a) over (partition by a order by a desc rows between unbounded preceding and unbounded following) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "LimitTransform" ]
+    8 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+}
+
+# rows frame multi window (can not push down limit)
+query T
+explain pipeline select a, sum(a) over (partition by a order by a desc rows between unbounded preceding and current row),
+avg(a) over (order by a rows between unbounded preceding and current row) from t limit 3
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(Window)" ]
+    4 [ label = "ShuffleMergePartition(Window)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "Resize" ]
+    8 [ label = "SortPartialTransform" ]
+    9 [ label = "SortPartialTransform" ]
+    10 [ label = "SortPartialTransform" ]
+    11 [ label = "SortPartialTransform" ]
+    12 [ label = "TransformSortMerge" ]
+    13 [ label = "TransformSortMerge" ]
+    14 [ label = "TransformSortMerge" ]
+    15 [ label = "TransformSortMerge" ]
+    16 [ label = "KWayMergePartitioner" ]
+    17 [ label = "KWayMergeWorker" ]
+    18 [ label = "KWayMergeWorker" ]
+    19 [ label = "KWayMergeWorker" ]
+    20 [ label = "KWayMergeWorker" ]
+    21 [ label = "KWayMergeCombiner" ]
+    22 [ label = "Transform Window" ]
+    23 [ label = "LimitTransform" ]
+    24 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "from: 0, to: 0" ]
+    7 -> 9 [ label = "from: 1, to: 0" ]
+    7 -> 10 [ label = "from: 2, to: 0" ]
+    7 -> 11 [ label = "from: 3, to: 0" ]
+    8 -> 12 [ label = "" ]
+    9 -> 13 [ label = "" ]
+    10 -> 14 [ label = "" ]
+    11 -> 15 [ label = "" ]
+    12 -> 16 [ label = "from: 0, to: 0" ]
+    13 -> 16 [ label = "from: 0, to: 1" ]
+    14 -> 16 [ label = "from: 0, to: 2" ]
+    15 -> 16 [ label = "from: 0, to: 3" ]
+    16 -> 17 [ label = "from: 0, to: 0" ]
+    16 -> 18 [ label = "from: 1, to: 0" ]
+    16 -> 19 [ label = "from: 2, to: 0" ]
+    16 -> 20 [ label = "from: 3, to: 0" ]
+    17 -> 21 [ label = "from: 0, to: 0" ]
+    18 -> 21 [ label = "from: 0, to: 1" ]
+    19 -> 21 [ label = "from: 0, to: 2" ]
+    20 -> 21 [ label = "from: 0, to: 3" ]
+    21 -> 22 [ label = "" ]
+    22 -> 23 [ label = "" ]
+    23 -> 24 [ label = "" ]
+}
+
+# row fetch with window function(pipeline explain)
+query T
+explain pipeline select *, sum(a) over (partition by a order by a desc rows between unbounded preceding and current row) from t where a > 1 order by b limit 3;
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "AddInternalColumnsTransform" ]
+    4 [ label = "TransformFilter" ]
+    5 [ label = "ShufflePartition(Window)" ]
+    6 [ label = "ShuffleMergePartition(Window)" ]
+    7 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    8 [ label = "Transform Window" ]
+    9 [ label = "Resize" ]
+    10 [ label = "SortPartialTransform" ]
+    11 [ label = "SortPartialTransform" ]
+    12 [ label = "SortPartialTransform" ]
+    13 [ label = "SortPartialTransform" ]
+    14 [ label = "TransformSortMergeLimit" ]
+    15 [ label = "TransformSortMergeLimit" ]
+    16 [ label = "TransformSortMergeLimit" ]
+    17 [ label = "TransformSortMergeLimit" ]
+    18 [ label = "KWayMergePartitioner" ]
+    19 [ label = "KWayMergeWorker" ]
+    20 [ label = "KWayMergeWorker" ]
+    21 [ label = "KWayMergeWorker" ]
+    22 [ label = "KWayMergeWorker" ]
+    23 [ label = "KWayMergeCombiner" ]
+    24 [ label = "LimitTransform" ]
+    25 [ label = "TransformRowsFetcher" ]
+    26 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+    8 -> 9 [ label = "" ]
+    9 -> 10 [ label = "from: 0, to: 0" ]
+    9 -> 11 [ label = "from: 1, to: 0" ]
+    9 -> 12 [ label = "from: 2, to: 0" ]
+    9 -> 13 [ label = "from: 3, to: 0" ]
+    10 -> 14 [ label = "" ]
+    11 -> 15 [ label = "" ]
+    12 -> 16 [ label = "" ]
+    13 -> 17 [ label = "" ]
+    14 -> 18 [ label = "from: 0, to: 0" ]
+    15 -> 18 [ label = "from: 0, to: 1" ]
+    16 -> 18 [ label = "from: 0, to: 2" ]
+    17 -> 18 [ label = "from: 0, to: 3" ]
+    18 -> 19 [ label = "from: 0, to: 0" ]
+    18 -> 20 [ label = "from: 1, to: 0" ]
+    18 -> 21 [ label = "from: 2, to: 0" ]
+    18 -> 22 [ label = "from: 3, to: 0" ]
+    19 -> 23 [ label = "from: 0, to: 0" ]
+    20 -> 23 [ label = "from: 0, to: 1" ]
+    21 -> 23 [ label = "from: 0, to: 2" ]
+    22 -> 23 [ label = "from: 0, to: 3" ]
+    23 -> 24 [ label = "" ]
+    24 -> 25 [ label = "" ]
+    25 -> 26 [ label = "" ]
+}
+
+# row fetch with window function(plan explain)
+query T
+explain select *, sum(a) over (partition by a order by a desc rows between unbounded preceding and current row) from t where a > 1 order by b limit 3
+----
+RowFetch
+├── output columns: [t.a (#0), t.b (#1), t._row_id (#7), sum(a) OVER (PARTITION BY a ORDER BY a DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) (#6), t.c (#2), t.d (#3), t.e (#4), t.f (#5)]
+├── columns to fetch: [c, d, e, f]
+├── estimated rows: 0.00
+└── Limit
+    ├── output columns: [t.a (#0), t.b (#1), t._row_id (#7), sum(a) OVER (PARTITION BY a ORDER BY a DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) (#6)]
+    ├── limit: 3
+    ├── offset: 0
+    ├── estimated rows: 0.00
+    └── Sort(Single)
+        ├── output columns: [t.a (#0), t.b (#1), t._row_id (#7), sum(a) OVER (PARTITION BY a ORDER BY a DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) (#6)]
+        ├── sort keys: [b ASC NULLS LAST]
+        ├── estimated rows: 0.00
+        └── Window
+            ├── output columns: [t.a (#0), t.b (#1), t._row_id (#7), sum(a) OVER (PARTITION BY a ORDER BY a DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) (#6)]
+            ├── aggregate function: [sum(a)]
+            ├── partition by: [a]
+            ├── order by: [a]
+            ├── frame: [Rows: Preceding(None) ~ CurrentRow]
+            └── WindowPartition
+                ├── output columns: [t.a (#0), t.b (#1), t._row_id (#7)]
+                ├── hash keys: [a]
+                ├── estimated rows: 0.00
+                └── Filter
+                    ├── output columns: [t.a (#0), t.b (#1), t._row_id (#7)]
+                    ├── filters: [is_true(t.a (#0) > 1)]
+                    ├── estimated rows: 0.00
+                    └── TableScan
+                        ├── table: default.test_explain_window.t
+                        ├── output columns: [a (#0), b (#1), _row_id (#7)]
+                        ├── read rows: 0
+                        ├── read size: 0
+                        ├── partitions total: 0
+                        ├── partitions scanned: 0
+                        ├── push downs: [filters: [is_true(t.a (#0) > 1)], limit: NONE]
+                        └── estimated rows: 0.00
+
+statement ok
+drop table if exists table43764_orc
+
+statement ok
+CREATE TABLE table43764_orc (rowkey VARCHAR NOT NULL, time TIMESTAMP NULL, sirc_action VARCHAR NULL, sirc_operation_count DECIMAL(36, 16) NULL, akc087 VARCHAR NULL, aae035 VARCHAR)
+
+# window in subquery
+query T
+explain pipeline select time, rowkey from (select *, row_number() over(partition by rowkey order by time desc) as rn from table43764_orc) a where rn = 1 limit 4
+----
+digraph {
+    0 [ label = "BlockPartitionSource" ]
+    1 [ label = "SyncReadParquetDataTransform" ]
+    2 [ label = "DeserializeDataTransform" ]
+    3 [ label = "ShufflePartition(WindowTopN)" ]
+    4 [ label = "ShuffleMergePartition(WindowTopN)" ]
+    5 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    6 [ label = "Transform Window" ]
+    7 [ label = "TransformFilter" ]
+    8 [ label = "LimitTransform" ]
+    9 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+    8 -> 9 [ label = "" ]
+}
+
+# top n 0
+query T
+explain optimized select time, rowkey from (select *, row_number() over(partition by rowkey order by time desc) as rn from table43764_orc) a where rn < 1
+----
+EvalScalar
+├── scalars: [a.rowkey (#0) AS (#0), table43764_orc.rowkey (#0) AS (#0), a.time (#1) AS (#1), table43764_orc.time (#1) AS (#1), table43764_orc.sirc_action (#2) AS (#2), table43764_orc.sirc_operation_count (#3) AS (#3), table43764_orc.akc087 (#4) AS (#4), table43764_orc.aae035 (#5) AS (#5), row_number() OVER (PARTITION BY rowkey ORDER BY time DESC) (#6) AS (#6), a.rn (#6) AS (#7)]
+└── EmptyResultScan
+
+# same order multi window
+query T
+explain pipeline select *,lead(number,1, 42) over (order by number), lead(number,2,44) over (order by number), lead(number,3,44) over (order by number) from numbers(5);
+----
+digraph {
+    0 [ label = "NumbersSourceTransform" ]
+    1 [ label = "CompoundBlockOperator(Map)" ]
+    2 [ label = "Resize" ]
+    3 [ label = "SortPartialTransform" ]
+    4 [ label = "SortPartialTransform" ]
+    5 [ label = "SortPartialTransform" ]
+    6 [ label = "SortPartialTransform" ]
+    7 [ label = "TransformSortMerge" ]
+    8 [ label = "TransformSortMerge" ]
+    9 [ label = "TransformSortMerge" ]
+    10 [ label = "TransformSortMerge" ]
+    11 [ label = "KWayMergePartitioner" ]
+    12 [ label = "KWayMergeWorker" ]
+    13 [ label = "KWayMergeWorker" ]
+    14 [ label = "KWayMergeWorker" ]
+    15 [ label = "KWayMergeWorker" ]
+    16 [ label = "KWayMergeCombiner" ]
+    17 [ label = "Transform Window" ]
+    18 [ label = "CompoundBlockOperator(Map)" ]
+    19 [ label = "Transform Window" ]
+    20 [ label = "CompoundBlockOperator(Map)" ]
+    21 [ label = "Transform Window" ]
+    22 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "from: 0, to: 0" ]
+    2 -> 4 [ label = "from: 1, to: 0" ]
+    2 -> 5 [ label = "from: 2, to: 0" ]
+    2 -> 6 [ label = "from: 3, to: 0" ]
+    3 -> 7 [ label = "" ]
+    4 -> 8 [ label = "" ]
+    5 -> 9 [ label = "" ]
+    6 -> 10 [ label = "" ]
+    7 -> 11 [ label = "from: 0, to: 0" ]
+    8 -> 11 [ label = "from: 0, to: 1" ]
+    9 -> 11 [ label = "from: 0, to: 2" ]
+    10 -> 11 [ label = "from: 0, to: 3" ]
+    11 -> 12 [ label = "from: 0, to: 0" ]
+    11 -> 13 [ label = "from: 1, to: 0" ]
+    11 -> 14 [ label = "from: 2, to: 0" ]
+    11 -> 15 [ label = "from: 3, to: 0" ]
+    12 -> 16 [ label = "from: 0, to: 0" ]
+    13 -> 16 [ label = "from: 0, to: 1" ]
+    14 -> 16 [ label = "from: 0, to: 2" ]
+    15 -> 16 [ label = "from: 0, to: 3" ]
+    16 -> 17 [ label = "" ]
+    17 -> 18 [ label = "" ]
+    18 -> 19 [ label = "" ]
+    19 -> 20 [ label = "" ]
+    20 -> 21 [ label = "" ]
+    21 -> 22 [ label = "" ]
+}
+
+# same order same partiton by multi window
+query T
+explain pipeline select number, lead(number,1, 0) over (partition by number % 3 order by number+ 1), lead(number,2, 0) over (partition by number % 3 order by number + 1) from numbers(50);
+----
+digraph {
+    0 [ label = "NumbersSourceTransform" ]
+    1 [ label = "CompoundBlockOperator(Map)" ]
+    2 [ label = "ShufflePartition(Window)" ]
+    3 [ label = "ShuffleMergePartition(Window)" ]
+    4 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    5 [ label = "Transform Window" ]
+    6 [ label = "CompoundBlockOperator(Map)" ]
+    7 [ label = "ShufflePartition(Window)" ]
+    8 [ label = "ShuffleMergePartition(Window)" ]
+    9 [ label = "TransformWindowPartitionCollect(Sort)" ]
+    10 [ label = "Transform Window" ]
+    11 [ label = "CompoundBlockOperator(Project)" ]
+    0 -> 1 [ label = "" ]
+    1 -> 2 [ label = "" ]
+    2 -> 3 [ label = "" ]
+    3 -> 4 [ label = "" ]
+    4 -> 5 [ label = "" ]
+    5 -> 6 [ label = "" ]
+    6 -> 7 [ label = "" ]
+    7 -> 8 [ label = "" ]
+    8 -> 9 [ label = "" ]
+    9 -> 10 [ label = "" ]
+    10 -> 11 [ label = "" ]
+}
+
+# window partition with empty sort items from same window partition  with sort items
+## explain  select a, sum(number - 1) over (partition by number % 3) from (select number,  rank()over (partition by number % 3 order by number + 1) a
+##    from numbers(50)) t(number, a);
+query T
+explain  select a, sum(number - 1) over (partition by number % 3) from (select number,  rank()over (partition by number % 3 order by number + 1) a
+    from numbers(50));
+----
+Window
+├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#3), sum_arg_0 (#4), sum_part_0 (#5), sum(number - 1) OVER (PARTITION BY number % 3) (#6)]
+├── aggregate function: [sum(sum_arg_0)]
+├── partition by: [sum_part_0]
+├── order by: []
+├── frame: [Range: Preceding(None) ~ Following(None)]
+└── WindowPartition
+    ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#3), sum_arg_0 (#4), sum_part_0 (#5)]
+    ├── hash keys: [sum_part_0]
+    ├── estimated rows: 50.00
+    └── EvalScalar
+        ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#3), sum_arg_0 (#4), sum_part_0 (#5)]
+        ├── expressions: [numbers.number (#0) - 1, numbers.number (#0) % 3]
+        ├── estimated rows: 50.00
+        └── Window
+            ├── output columns: [numbers.number (#0), rank_part_0 (#1), rank_order_0 (#2), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#3)]
+            ├── aggregate function: [rank]
+            ├── partition by: [rank_part_0]
+            ├── order by: [rank_order_0]
+            ├── frame: [Range: Preceding(None) ~ CurrentRow]
+            └── WindowPartition
+                ├── output columns: [numbers.number (#0), rank_part_0 (#1), rank_order_0 (#2)]
+                ├── hash keys: [rank_part_0]
+                ├── estimated rows: 50.00
+                └── EvalScalar
+                    ├── output columns: [numbers.number (#0), rank_part_0 (#1), rank_order_0 (#2)]
+                    ├── expressions: [numbers.number (#0) % 3, numbers.number (#0) + 1]
+                    ├── estimated rows: 50.00
+                    └── TableScan
+                        ├── table: default.system.numbers
+                        ├── output columns: [number (#0)]
+                        ├── read rows: 50
+                        ├── read size: < 1 KiB
+                        ├── partitions total: 1
+                        ├── partitions scanned: 1
+                        ├── push downs: [filters: [], limit: NONE]
+                        └── estimated rows: 50.00
+
+query T
+explain select number, avg(number) over (partition by number % 3),  rank() over (partition by number % 3 order by number + 1), sum(number) over (partition by number % 3)
+    from numbers(50);
+----
+Window
+├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg(number) OVER (PARTITION BY number % 3) (#2), sum_part_0 (#6), sum(number) OVER (PARTITION BY number % 3) (#7)]
+├── aggregate function: [sum(number)]
+├── partition by: [sum_part_0]
+├── order by: []
+├── frame: [Range: Preceding(None) ~ Following(None)]
+└── WindowPartition
+    ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg(number) OVER (PARTITION BY number % 3) (#2), sum_part_0 (#6)]
+    ├── hash keys: [sum_part_0]
+    ├── estimated rows: 50.00
+    └── EvalScalar
+        ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg(number) OVER (PARTITION BY number % 3) (#2), sum_part_0 (#6)]
+        ├── expressions: [numbers.number (#0) % 3]
+        ├── estimated rows: 50.00
+        └── Window
+            ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg_part_0 (#1), avg(number) OVER (PARTITION BY number % 3) (#2)]
+            ├── aggregate function: [avg(number)]
+            ├── partition by: [avg_part_0]
+            ├── order by: []
+            ├── frame: [Range: Preceding(None) ~ Following(None)]
+            └── WindowPartition
+                ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg_part_0 (#1)]
+                ├── hash keys: [avg_part_0]
+                ├── estimated rows: 50.00
+                └── EvalScalar
+                    ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5), avg_part_0 (#1)]
+                    ├── expressions: [numbers.number (#0) % 3]
+                    ├── estimated rows: 50.00
+                    └── Window
+                        ├── output columns: [numbers.number (#0), rank_part_0 (#3), rank_order_0 (#4), rank() OVER (PARTITION BY number % 3 ORDER BY number + 1) (#5)]
+                        ├── aggregate function: [rank]
+                        ├── partition by: [rank_part_0]
+                        ├── order by: [rank_order_0]
+                        ├── frame: [Range: Preceding(None) ~ CurrentRow]
+                        └── WindowPartition
+                            ├── output columns: [numbers.number (#0), rank_part_0 (#3), rank_order_0 (#4)]
+                            ├── hash keys: [rank_part_0]
+                            ├── estimated rows: 50.00
+                            └── EvalScalar
+                                ├── output columns: [numbers.number (#0), rank_part_0 (#3), rank_order_0 (#4)]
+                                ├── expressions: [numbers.number (#0) % 3, numbers.number (#0) + 1]
+                                ├── estimated rows: 50.00
+                                └── TableScan
+                                    ├── table: default.system.numbers
+                                    ├── output columns: [number (#0)]
+                                    ├── read rows: 50
+                                    ├── read size: < 1 KiB
+                                    ├── partitions total: 1
+                                    ├── partitions scanned: 1
+                                    ├── push downs: [filters: [], limit: NONE]
+                                    └── estimated rows: 50.00
+
+query T
+explain  select a, sum(number - 1) over (partition by number % 3) from (select number,  rank()over (partition by number % 3 order by number) a from numbers(50));
+----
+Window
+├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4), sum(number - 1) OVER (PARTITION BY number % 3) (#5)]
+├── aggregate function: [sum(sum_arg_0)]
+├── partition by: [sum_part_0]
+├── order by: []
+├── frame: [Range: Preceding(None) ~ Following(None)]
+└── WindowPartition
+    ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4)]
+    ├── hash keys: [sum_part_0]
+    ├── estimated rows: 50.00
+    └── EvalScalar
+        ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4)]
+        ├── expressions: [numbers.number (#0) - 1, numbers.number (#0) % 3]
+        ├── estimated rows: 50.00
+        └── Window
+            ├── output columns: [numbers.number (#0), rank_part_0 (#1), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2)]
+            ├── aggregate function: [rank]
+            ├── partition by: [rank_part_0]
+            ├── order by: [number]
+            ├── frame: [Range: Preceding(None) ~ CurrentRow]
+            └── WindowPartition
+                ├── output columns: [numbers.number (#0), rank_part_0 (#1)]
+                ├── hash keys: [rank_part_0]
+                ├── estimated rows: 50.00
+                └── EvalScalar
+                    ├── output columns: [numbers.number (#0), rank_part_0 (#1)]
+                    ├── expressions: [numbers.number (#0) % 3]
+                    ├── estimated rows: 50.00
+                    └── TableScan
+                        ├── table: default.system.numbers
+                        ├── output columns: [number (#0)]
+                        ├── read rows: 50
+                        ├── read size: < 1 KiB
+                        ├── partitions total: 1
+                        ├── partitions scanned: 1
+                        ├── push downs: [filters: [], limit: NONE]
+                        └── estimated rows: 50.00
+
+query T
+explain  select a, sum(number - 1) over (partition by number % 3) from (select number,  rank()over (partition by number % 3 order by number) a from numbers(50)) t(number);
+----
+Window
+├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4), sum(number - 1) OVER (PARTITION BY number % 3) (#5)]
+├── aggregate function: [sum(sum_arg_0)]
+├── partition by: [sum_part_0]
+├── order by: []
+├── frame: [Range: Preceding(None) ~ Following(None)]
+└── WindowPartition
+    ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4)]
+    ├── hash keys: [sum_part_0]
+    ├── estimated rows: 50.00
+    └── EvalScalar
+        ├── output columns: [numbers.number (#0), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2), sum_arg_0 (#3), sum_part_0 (#4)]
+        ├── expressions: [t.number (#0) - 1, t.number (#0) % 3]
+        ├── estimated rows: 50.00
+        └── Window
+            ├── output columns: [numbers.number (#0), rank_part_0 (#1), rank() OVER (PARTITION BY number % 3 ORDER BY number) (#2)]
+            ├── aggregate function: [rank]
+            ├── partition by: [rank_part_0]
+            ├── order by: [number]
+            ├── frame: [Range: Preceding(None) ~ CurrentRow]
+            └── WindowPartition
+                ├── output columns: [numbers.number (#0), rank_part_0 (#1)]
+                ├── hash keys: [rank_part_0]
+                ├── estimated rows: 50.00
+                └── EvalScalar
+                    ├── output columns: [numbers.number (#0), rank_part_0 (#1)]
+                    ├── expressions: [numbers.number (#0) % 3]
+                    ├── estimated rows: 50.00
+                    └── TableScan
+                        ├── table: default.system.numbers
+                        ├── output columns: [number (#0)]
+                        ├── read rows: 50
+                        ├── read size: < 1 KiB
+                        ├── partitions total: 1
+                        ├── partitions scanned: 1
+                        ├── push downs: [filters: [], limit: NONE]
+                        └── estimated rows: 50.00
+
+query T
+explain with test as ( select number % 10 as id, number as full_matched, max(number) OVER ( PARTITION BY id ) max from numbers(1000)) select * from test where full_matched = 3;
+----
+EvalScalar
+├── output columns: [numbers.number (#0), max(number) OVER (PARTITION BY id) (#2), id (#3)]
+├── expressions: [numbers.number (#0) % 10]
+├── estimated rows: 0.40
+└── Filter
+    ├── output columns: [numbers.number (#0), max(number) OVER (PARTITION BY id) (#2)]
+    ├── filters: [numbers.number (#0) = 3]
+    ├── estimated rows: 0.40
+    └── Window
+        ├── output columns: [numbers.number (#0), max_part_0 (#1), max(number) OVER (PARTITION BY id) (#2)]
+        ├── aggregate function: [max(number)]
+        ├── partition by: [max_part_0]
+        ├── order by: []
+        ├── frame: [Range: Preceding(None) ~ Following(None)]
+        └── WindowPartition
+            ├── output columns: [numbers.number (#0), max_part_0 (#1)]
+            ├── hash keys: [max_part_0]
+            ├── estimated rows: 1000.00
+            └── EvalScalar
+                ├── output columns: [numbers.number (#0), max_part_0 (#1)]
+                ├── expressions: [numbers.number (#0) % 10]
+                ├── estimated rows: 1000.00
+                └── TableScan
+                    ├── table: default.system.numbers
+                    ├── output columns: [number (#0)]
+                    ├── read rows: 1000
+                    ├── read size: 7.81 KiB
+                    ├── partitions total: 1
+                    ├── partitions scanned: 1
+                    ├── push downs: [filters: [], limit: NONE]
+                    └── estimated rows: 1000.00
+
+query T
+explain with test as (select number % 10 as id, number as full_matched from numbers(1000) QUALIFY row_number() OVER (PARTITION BY id ORDER BY  number DESC)=1) select full_matched, count() from test group by full_matched having full_matched = 3;
+----
+AggregateFinal
+├── output columns: [count() (#4), numbers.number (#0)]
+├── group by: [number]
+├── aggregate functions: [count()]
+├── estimated rows: 0.40
+└── AggregatePartial
+    ├── group by: [number]
+    ├── aggregate functions: [count()]
+    ├── estimated rows: 0.40
+    └── Filter
+        ├── output columns: [numbers.number (#0)]
+        ├── filters: [numbers.number (#0) = 3, row_number() OVER (PARTITION BY id ORDER BY number DESC) (#3) = 1]
+        ├── estimated rows: 0.40
+        └── Window
+            ├── output columns: [numbers.number (#0), row_number_part_0 (#2), row_number() OVER (PARTITION BY id ORDER BY number DESC) (#3)]
+            ├── aggregate function: [row_number]
+            ├── partition by: [row_number_part_0]
+            ├── order by: [number]
+            ├── frame: [Range: Preceding(None) ~ CurrentRow]
+            └── WindowPartition
+                ├── output columns: [numbers.number (#0), row_number_part_0 (#2)]
+                ├── hash keys: [row_number_part_0]
+                ├── top: 1
+                ├── estimated rows: 1000.00
+                └── EvalScalar
+                    ├── output columns: [numbers.number (#0), row_number_part_0 (#2)]
+                    ├── expressions: [numbers.number (#0) % 10]
+                    ├── estimated rows: 1000.00
+                    └── TableScan
+                        ├── table: default.system.numbers
+                        ├── output columns: [number (#0)]
+                        ├── read rows: 1000
+                        ├── read size: 7.81 KiB
+                        ├── partitions total: 1
+                        ├── partitions scanned: 1
+                        ├── push downs: [filters: [], limit: NONE]
+                        └── estimated rows: 1000.00
+
+statement ok
+DROP DATABASE test_explain_window;

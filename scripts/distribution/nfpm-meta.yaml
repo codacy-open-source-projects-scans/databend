@@ -1,0 +1,45 @@
+name: "databend-meta"
+arch: ""
+platform: "linux"
+version: ""
+section: "database"
+priority: "extra"
+maintainer: "Databend Labs <opensource@databend.com>"
+description: |
+  Databend is a powerful cloud data warehouse. Built for elasticity and efficiency.
+  Free and open. Databend Meta is is responsible for storing and managing various types of metadata.
+vendor: "Databend Labs"
+homepage: "https://databend.com"
+license: "Apache-2.0"
+depends:
+  - libc6 (>= 2.31)
+contents:
+  # Binaries
+  - src: distro/bin/databend-meta
+    dst: /usr/bin/databend-meta
+  - src: distro/bin/databend-metactl
+    dst: /usr/bin/databend-metactl
+
+  # Configs
+  - src: distro/configs/databend-meta.toml
+    dst: /etc/databend/databend-meta.toml
+    type: config
+
+  # Systemd
+  - src: distro/systemd/databend-meta.service
+    dst: /lib/systemd/system/databend-meta.service
+  - src: distro/systemd/databend-meta.default
+    dst: /etc/default/databend-meta
+
+  - dst: /var/lib/databend
+    type: dir
+    file_info:
+      mode: 0750
+  - dst: /var/log/databend
+    type: dir
+    file_info:
+      mode: 0755
+
+scripts:
+  preinstall: distro/scripts/preinstall.sh
+  postinstall: distro/scripts/postinstall.sh

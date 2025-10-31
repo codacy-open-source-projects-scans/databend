@@ -1,0 +1,561 @@
+statement ok
+drop table if exists t1 all;
+
+statement ok
+drop table if exists t2 all;
+
+statement ok
+set max_threads = 1;
+
+statement ok
+set enable_shuffle_sort = 0;
+
+statement ok
+create table t1(a int not null, b int not null) as select number as a, number+1 as b from numbers(100);
+
+statement ok
+create table t2(a int not null, b int not null) as select number as a, number+1 as b from numbers(100);
+
+query T
+explain select t1.a from t1 where a > 0;
+----
+Exchange
+├── output columns: [t1.a (#0)]
+├── exchange type: Merge
+└── Filter
+    ├── output columns: [t1.a (#0)]
+    ├── filters: [t1.a (#0) > 0]
+    ├── estimated rows: 99.00
+    └── TableScan
+        ├── table: default.default.t1
+        ├── output columns: [a (#0)]
+        ├── read rows: 100
+        ├── read size: < 1 KiB
+        ├── partitions total: 3
+        ├── partitions scanned: 3
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+        ├── push downs: [filters: [t1.a (#0) > 0], limit: NONE]
+        └── estimated rows: 100.00
+
+query T
+explain select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a and t2.a > 5 and t1.a > 1);
+----
+Exchange
+├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+├── exchange type: Merge
+└── Filter
+    ├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+    ├── filters: [(t1.a (#0) > 3 OR (t2.a (#2) > 5 AND t1.a (#0) > 1))]
+    ├── estimated rows: 99.68
+    └── HashJoin
+        ├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+        ├── join type: INNER
+        ├── build keys: [t2.a (#2)]
+        ├── probe keys: [t1.a (#0)]
+        ├── keys is null equal: [false]
+        ├── filters: []
+        ├── build join filters:
+        │   └── filter id:0, build key:t2.a (#2), probe key:t1.a (#0), filter type:inlist,min_max
+        ├── estimated rows: 99.92
+        ├── Exchange(Build)
+        │   ├── output columns: [t2.a (#2), t2.b (#3)]
+        │   ├── exchange type: Broadcast
+        │   └── Filter
+        │       ├── output columns: [t2.a (#2), t2.b (#3)]
+        │       ├── filters: [(t2.a (#2) > 3 OR t2.a (#2) > 1)]
+        │       ├── estimated rows: 99.92
+        │       └── TableScan
+        │           ├── table: default.default.t2
+        │           ├── output columns: [a (#2), b (#3)]
+        │           ├── read rows: 100
+        │           ├── read size: < 1 KiB
+        │           ├── partitions total: 3
+        │           ├── partitions scanned: 3
+        │           ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+        │           ├── push downs: [filters: [(t2.a (#2) > 3 OR t2.a (#2) > 1)], limit: NONE]
+        │           └── estimated rows: 100.00
+        └── Filter(Probe)
+            ├── output columns: [t1.a (#0), t1.b (#1)]
+            ├── filters: [(t1.a (#0) > 3 OR t1.a (#0) > 1)]
+            ├── estimated rows: 99.92
+            └── TableScan
+                ├── table: default.default.t1
+                ├── output columns: [a (#0), b (#1)]
+                ├── read rows: 100
+                ├── read size: < 1 KiB
+                ├── partitions total: 3
+                ├── partitions scanned: 3
+                ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+                ├── push downs: [filters: [(t1.a (#0) > 3 OR t1.a (#0) > 1)], limit: NONE]
+                ├── apply join filters: [#0]
+                └── estimated rows: 100.00
+
+query T
+explain select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a);
+----
+Exchange
+├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+├── exchange type: Merge
+└── HashJoin
+    ├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+    ├── join type: INNER
+    ├── build keys: [t2.a (#2)]
+    ├── probe keys: [t1.a (#0)]
+    ├── keys is null equal: [false]
+    ├── filters: []
+    ├── build join filters:
+    │   └── filter id:0, build key:t2.a (#2), probe key:t1.a (#0), filter type:inlist,min_max
+    ├── estimated rows: 100.00
+    ├── Exchange(Build)
+    │   ├── output columns: [t2.a (#2), t2.b (#3)]
+    │   ├── exchange type: Broadcast
+    │   └── TableScan
+    │       ├── table: default.default.t2
+    │       ├── output columns: [a (#2), b (#3)]
+    │       ├── read rows: 100
+    │       ├── read size: < 1 KiB
+    │       ├── partitions total: 3
+    │       ├── partitions scanned: 3
+    │       ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+    │       ├── push downs: [filters: [], limit: NONE]
+    │       └── estimated rows: 100.00
+    └── TableScan(Probe)
+        ├── table: default.default.t1
+        ├── output columns: [a (#0), b (#1)]
+        ├── read rows: 100
+        ├── read size: < 1 KiB
+        ├── partitions total: 3
+        ├── partitions scanned: 3
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+        ├── push downs: [filters: [], limit: NONE]
+        ├── apply join filters: [#0]
+        └── estimated rows: 100.00
+
+query T
+explain raw select * from t1, t2 where (t1.a = t2.a and t1.a > 3) or (t1.a = t2.a);
+----
+EvalScalar
+├── scalars: [t1.a (#0) AS (#0), t1.b (#1) AS (#1), t2.a (#2) AS (#2), t2.b (#3) AS (#3)]
+└── Filter
+    ├── filters: [or(and(eq(t1.a (#0), t2.a (#2)), gt(t1.a (#0), 3)), eq(t1.a (#0), t2.a (#2)))]
+    └── Join(Cross)
+        ├── build keys: []
+        ├── probe keys: []
+        ├── other filters: []
+        ├── Scan
+        │   ├── table: default.t1 (#0)
+        │   ├── filters: []
+        │   ├── order by: []
+        │   └── limit: NONE
+        └── Scan
+            ├── table: default.t2 (#1)
+            ├── filters: []
+            ├── order by: []
+            └── limit: NONE
+
+query T
+explain raw select * from t1 inner join t2 on t1.a = t2.a and t1.b = t2.b and t1.a > 2;
+----
+EvalScalar
+├── scalars: [t1.a (#0) AS (#0), t1.b (#1) AS (#1), t2.a (#2) AS (#2), t2.b (#3) AS (#3)]
+└── Join(Inner)
+    ├── build keys: [t2.a (#2), t2.b (#3)]
+    ├── probe keys: [t1.a (#0), t1.b (#1)]
+    ├── other filters: []
+    ├── Filter
+    │   ├── filters: [gt(t1.a (#0), 2)]
+    │   └── Scan
+    │       ├── table: default.t1 (#0)
+    │       ├── filters: []
+    │       ├── order by: []
+    │       └── limit: NONE
+    └── Scan
+        ├── table: default.t2 (#1)
+        ├── filters: []
+        ├── order by: []
+        └── limit: NONE
+
+query T
+explain select count(1) as c, count(b) as d, max(a) as e from t1 order by c, e, d limit 10;
+----
+Limit
+├── output columns: [count(1) (#2), count(b) (#3), max(a) (#4)]
+├── limit: 10
+├── offset: 0
+├── estimated rows: 1.00
+└── Sort(Single)
+    ├── output columns: [count(1) (#2), count(b) (#3), max(a) (#4)]
+    ├── sort keys: [count(1) ASC NULLS LAST, max(a) ASC NULLS LAST, count(b) ASC NULLS LAST]
+    ├── estimated rows: 1.00
+    └── EvalScalar
+        ├── output columns: [count(1) (#2), count(b) (#3), max(a) (#4)]
+        ├── expressions: [99]
+        ├── estimated rows: 1.00
+        └── EvalScalar
+            ├── output columns: [count(1) (#2), count(b) (#3)]
+            ├── expressions: [count(1) (#2)]
+            ├── estimated rows: 1.00
+            └── EvalScalar
+                ├── output columns: [count(1) (#2)]
+                ├── expressions: [100]
+                ├── estimated rows: 1.00
+                └── DummyTableScan
+
+query T
+explain select (t1.a + 1) as c,(t1.b+1) as d, (t2.a+1) as e from t1 join t2 on t1.a = t2.a order by c, d, e limit 10;
+----
+Limit
+├── output columns: [c (#4), d (#5), e (#6)]
+├── limit: 10
+├── offset: 0
+├── estimated rows: 10.00
+└── Sort(Final)
+    ├── output columns: [c (#4), d (#5), e (#6)]
+    ├── sort keys: [c ASC NULLS LAST, d ASC NULLS LAST, e ASC NULLS LAST]
+    ├── estimated rows: 100.00
+    └── Exchange
+        ├── output columns: [c (#4), d (#5), e (#6), #_order_col]
+        ├── exchange type: Merge
+        └── Sort(Partial)
+            ├── output columns: [c (#4), d (#5), e (#6), #_order_col]
+            ├── sort keys: [c ASC NULLS LAST, d ASC NULLS LAST, e ASC NULLS LAST]
+            ├── estimated rows: 100.00
+            └── EvalScalar
+                ├── output columns: [c (#4), d (#5), e (#6)]
+                ├── expressions: [t1.a (#0) + 1, t1.b (#1) + 1, t2.a (#2) + 1]
+                ├── estimated rows: 100.00
+                └── HashJoin
+                    ├── output columns: [t1.a (#0), t1.b (#1), t2.a (#2)]
+                    ├── join type: INNER
+                    ├── build keys: [t2.a (#2)]
+                    ├── probe keys: [t1.a (#0)]
+                    ├── keys is null equal: [false]
+                    ├── filters: []
+                    ├── build join filters:
+                    │   └── filter id:0, build key:t2.a (#2), probe key:t1.a (#0), filter type:inlist,min_max
+                    ├── estimated rows: 100.00
+                    ├── Exchange(Build)
+                    │   ├── output columns: [t2.a (#2)]
+                    │   ├── exchange type: Broadcast
+                    │   └── TableScan
+                    │       ├── table: default.default.t2
+                    │       ├── output columns: [a (#2)]
+                    │       ├── read rows: 100
+                    │       ├── read size: < 1 KiB
+                    │       ├── partitions total: 3
+                    │       ├── partitions scanned: 3
+                    │       ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+                    │       ├── push downs: [filters: [], limit: NONE]
+                    │       └── estimated rows: 100.00
+                    └── TableScan(Probe)
+                        ├── table: default.default.t1
+                        ├── output columns: [a (#0), b (#1)]
+                        ├── read rows: 100
+                        ├── read size: < 1 KiB
+                        ├── partitions total: 3
+                        ├── partitions scanned: 3
+                        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+                        ├── push downs: [filters: [], limit: NONE]
+                        ├── apply join filters: [#0]
+                        └── estimated rows: 100.00
+
+statement ok
+set prefer_broadcast_join = 1;
+
+query T
+explain select * from t1 join t2 on t1.a = t2.a;
+----
+Exchange
+├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+├── exchange type: Merge
+└── HashJoin
+    ├── output columns: [t1.a (#0), t1.b (#1), t2.b (#3), t2.a (#2)]
+    ├── join type: INNER
+    ├── build keys: [t2.a (#2)]
+    ├── probe keys: [t1.a (#0)]
+    ├── keys is null equal: [false]
+    ├── filters: []
+    ├── build join filters:
+    │   └── filter id:0, build key:t2.a (#2), probe key:t1.a (#0), filter type:inlist,min_max
+    ├── estimated rows: 100.00
+    ├── Exchange(Build)
+    │   ├── output columns: [t2.a (#2), t2.b (#3)]
+    │   ├── exchange type: Broadcast
+    │   └── TableScan
+    │       ├── table: default.default.t2
+    │       ├── output columns: [a (#2), b (#3)]
+    │       ├── read rows: 100
+    │       ├── read size: < 1 KiB
+    │       ├── partitions total: 3
+    │       ├── partitions scanned: 3
+    │       ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+    │       ├── push downs: [filters: [], limit: NONE]
+    │       └── estimated rows: 100.00
+    └── TableScan(Probe)
+        ├── table: default.default.t1
+        ├── output columns: [a (#0), b (#1)]
+        ├── read rows: 100
+        ├── read size: < 1 KiB
+        ├── partitions total: 3
+        ├── partitions scanned: 3
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 3 to 3>]
+        ├── push downs: [filters: [], limit: NONE]
+        ├── apply join filters: [#0]
+        └── estimated rows: 100.00
+
+statement ok
+set prefer_broadcast_join = 0;
+
+query T
+explain select * from (SELECT number AS a FROM numbers(10)) x  order by x.a limit 3;
+----
+Limit
+├── output columns: [numbers.number (#0)]
+├── limit: 3
+├── offset: 0
+├── estimated rows: 3.00
+└── Sort(Final)
+    ├── output columns: [numbers.number (#0)]
+    ├── sort keys: [number ASC NULLS LAST]
+    ├── estimated rows: 10.00
+    └── Exchange
+        ├── output columns: [numbers.number (#0), #_order_col]
+        ├── exchange type: Merge
+        └── Sort(Partial)
+            ├── output columns: [numbers.number (#0), #_order_col]
+            ├── sort keys: [number ASC NULLS LAST]
+            ├── estimated rows: 10.00
+            └── TableScan
+                ├── table: default.system.numbers
+                ├── output columns: [number (#0)]
+                ├── read rows: 10
+                ├── read size: < 1 KiB
+                ├── partitions total: 1
+                ├── partitions scanned: 1
+                ├── push downs: [filters: [], limit: 3]
+                └── estimated rows: 10.00
+
+query T
+explain select sum(a) from (SELECT number AS a FROM numbers(10)) x right join (SELECT number AS a FROM numbers(5)) y using(a);
+----
+AggregateFinal
+├── output columns: [sum(a) (#3)]
+├── group by: []
+├── aggregate functions: [sum(number)]
+├── estimated rows: 1.00
+└── Exchange
+    ├── output columns: [sum(a) (#3)]
+    ├── exchange type: Merge
+    └── AggregatePartial
+        ├── group by: []
+        ├── aggregate functions: [sum(number)]
+        ├── estimated rows: 1.00
+        └── HashJoin
+            ├── output columns: [numbers.number (#1)]
+            ├── join type: RIGHT OUTER
+            ├── build keys: [CAST(y.a (#1) AS UInt64 NULL)]
+            ├── probe keys: [x.a (#2)]
+            ├── keys is null equal: [false]
+            ├── filters: []
+            ├── estimated rows: 50.00
+            ├── Exchange(Build)
+            │   ├── output columns: [numbers.number (#1)]
+            │   ├── exchange type: Hash(CAST(y.a (#1) AS UInt64 NULL))
+            │   └── TableScan
+            │       ├── table: default.system.numbers
+            │       ├── output columns: [number (#1)]
+            │       ├── read rows: 5
+            │       ├── read size: < 1 KiB
+            │       ├── partitions total: 1
+            │       ├── partitions scanned: 1
+            │       ├── push downs: [filters: [], limit: NONE]
+            │       └── estimated rows: 5.00
+            └── Exchange(Probe)
+                ├── output columns: [a (#2)]
+                ├── exchange type: Hash(x.a (#2))
+                └── EvalScalar
+                    ├── output columns: [a (#2)]
+                    ├── expressions: [CAST(x.a (#0) AS UInt64 NULL)]
+                    ├── estimated rows: 10.00
+                    └── TableScan
+                        ├── table: default.system.numbers
+                        ├── output columns: [number (#0)]
+                        ├── read rows: 10
+                        ├── read size: < 1 KiB
+                        ├── partitions total: 1
+                        ├── partitions scanned: 1
+                        ├── push downs: [filters: [], limit: NONE]
+                        └── estimated rows: 10.00
+
+statement ok
+drop table t1;
+
+statement ok
+drop table t2;
+
+statement ok
+create table t1(a int, b int);
+
+statement ok
+insert into t1 values(1, 2), (2, 3), (3, 4);
+
+statement ok
+set inlist_to_join_threshold = 1;
+
+query T
+explain select * from t1 where a in (1, 2);
+----
+Exchange
+├── output columns: [t1.a (#0), t1.b (#1)]
+├── exchange type: Merge
+└── HashJoin
+    ├── output columns: [t1.a (#0), t1.b (#1)]
+    ├── join type: INNER
+    ├── build keys: [CAST(CAST(subquery_2 (#2) AS UInt8 NULL) AS Int32 NULL)]
+    ├── probe keys: [t1.a (#0)]
+    ├── keys is null equal: [false]
+    ├── filters: []
+    ├── build join filters:
+    │   └── filter id:0, build key:CAST(CAST(subquery_2 (#2) AS UInt8 NULL) AS Int32 NULL), probe key:t1.a (#0), filter type:inlist,min_max
+    ├── estimated rows: 2.00
+    ├── Exchange(Build)
+    │   ├── output columns: [col0 (#2)]
+    │   ├── exchange type: Broadcast
+    │   └── AggregateFinal
+    │       ├── output columns: [col0 (#2)]
+    │       ├── group by: [col0]
+    │       ├── aggregate functions: []
+    │       ├── estimated rows: 2.00
+    │       └── Exchange
+    │           ├── output columns: [col0 (#2)]
+    │           ├── exchange type: Hash(0)
+    │           └── AggregatePartial
+    │               ├── group by: [col0]
+    │               ├── aggregate functions: []
+    │               ├── estimated rows: 2.00
+    │               └── ConstantTableScan
+    │                   ├── output columns: [col0 (#2)]
+    │                   └── column 0: [1, 2]
+    └── TableScan(Probe)
+        ├── table: default.default.t1
+        ├── output columns: [a (#0), b (#1)]
+        ├── read rows: 3
+        ├── read size: < 1 KiB
+        ├── partitions total: 1
+        ├── partitions scanned: 1
+        ├── pruning stats: [segments: <range pruning: 1 to 1>, blocks: <range pruning: 1 to 1>]
+        ├── push downs: [filters: [], limit: NONE]
+        ├── apply join filters: [#0]
+        └── estimated rows: 3.00
+
+statement ok
+drop table t1;
+
+statement ok
+unset inlist_to_join_threshold;
+
+
+statement ok
+CREATE OR REPLACE TABLE a00c (
+  a0d VARCHAR NULL,
+  a0e VARCHAR NULL,
+  a0f VARCHAR NULL,
+  a0g VARCHAR NULL,
+  a0h VARCHAR NULL,
+  a0i VARCHAR NULL,
+  a0j VARCHAR NULL,
+  a0k VARCHAR NULL,
+  a0l VARCHAR NULL,
+  a0m VARCHAR NULL,
+  a0n VARCHAR NULL,
+  a0o VARCHAR NULL,
+  a0p VARCHAR NULL,
+  a0q VARCHAR NULL,
+  a0r VARCHAR NULL,
+  a0s VARCHAR NULL,
+  a0t VARCHAR NULL,
+  a0u VARCHAR NULL,
+  a0v VARCHAR NULL,
+  a0w VARCHAR NULL,
+  a0x VARCHAR NULL,
+  a0y VARCHAR NULL,
+  a0z VARCHAR NULL,
+  a1a VARCHAR NULL
+) ENGINE=FUSE;
+
+query T
+explain  SELECT /*+ SET_VAR(enforce_shuffle_join=1) SET_VAR(disable_join_reorder=1) */ t1.a0f, t2.cjny FROM (SELECT a0f, min(to_yyyymm(a0t)) AS cjny FROM a00c WHERE a0w = '汇缴' GROUP BY a0f) AS t2 RIGHT OUTER JOIN (SELECT a0f FROM a00c QUALIFY row_number() OVER (PARTITION BY a0f ORDER BY a0t DESC NULLS LAST) = 1) AS t1 ON t1.a0f = t2.a0f;
+----
+Exchange
+├── output columns: [min(to_yyyymm(a0t)) (#25), a00c.a0f (#28)]
+├── exchange type: Merge
+└── HashJoin
+    ├── output columns: [min(to_yyyymm(a0t)) (#25), a00c.a0f (#28)]
+    ├── join type: RIGHT OUTER
+    ├── build keys: [t1.a0f (#28)]
+    ├── probe keys: [t2.a0f (#2)]
+    ├── keys is null equal: [false]
+    ├── filters: []
+    ├── build join filters(distributed):
+    │   └── filter id:0, build key:t1.a0f (#28), probe key:t2.a0f (#2), filter type:inlist,min_max
+    ├── estimated rows: 0.00
+    ├── Filter(Build)
+    │   ├── output columns: [a00c.a0f (#28)]
+    │   ├── filters: [row_number() OVER (PARTITION BY a0f ORDER BY a0t DESC NULLS LAST) (#50) = 1]
+    │   ├── estimated rows: 0.00
+    │   └── Window
+    │       ├── output columns: [a00c.a0f (#28), a00c.a0t (#42), row_number() OVER (PARTITION BY a0f ORDER BY a0t DESC NULLS LAST) (#50)]
+    │       ├── aggregate function: [row_number]
+    │       ├── partition by: [a0f]
+    │       ├── order by: [a0t]
+    │       ├── frame: [Range: Preceding(None) ~ CurrentRow]
+    │       └── WindowPartition
+    │           ├── output columns: [a00c.a0f (#28), a00c.a0t (#42)]
+    │           ├── hash keys: [a0f]
+    │           ├── top: 1
+    │           ├── estimated rows: 0.00
+    │           └── Exchange
+    │               ├── output columns: [a00c.a0f (#28), a00c.a0t (#42)]
+    │               ├── exchange type: Hash(a00c.a0f (#28))
+    │               └── TableScan
+    │                   ├── table: default.default.a00c
+    │                   ├── output columns: [a0f (#28), a0t (#42)]
+    │                   ├── read rows: 0
+    │                   ├── read size: 0
+    │                   ├── partitions total: 0
+    │                   ├── partitions scanned: 0
+    │                   ├── push downs: [filters: [], limit: NONE]
+    │                   └── estimated rows: 0.00
+    └── Exchange(Probe)
+        ├── output columns: [min(to_yyyymm(a0t)) (#25), a00c.a0f (#2)]
+        ├── exchange type: Hash(t2.a0f (#2))
+        └── AggregateFinal
+            ├── output columns: [min(to_yyyymm(a0t)) (#25), a00c.a0f (#2)]
+            ├── group by: [a0f]
+            ├── aggregate functions: [min(min_arg_0)]
+            ├── estimated rows: 0.00
+            └── Exchange
+                ├── output columns: [min(to_yyyymm(a0t)) (#25), a00c.a0f (#2)]
+                ├── exchange type: Hash(0)
+                └── AggregatePartial
+                    ├── group by: [a0f]
+                    ├── aggregate functions: [min(min_arg_0)]
+                    ├── estimated rows: 0.00
+                    └── EvalScalar
+                        ├── output columns: [a00c.a0f (#2), min_arg_0 (#24)]
+                        ├── expressions: [to_yyyymm(CAST(a00c.a0t (#16) AS Date NULL))]
+                        ├── estimated rows: 0.00
+                        └── Filter
+                            ├── output columns: [a00c.a0f (#2), a00c.a0t (#16)]
+                            ├── filters: [is_true(a00c.a0w (#19) = '汇缴')]
+                            ├── estimated rows: 0.00
+                            └── TableScan
+                                ├── table: default.default.a00c
+                                ├── output columns: [a0f (#2), a0t (#16), a0w (#19)]
+                                ├── read rows: 0
+                                ├── read size: 0
+                                ├── partitions total: 0
+                                ├── partitions scanned: 0
+                                ├── push downs: [filters: [is_true(a00c.a0w (#19) = '汇缴')], limit: NONE]
+                                ├── apply join filters: [#0]
+                                └── estimated rows: 0.00

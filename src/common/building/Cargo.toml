@@ -1,0 +1,18 @@
+[package]
+name = "databend-common-building"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+cargo_metadata = { workspace = true }
+gix = { workspace = true }
+log = { workspace = true }
+vergen-gix = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+--ontime_200.csv
+ontime_200.csv
+199
+
+199	2020	769
+--ontime_200.csv.gz
+ontime_200.csv.gz
+199
+
+199	2020	769
+--ontime_200.csv.zst
+ontime_200.csv.zst
+199
+
+199	2020	769
+--ontime_200.csv.bz2
+ontime_200.csv.bz2
+199
+
+199	2020	769
+--ontime_200.ndjson
+ontime_200.ndjson
+199
+
+199	2020	769
+--ontime_200.parquet
+ontime_200.parquet
+199
+
+199	2020	769

@@ -1,0 +1,13 @@
+[package]
+name = "databend-enterprise-meta"
+description = "enterprise features for databend-meta"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+
+[lints]
+workspace = true

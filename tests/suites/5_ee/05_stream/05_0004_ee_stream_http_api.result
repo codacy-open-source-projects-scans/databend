@@ -1,0 +1,17 @@
+# Test catalog streams API - existing database
+{
+  "streams": [
+    {
+      "name": "s1",
+      "database": "default",
+      "catalog": "default",
+      "mode": "append_only",
+      "comment": "",
+      "table_name": "t1",
+      "snapshot_location": null
+    }
+  ],
+  "warnings": []
+}
+# Test catalog streams API - non-existent database
+{"error":{"code":404,"message":"UnknownDatabase. Code: 1003, Text = Unknown database 'nonexistent'."}}404

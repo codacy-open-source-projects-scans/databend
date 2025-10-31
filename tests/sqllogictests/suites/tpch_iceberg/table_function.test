@@ -1,0 +1,40 @@
+statement ok
+DROP CATALOG IF EXISTS ctl;
+
+statement ok
+CREATE CATALOG ctl
+TYPE=ICEBERG
+CONNECTION=(
+    TYPE='rest'
+    ADDRESS='http://127.0.0.1:8181'
+    WAREHOUSE='s3://iceberg-tpch'
+    "s3.region"='us-east-1'
+    "s3.endpoint"='http://127.0.0.1:9000'
+);
+
+statement ok
+SET catalog ctl;
+
+statement ok
+catalog ctl;
+
+statement ok
+select * from iceberg_snapshot('tpch', 'lineitem');
+
+statement ok
+select * from iceberg_manifest('tpch', 'lineitem');
+
+statement ok
+select sum(added_data_files_count) from iceberg_manifest('tpch', 'lineitem');
+
+statement ok
+select sum(summary['total-records']::Int64), count() from iceberg_snapshot('tpch', 'lineitem') where operation = 'append';
+
+statement ok
+select * from tpch.lineitem at (timestamp=>'2099-03-12 23:18:22.665000'::Timestamp) limit 1;
+
+statement error 2013
+select * from tpch.lineitem at (timestamp=>'2000-03-12 23:18:22.665000'::Timestamp) limit 1;
+
+statement error 2013
+select * from tpch.lineitem at (snapshot=>'4524280171191816067') limit 1;

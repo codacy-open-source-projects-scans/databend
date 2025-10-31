@@ -1,0 +1,80 @@
+statement ok
+drop role if exists 'test-a'
+
+statement ok
+CREATE ROLE `test-a`
+
+statement error 2216
+CREATE ROLE `test-a`
+
+statement error 2217
+CREATE ROLE 'a\b'
+
+statement error 2217
+CREATE ROLE 'a\f'
+
+statement ok
+drop role if exists 'a\b';
+
+statement ok
+drop role if exists 'a\f';
+
+statement ok
+CREATE ROLE IF NOT EXISTS `test-a`
+
+statement ok
+DROP ROLE `test-a`
+
+statement error 2217
+create role 'account_admin'
+
+statement error 2217
+create role 'account_admiN'
+
+statement error 2217
+create role 'Public'
+
+statement error 2217
+create role 'public'
+
+onlyif http
+statement error 2217
+create role 'a"a'
+
+statement error 1005
+create role "a'a"
+
+statement ok
+drop role if exists r1;
+
+statement ok
+create role r1;
+
+statement ok
+grant select on *.* to role r1;
+
+query T
+show grants for role r1;
+----
+SELECT *.* NULL ROLE r1 GRANT SELECT ON *.* TO ROLE `r1`
+
+## not replace return ok
+statement ok
+create role if not exists r1;
+
+query T
+show grants for role r1;
+----
+SELECT *.* NULL ROLE r1 GRANT SELECT ON *.* TO ROLE `r1`
+
+## not replace return error
+statement error 2216
+CREATE ROLE r1
+
+query T
+show grants for role r1;
+----
+SELECT *.* NULL ROLE r1 GRANT SELECT ON *.* TO ROLE `r1`
+
+statement ok
+drop role r1;

@@ -1,0 +1,40 @@
+[package]
+name = "databend-common-tracing"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-channel = { workspace = true }
+backtrace = { workspace = true }
+concurrent-queue = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-meta-app-storage = { workspace = true }
+defer = { workspace = true }
+fastrace = { workspace = true }
+fastrace-opentelemetry = { workspace = true }
+itertools = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
+opendal = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,176 @@
+statement ok
+DROP CATALOG IF EXISTS ctl;
+
+statement ok
+CREATE CATALOG ctl
+TYPE=ICEBERG
+CONNECTION=(
+    TYPE='rest'
+    ADDRESS='http://127.0.0.1:8181'
+    WAREHOUSE='s3://iceberg-tpch'
+    "s3.region"='us-east-1'
+    "s3.endpoint"='http://127.0.0.1:9000'
+);
+
+statement ok
+use catalog ctl;
+
+query T
+show catalogs where name='ctl';
+----
+ctl
+
+statement ok
+create or replace database default.system_db_test;
+
+## should not display system_db_test
+query T
+show databases from ctl;
+----
+information_schema
+system
+test
+tpch
+
+statement ok
+drop database if exists default.system_db_test;
+
+statement error 1003
+use aa;
+
+statement ok
+create or replace database default.tpch;
+
+statement ok
+create table default.tpch.lineitem(id int);
+
+statement ok
+insert into default.tpch.lineitem values(1);
+
+query T
+select * from default.tpch.lineitem;
+----
+1
+
+query T
+show tables from ctl.tpch;
+----
+customer
+lineitem
+nation
+orders
+part
+partsupp
+region
+supplier
+
+statement ok
+use tpch
+
+statement ok
+use tpch
+
+query III
+select access > 0, hit > 0, miss > 0 from default.system.caches where name = 'memory_cache_iceberg_table'
+----
+1 1 1
+
+## test database
+statement ok
+create database if not exists abc;
+
+statement ok
+create database if not exists ef123;
+
+statement ok
+create or replace database ef123;
+
+statement ok
+create database if not exists ef123;
+
+query T rowsort
+show databases;
+----
+abc
+ef123
+information_schema
+system
+test
+tpch
+
+statement ok
+drop database if exists ef123;
+
+query T rowsort
+show databases from ctl;
+----
+abc
+information_schema
+system
+test
+tpch
+
+statement ok
+create table if not exists abc.t(id int) engine=ICEBERG;
+
+query T
+desc abc.t;
+----
+id INT YES NULL (empty)
+
+statement error 1302
+ALTER TABLE abc.t rename column id to b
+
+statement ok
+create or replace table abc.t1(c1 int, c2 string);
+
+statement error 1301
+create or replace table abc.t1(c1 datetime, c2 string) partition by (c1, c2);
+
+statement ok
+create or replace table abc.t1(c1 date, c2 string) partition by (c2) properties ("read.split.target-size"='134217728', "read.split.metadata-target-size"='33554432');
+
+query T
+desc abc.t1;
+----
+c1 DATE YES NULL (empty)
+c2 VARCHAR YES NULL (empty)
+
+query T
+show tables from abc;
+----
+t
+t1
+
+query T
+show columns from abc.t1;
+----
+c1 DATE YES (empty) NULL NULL
+c2 VARCHAR YES (empty) NULL NULL
+
+statement error 1302
+CREATE TABLE IF NOT EXISTS abc.t2(c1 int) ENGINE = fuse
+
+statement ok
+alter table abc.t refresh cache;
+
+statement ok
+alter database abc refresh cache;
+
+statement ok
+drop table abc.t
+
+statement ok
+drop table abc.t1
+
+statement error
+drop database ef123;
+
+statement ok
+drop database abc;
+
+statement ok
+select name from default.system.tables;
+
+statement ok
+drop database default.tpch;

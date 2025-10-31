@@ -1,0 +1,97 @@
+name: "Pack Deb"
+description: "Pack releases deb"
+inputs:
+  arch:
+    description: "Release arch"
+    required: true
+  version:
+    description: "Release version"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install nfpm@latest
+      shell: bash
+      run: |
+        version="2.43.1"
+        arch=$(uname -m)
+        url_base="https://github.com/goreleaser/nfpm/releases/download/v${version}"
+        case $arch in
+          x86_64)
+            curl -sSLo nfpm.deb ${url_base}/nfpm_${version}_amd64.deb
+            ;;
+          aarch64)
+            curl -sSLo nfpm.deb ${url_base}/nfpm_${version}_arm64.deb
+            ;;
+          *)
+            echo "Unsupported arch: $arch"
+            exit 1
+            ;;
+        esac
+        sudo dpkg -i nfpm.deb
+        rm nfpm.deb
+        nfpm --version
+
+    - name: Get target
+      id: target
+      shell: bash
+      run: |
+        echo 'target=${{ inputs.arch }}-unknown-linux-gnu' >> $GITHUB_OUTPUT
+
+    - name: Download artifacts
+      uses: ./.github/actions/artifact_download
+      with:
+        sha: ${{ github.sha }}
+        target: ${{ steps.target.outputs.target }}
+        category: default
+        artifacts: metactl,meta,query,query.debug
+        path: distro/bin
+
+    - name: Prepare Package Info
+      shell: bash
+      id: info
+      run: |
+        export version="${{ inputs.version }}"
+        case "${{ inputs.arch }}" in
+          x86_64)
+            echo "arch=amd64" >> $GITHUB_OUTPUT
+            ;;
+          aarch64)
+            echo "arch=arm64" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "Unsupported arch: ${{ inputs.arch }}"
+            exit 1
+            ;;
+        esac
+        deb_version=${version/-/'~'}
+        echo "version=${deb_version/v/}" >> $GITHUB_OUTPUT
+        mkdir -p distro/{bin,configs,systemd,scripts,pkg}
+        cp ./scripts/distribution/systemd/databend-* distro/systemd/
+        cp ./scripts/distribution/configs/databend-* distro/configs/
+        cp ./scripts/distribution/release-readme.txt distro/readme.txt
+        cp -r ./scripts/distribution/package-scripts/* distro/scripts/
+
+    - name: Build Databend Packages
+      shell: bash
+      run: |
+        pkgs="query meta query-dbg"
+        for pkg in $pkgs; do
+          yq -i '.arch = "${{ steps.info.outputs.arch }}"' scripts/distribution/nfpm-${pkg}.yaml
+          yq -i '.version = "${{ steps.info.outputs.version }}"' scripts/distribution/nfpm-${pkg}.yaml
+          nfpm pkg --packager deb --target distro/pkg -f scripts/distribution/nfpm-${pkg}.yaml
+        done
+        ls -lh distro/pkg
+
+    - name: Update release to github
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      # Reference: https://cli.github.com/manual/gh_release_upload
+      run: |
+        version="${{ inputs.version }}"
+        # name looks like: `databend_0.8.144~nightly_amd64.deb`
+        for pkg in $(ls distro/pkg/*.deb); do
+          gh release upload ${version} $pkg --clobber
+        done

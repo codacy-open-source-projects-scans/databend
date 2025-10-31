@@ -1,0 +1,89 @@
+statement ok
+CREATE OR REPLACE database test
+
+# most show create table tests are migrated into 02_0001_show_create_table.sh
+# logictests are not suitable to test outputs with newline
+
+statement error 3901
+CREATE TABLE should_fail (a int not null) ENGINE=FUSE 's3://load/files/' CONNECTION=(access_key_id='1a2b3c' aws_secret_key='4x5y6z') CLUSTER BY (a, a % 3) COMPRESSION='lz4' STORAGE_FORMAT='parquet'
+
+statement ok
+drop table if exists t;
+
+statement ok
+drop table if exists t1;
+
+statement ok
+create table t(c1 int, c2 int);
+
+statement ok
+create table t1(c1 int, c2 string);
+
+statement ok
+insert into t values(1,10),(2,20),(3,30);
+
+statement ok
+insert into t1 values(1,'x'),(2,'y'),(3,'z');
+
+statement ok
+create view v_t as select * from t;
+
+statement ok
+create view v_union as select c1 from t union all select c1 from t1;
+
+statement ok
+create view v_subquery as select * from (select c1 from t union all select c1 from t1) as res;
+
+statement ok
+create view v_join as select * from (select c1 from t union all select c1 from t1) as res join t1 on t1.c1=res.c1;
+
+statement ok
+create database db1;
+
+statement ok
+use db1;
+
+query II
+select * from default.v_t order by c1;
+----
+1 10
+2 20
+3 30
+
+query I
+select * from default.v_union order by c1;
+----
+1
+1
+2
+2
+3
+3
+
+query I
+select * from default.v_subquery order by c1;
+----
+1
+1
+2
+2
+3
+3
+
+query III
+select * from default.v_join order by c2;
+----
+1 1 x
+1 1 x
+2 2 y
+2 2 y
+3 3 z
+3 3 z
+
+statement ok
+create or replace view default.v_test as select * from t;
+
+query TT
+show create table default.v_test;
+----
+v_test CREATE VIEW `default`.`v_test` AS SELECT * FROM default.t

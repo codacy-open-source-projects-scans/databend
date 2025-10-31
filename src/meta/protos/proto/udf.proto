@@ -1,0 +1,118 @@
+// Copyright 2022 Datafuse Labs.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package databend_proto;
+
+import "datatype.proto";
+import "metadata.proto";
+
+message LambdaUDF {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  repeated string parameters = 1;
+  string definition = 2;
+}
+
+message UDFServer {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  string address = 1;
+  string handler = 2;
+  string language = 3;
+  repeated DataType arg_types = 4;
+  DataType return_type = 5;
+  map<string, string> headers = 6;
+  optional bool immutable = 7;
+  repeated string arg_names = 8;
+}
+
+message UDFScript {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  string code = 1;
+  string handler = 2;
+  string language = 3;
+  repeated DataType arg_types = 4;
+  DataType return_type = 5;
+  string runtime_version = 6;
+  repeated string imports = 7;
+  repeated string packages = 8;
+  optional bool immutable = 9;
+}
+
+message UDAFScript {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  string code = 1;
+  string language = 2;
+  string runtime_version = 3;
+  DataType return_type = 4;
+  repeated DataType arg_types = 5;
+  repeated DataField state_fields = 6;
+  repeated string imports = 7;
+  repeated string packages = 8;
+}
+
+message UDTFArg {
+  string name = 1;
+  DataType ty = 2;
+}
+
+message UDTF {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  // arg name with data type
+  repeated UDTFArg arg_types = 1;
+  // return column name with data type
+  repeated UDTFArg return_types = 2;
+  string sql = 3;
+}
+
+message ScalarUDF {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  // arg name with data type
+  repeated UDTFArg arg_types = 1;
+  // return data type
+  DataType return_type = 2;
+  // typically including the code or expression implementing the function logic
+  string definition = 3;
+}
+
+
+message UserDefinedFunction {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  string name = 1;
+  string description = 2;
+  oneof definition {
+    LambdaUDF lambda_udf = 3;
+    UDFServer udf_server = 4;
+    UDFScript udf_script = 6;
+    UDAFScript udaf_script = 7;
+    UDTF udtf = 8;
+    ScalarUDF scalar_udf = 9;
+  }
+  // The time udf created.
+  optional string created_on = 5;
+}

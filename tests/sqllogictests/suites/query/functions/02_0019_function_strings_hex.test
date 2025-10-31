@@ -1,0 +1,29 @@
+query T
+select hex(100)
+----
+64
+
+query T
+select hex(-100)
+----
+ffffffffffffff9c
+
+query T
+select hex('abc')
+----
+616263
+
+query T
+select hex(null)
+----
+NULL
+
+query T
+SELECT FROM_HEX(TO_HEX('abc'))::STRING
+----
+abc
+
+query T
+SELECT HEX_DECODE_STRING(TO_HEX('abc'))
+----
+abc

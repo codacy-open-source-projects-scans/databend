@@ -1,0 +1,61 @@
+statement ok
+DROP DATABASE IF EXISTS db1
+
+statement ok
+CREATE DATABASE db1
+
+statement ok
+USE db1
+
+statement ok
+CREATE TABLE IF NOT EXISTS t1(a Int, b Date)
+
+statement ok
+INSERT INTO t1 VALUES(1, '2022-12-30')
+
+statement ok
+INSERT INTO t1 VALUES(2, '2023-01-01')
+
+query IT
+SELECT * FROM t1 ORDER BY b
+----
+1 2022-12-30
+2 2023-01-01
+
+query T
+explain fragments UPDATE t1 SET a = 3 WHERE b > '2022-12-31'
+----
+Fragment 0:
+  DataExchange: Merge
+    ExchangeSink
+    ├── output columns: []
+    ├── destination fragment: [2]
+    └── MutationSource(Update)
+        ├── table: default.db1.t1
+        ├── output columns: [a (#0), b (#1), _predicate (#2)]
+        ├── filters: [is_true(t1.b (#1) > '2022-12-31')]
+        ├── read rows: 1
+        ├── read size: < 1 KiB
+        ├── partitions total: 2
+        └── partitions scanned: 1
+(empty)
+(empty)
+Fragment 2:
+    CommitSink
+    └── ExchangeSource
+        ├── output columns: []
+        └── source fragment: [0]
+(empty)
+
+query IT
+SELECT * FROM t1 ORDER BY b
+----
+1 2022-12-30
+2 2023-01-01
+
+query T
+explain fragments UPDATE t1 SET a = 3 WHERE false
+----
+Fragment 1:
+    EmptyResultScan
+(empty)

@@ -1,0 +1,78 @@
+[package]
+name = "databend-common-sql"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
+
+[features]
+default = []
+storage-hdfs = ["databend-common-config/storage-hdfs"]
+
+[dependencies]
+databend-common-ast = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-catalog = { workspace = true }
+databend-common-compress = { workspace = true }
+databend-common-config = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-functions = { workspace = true }
+databend-common-license = { workspace = true }
+databend-common-management = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-meta-types = { workspace = true }
+databend-common-metrics = { workspace = true }
+databend-common-pipeline-core = { workspace = true }
+databend-common-settings = { workspace = true }
+databend-common-storage = { workspace = true }
+databend-common-storages-basic = { workspace = true }
+databend-common-users = { workspace = true }
+databend-enterprise-data-mask-feature = { workspace = true }
+databend-enterprise-row-access-policy-feature = { workspace = true }
+databend-storages-common-cache = { workspace = true }
+databend-storages-common-stage = { workspace = true }
+databend-storages-common-table-meta = { workspace = true }
+
+ahash = { workspace = true, features = ["no-rng"] }
+anyhow = { workspace = true }
+async-backtrace = { workspace = true }
+async-recursion = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+cidr = { workspace = true }
+cron = { workspace = true }
+ctor = { workspace = true }
+dashmap = { workspace = true }
+derive-visitor = { workspace = true }
+educe = { workspace = true }
+enum-as-inner = { workspace = true }
+fastrace = { workspace = true }
+globiter = { workspace = true }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+jsonb = { workspace = true }
+log = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
+opendal = { workspace = true }
+parking_lot = { workspace = true }
+prqlc = { workspace = true }
+recursive = { workspace = true }
+regex = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+similar = { workspace = true }
+simsearch = { workspace = true }
+unicase = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

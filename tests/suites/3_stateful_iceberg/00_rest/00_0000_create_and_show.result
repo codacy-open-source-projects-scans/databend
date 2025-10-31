@@ -1,0 +1,22 @@
+===== Testing iceberg_rest =====
+iceberg_rest	iceberg	ADDRESS
+http://localhost:8181
+WAREHOUSE
+s3://warehouse/demo/
+default
+t
+t
+iceberg_rest
+
+
+===== Testing iceberg_glue =====
+iceberg_glue	iceberg	ADDRESS
+http://localhost:5000
+WAREHOUSE
+s3a://warehouse/glue/
+default
+t
+t
+iceberg_glue
+
+

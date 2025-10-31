@@ -1,0 +1,84 @@
+statement ok
+DROP CATALOG IF EXISTS ctl;
+
+statement ok
+CREATE CATALOG ctl
+TYPE=ICEBERG
+CONNECTION=(
+    TYPE='rest'
+    ADDRESS='http://127.0.0.1:8181'
+    WAREHOUSE='s3://iceberg-tpch/'
+    "s3.region"='us-east-1'
+    "s3.endpoint"='http://127.0.0.1:9000'
+);
+
+statement ok
+use catalog ctl;
+
+statement ok
+use test;
+
+query II rowsort
+select * from t1;
+----
+0 0 a
+1 1 b
+2 2 c
+3 3 d
+4 NULL NULL
+
+query II rowsort
+select * from t1_orc;
+----
+0 0 a
+1 1 b
+2 2 c
+3 3 d
+4 NULL NULL
+
+query II rowsort
+select c1, c3 from t1;
+----
+0 a
+1 b
+2 c
+3 d
+4 NULL
+
+query II rowsort
+select c1, c3 from t1_orc;
+----
+0 a
+1 b
+2 c
+3 d
+4 NULL
+
+# test_merge_on_read_deletes: DELETE FROM test_merge_on_read_deletes WHERE letter = 'k' OR number = 3 OR (number > 4 AND number < 7)
+# Tips: `2023-03-30 6 z` is new row
+query TTI rowsort
+select * from test_merge_on_read_deletes;
+----
+2023-03-01 1 a
+2023-03-02 2 b
+2023-03-04 4 d
+2023-03-07 7 g
+2023-03-08 8 h
+2023-03-09 9 i
+2023-03-10 10 j
+2023-03-12 12 l
+2023-03-30 6 z
+
+# test projection
+query T rowsort
+select dt from test_merge_on_read_deletes;
+----
+2023-03-01
+2023-03-02
+2023-03-04
+2023-03-07
+2023-03-08
+2023-03-09
+2023-03-10
+2023-03-12
+2023-03-30

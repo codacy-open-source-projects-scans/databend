@@ -1,0 +1,30 @@
+statement ok
+DROP STAGE IF EXISTS stage_t4;
+
+statement ok
+DROP TABLE IF EXISTS t4;
+
+statement ok
+CREATE STAGE stage_t4;
+
+statement ok
+CREATE TABLE t4(str string);
+
+statement ok
+set enable_distributed_copy_into = 0;
+
+statement ok
+copy into @stage_t4 from (SELECT to_string(number) as str from numbers(10));
+
+statement ok
+COPY INTO t4 from @stage_t4 pattern='.*' FILE_FORMAT = (TYPE = 'parquet') PURGE=true FORCE=true max_files=10000;
+
+# Test cases for column not exist error
+statement error (?s)1006(.*)Table "default.t4" does not have a column with name "c_not_exist"
+COPY INTO t4(str, c_not_exist) from @stage_t4 pattern='.*' FILE_FORMAT = (TYPE = 'parquet') PURGE=true FORCE=true max_files=10000;
+
+statement ok
+DROP STAGE IF EXISTS stage_t4;
+
+statement ok
+DROP TABLE IF EXISTS t4;

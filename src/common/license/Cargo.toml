@@ -1,0 +1,18 @@
+[package]
+name = "databend-common-license"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+databend-common-base = { workspace = true }
+databend-common-exception = { workspace = true }
+display-more = { workspace = true }
+jwt-simple = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
