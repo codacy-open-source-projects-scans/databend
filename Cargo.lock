@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "databend-common-ast"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "databend_educe",
  "derive-visitor",
@@ -3173,7 +3173,7 @@ dependencies = [
  "databend-common-meta-app",
  "databend-common-meta-store",
  "databend-common-meta-types",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-settings",
  "databend-common-storage",
  "databend-common-users",
@@ -3186,6 +3186,7 @@ dependencies = [
  "parking_lot 0.12.3",
  "parquet",
  "rand 0.8.5",
+ "roaring",
  "serde",
  "serde_json",
  "sha2",
@@ -4030,7 +4031,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "databend-common-pipeline-core"
+name = "databend-common-pipeline"
 version = "0.1.0"
 dependencies = [
  "async-backtrace",
@@ -4045,34 +4046,6 @@ dependencies = [
  "serde",
  "tokio",
  "typetag",
-]
-
-[[package]]
-name = "databend-common-pipeline-sinks"
-version = "0.1.0"
-dependencies = [
- "async-backtrace",
- "async-trait",
- "databend-common-base",
- "databend-common-exception",
- "databend-common-expression",
- "databend-common-pipeline-core",
- "tokio",
-]
-
-[[package]]
-name = "databend-common-pipeline-sources"
-version = "0.1.0"
-dependencies = [
- "async-backtrace",
- "async-trait",
- "databend-common-base",
- "databend-common-catalog",
- "databend-common-exception",
- "databend-common-expression",
- "databend-common-pipeline-core",
- "futures",
- "parking_lot 0.12.3",
 ]
 
 [[package]]
@@ -4094,7 +4067,7 @@ dependencies = [
  "databend-common-expression",
  "databend-common-functions",
  "databend-common-license",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-sql",
  "databend-storages-common-cache",
  "enum-as-inner",
@@ -4214,7 +4187,7 @@ dependencies = [
  "databend-common-meta-app",
  "databend-common-meta-types",
  "databend-common-metrics",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-settings",
  "databend-common-storage",
  "databend-common-storages-basic",
@@ -4302,9 +4275,7 @@ dependencies = [
  "databend-common-meta-kvapi",
  "databend-common-meta-store",
  "databend-common-meta-types",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sinks",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-storage",
  "databend-common-storages-parquet",
  "databend-storages-common-blocks",
@@ -4333,7 +4304,7 @@ dependencies = [
  "databend-common-expression",
  "databend-common-functions",
  "databend-common-meta-app",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-storage",
  "databend-common-storages-parquet",
  "databend-storages-common-pruner",
@@ -4394,9 +4365,7 @@ dependencies = [
  "databend-common-meta-types",
  "databend-common-metrics",
  "databend-common-native",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sinks",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-sql",
  "databend-common-storage",
@@ -4426,6 +4395,7 @@ dependencies = [
  "parquet",
  "paste",
  "rand 0.8.5",
+ "roaring",
  "serde",
  "serde_json",
  "sha2",
@@ -4456,8 +4426,7 @@ dependencies = [
  "databend-common-functions",
  "databend-common-meta-app",
  "databend-common-meta-types",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-sql",
  "databend-common-storage",
  "databend-common-storages-parquet",
@@ -4492,8 +4461,7 @@ dependencies = [
  "databend-common-expression",
  "databend-common-meta-app",
  "databend-common-meta-types",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-storage",
  "databend-common-storages-orc",
@@ -4544,8 +4512,7 @@ dependencies = [
  "databend-common-expression",
  "databend-common-functions",
  "databend-common-meta-app",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-storage",
  "databend-storages-common-stage",
@@ -4580,7 +4547,7 @@ dependencies = [
  "databend-common-functions",
  "databend-common-meta-app",
  "databend-common-metrics",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-settings",
  "databend-common-storage",
  "databend-storages-common-cache",
@@ -4619,8 +4586,7 @@ dependencies = [
  "databend-common-functions",
  "databend-common-io",
  "databend-common-meta-app",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-settings",
  "databend-common-storage",
@@ -4654,8 +4620,7 @@ dependencies = [
  "databend-common-exception",
  "databend-common-expression",
  "databend-common-meta-app",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-sql",
  "databend-common-storages-fuse",
  "databend-storages-common-table-meta",
@@ -4682,8 +4647,7 @@ dependencies = [
  "databend-common-management",
  "databend-common-meta-app",
  "databend-common-metrics",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-sql",
  "databend-common-storage",
  "databend-common-storages-basic",
@@ -4807,18 +4771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "databend-enterprise-aggregating-index"
-version = "0.1.0"
-dependencies = [
- "async-backtrace",
- "async-trait",
- "databend-common-base",
- "databend-common-catalog",
- "databend-common-exception",
- "databend-common-meta-app",
-]
-
-[[package]]
 name = "databend-enterprise-attach-table"
 version = "0.1.0"
 dependencies = [
@@ -4879,7 +4831,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dashmap 6.1.0",
- "databend-common-ast",
  "databend-common-base",
  "databend-common-catalog",
  "databend-common-config",
@@ -4895,8 +4846,7 @@ dependencies = [
  "databend-common-meta-store",
  "databend-common-meta-types",
  "databend-common-metrics",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-sql",
  "databend-common-storage",
@@ -4904,7 +4854,6 @@ dependencies = [
  "databend-common-storages-stream",
  "databend-common-tracing",
  "databend-common-version",
- "databend-enterprise-aggregating-index",
  "databend-enterprise-attach-table",
  "databend-enterprise-data-mask-feature",
  "databend-enterprise-fail-safe",
@@ -4913,15 +4862,12 @@ dependencies = [
  "databend-enterprise-row-access-policy-feature",
  "databend-enterprise-storage-encryption",
  "databend-enterprise-stream-handler",
- "databend-enterprise-table-index",
  "databend-enterprise-vacuum-handler",
  "databend-enterprise-virtual-column",
  "databend-query",
  "databend-storages-common-cache",
  "databend-storages-common-io",
- "databend-storages-common-pruner",
  "databend-storages-common-table-meta",
- "derive-visitor",
  "futures",
  "futures-util",
  "jsonb",
@@ -4984,21 +4930,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "databend-enterprise-table-index"
-version = "0.1.0"
-dependencies = [
- "async-backtrace",
- "async-trait",
- "databend-common-base",
- "databend-common-catalog",
- "databend-common-exception",
- "databend-common-expression",
- "databend-common-meta-app",
- "databend-common-pipeline-core",
- "databend-common-storages-fuse",
-]
-
-[[package]]
 name = "databend-enterprise-vacuum-handler"
 version = "0.1.0"
 dependencies = [
@@ -5018,7 +4949,7 @@ dependencies = [
  "databend-common-base",
  "databend-common-catalog",
  "databend-common-exception",
- "databend-common-pipeline-core",
+ "databend-common-pipeline",
  "databend-common-storages-fuse",
 ]
 
@@ -5276,9 +5207,7 @@ dependencies = [
  "databend-common-meta-store",
  "databend-common-meta-types",
  "databend-common-metrics",
- "databend-common-pipeline-core",
- "databend-common-pipeline-sinks",
- "databend-common-pipeline-sources",
+ "databend-common-pipeline",
  "databend-common-pipeline-transforms",
  "databend-common-script",
  "databend-common-settings",
@@ -5300,20 +5229,19 @@ dependencies = [
  "databend-common-tracing",
  "databend-common-users",
  "databend-common-version",
- "databend-enterprise-aggregating-index",
  "databend-enterprise-attach-table",
  "databend-enterprise-data-mask-feature",
  "databend-enterprise-hilbert-clustering",
  "databend-enterprise-resources-management",
  "databend-enterprise-row-access-policy-feature",
  "databend-enterprise-stream-handler",
- "databend-enterprise-table-index",
  "databend-enterprise-vacuum-handler",
  "databend-enterprise-virtual-column",
  "databend-storages-common-blocks",
  "databend-storages-common-cache",
  "databend-storages-common-index",
  "databend-storages-common-io",
+ "databend-storages-common-pruner",
  "databend-storages-common-session",
  "databend-storages-common-stage",
  "databend-storages-common-table-meta",
@@ -5376,6 +5304,7 @@ dependencies = [
  "socket2",
  "sqlx",
  "sysinfo",
+ "tantivy",
  "temp-env",
  "tempfile",
  "tokio",
@@ -11112,7 +11041,7 @@ dependencies = [
 [[package]]
 name = "opensrv-mysql"
 version = "0.8.0"
-source = "git+https://github.com/databendlabs/opensrv.git?rev=a1fb4da#a1fb4da215c8693c7e4f62be249a01b7fec52997"
+source = "git+https://github.com/databendlabs/opensrv.git?tag=v0.9.0#ae91dc387ca73e1978b6d8d882039f00bc52b45b"
 dependencies = [
  "async-trait",
  "byteorder",

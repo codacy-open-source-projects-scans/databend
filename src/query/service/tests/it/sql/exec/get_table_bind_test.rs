@@ -133,9 +133,9 @@ use databend_common_meta_app::schema::UpsertTableOptionReq;
 use databend_common_meta_app::tenant::Tenant;
 use databend_common_meta_types::MetaId;
 use databend_common_meta_types::SeqV;
-use databend_common_pipeline_core::InputError;
-use databend_common_pipeline_core::LockGuard;
-use databend_common_pipeline_core::PlanProfile;
+use databend_common_pipeline::core::InputError;
+use databend_common_pipeline::core::LockGuard;
+use databend_common_pipeline::core::PlanProfile;
 use databend_common_settings::Settings;
 use databend_common_sql::Planner;
 use databend_common_storage::CopyStatus;
@@ -1033,7 +1033,7 @@ impl TableContext for CtxDelegation {
     }
 
     fn session_state(&self) -> Result<SessionState> {
-        todo!()
+        Ok(SessionState::default())
     }
 
     fn is_temp_table(&self, _catalog_name: &str, _database_name: &str, _table_name: &str) -> bool {
