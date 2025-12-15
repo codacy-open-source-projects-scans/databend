@@ -14,7 +14,11 @@
 
 use std::sync::LazyLock;
 
+use databend_common_column::types::timestamp_tz;
 use databend_common_exception::Result;
+use databend_common_timezone::fast_components_from_timestamp;
+use databend_common_timezone::fast_utc_from_local;
+use databend_common_timezone::DateTimeComponents;
 use jiff::civil::date;
 use jiff::civil::datetime;
 use jiff::civil::Date;
@@ -177,14 +181,67 @@ macro_rules! impl_interval_year_month {
                 add_months: bool,
             ) -> std::result::Result<i64, String> {
                 let ts = us.to_timestamp(tz);
+                let original_offset = ts.offset().seconds();
+
+                if let Some(components) = fast_components_from_timestamp(us, tz) {
+                    let new_date = $op(
+                        components.year as i16,
+                        components.month as i8,
+                        components.day as i8,
+                        delta.as_(),
+                        add_months,
+                    )?;
+                    if let Some(mut new_ts) = fast_utc_from_local(
+                        tz,
+                        new_date.year() as i32,
+                        new_date.month() as u8,
+                        new_date.day() as u8,
+                        components.hour,
+                        components.minute,
+                        components.second,
+                        components.micro,
+                    ) {
+                        if let Some(new_components) = fast_components_from_timestamp(new_ts, tz) {
+                            if new_components.offset_seconds != original_offset {
+                                let shift_secs =
+                                    (new_components.offset_seconds - original_offset) as i64;
+                                let shift_micros = shift_secs.saturating_mul(MICROS_PER_SEC);
+                                new_ts = new_ts.checked_add(shift_micros).unwrap_or_else(|| {
+                                    if shift_micros.is_negative() {
+                                        i64::MIN
+                                    } else {
+                                        i64::MAX
+                                    }
+                                });
+                            }
+                            clamp_timestamp(&mut new_ts);
+                            return Ok(new_ts);
+                        }
+                    }
+                }
+
                 let new_date = $op(ts.year(), ts.month(), ts.day(), delta.as_(), add_months)?;
 
-                let mut ts = new_date
-                    .at(ts.hour(), ts.minute(), ts.second(), ts.subsec_nanosecond())
-                    .to_zoned(tz.clone())
-                    .map_err(|e| format!("{}", e))?
-                    .timestamp()
-                    .as_microsecond();
+                let local =
+                    new_date.at(ts.hour(), ts.minute(), ts.second(), ts.subsec_nanosecond());
+                let mut zoned = match local.to_zoned(tz.clone()) {
+                    Ok(z) => z,
+                    Err(e) => match local.checked_add(SignedDuration::from_secs(3600)) {
+                        Ok(res2) => res2
+                            .to_zoned(tz.clone())
+                            .map_err(|err| format!("{}", err))?,
+                        Err(_) => return Err(format!("{}", e)),
+                    },
+                };
+                if zoned.offset().seconds() != original_offset {
+                    let shift = (zoned.offset().seconds() - original_offset) as i64;
+                    if let Ok(adj_local) = local.checked_add(SignedDuration::from_secs(shift)) {
+                        if let Ok(adj_zoned) = adj_local.to_zoned(tz.clone()) {
+                            zoned = adj_zoned;
+                        }
+                    }
+                }
+                let mut ts = zoned.timestamp().as_microsecond();
                 clamp_timestamp(&mut ts);
                 Ok(ts)
             }
@@ -194,6 +251,37 @@ macro_rules! impl_interval_year_month {
 
 impl_interval_year_month!(EvalYearsImpl, eval_years_base);
 impl_interval_year_month!(EvalMonthsImpl, eval_months_base);
+
+/// Compare two `DateTimeComponents` by their time-of-day portion only.
+fn components_time_less_than(a: &DateTimeComponents, b: &DateTimeComponents) -> bool {
+    (a.hour, a.minute, a.second, a.micro) < (b.hour, b.minute, b.second, b.micro)
+}
+
+fn date_from_components(c: &DateTimeComponents) -> Option<Date> {
+    Date::new(c.year as i16, c.month as i8, c.day as i8).ok()
+}
+
+#[inline]
+pub fn timestamp_tz_local_micros(value: timestamp_tz) -> Option<i64> {
+    let offset = value.micros_offset()?;
+    value.timestamp().checked_add(offset)
+}
+
+#[inline]
+pub fn timestamp_tz_components_via_lut(value: timestamp_tz) -> Option<DateTimeComponents> {
+    let local = timestamp_tz_local_micros(value)?;
+    fast_components_from_timestamp(local, &TimeZone::UTC)
+}
+
+fn datetime_from_components(c: &DateTimeComponents) -> Option<DateTime> {
+    let date = date_from_components(c)?;
+    Some(date.at(
+        c.hour as i8,
+        c.minute as i8,
+        c.second as i8,
+        (c.micro * 1_000) as i32,
+    ))
+}
 
 impl EvalYearsImpl {
     pub fn eval_date_diff(date_start: i32, date_end: i32, tz: &TimeZone) -> i32 {
@@ -228,6 +316,12 @@ impl EvalYearsImpl {
     }
 
     pub fn eval_timestamp_diff(date_start: i64, date_end: i64, tz: &TimeZone) -> i64 {
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            return (end.year as i64) - (start.year as i64);
+        }
         let date_start = date_start.to_timestamp(tz);
         let date_end = date_end.to_timestamp(tz);
         date_end.year() as i64 - date_start.year() as i64
@@ -239,6 +333,23 @@ impl EvalYearsImpl {
         }
         if date_start > date_end {
             return -Self::eval_timestamp_between(date_end, date_start, tz);
+        }
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            let mut years = end.year - start.year;
+            let start_is_feb_29 = start.month == 2 && start.day == 29;
+            let end_is_feb_28 = end.month == 2 && end.day == 28;
+            let end_before_start_date = (end.month < start.month)
+                || (end.month == start.month && end.day < start.day)
+                || (end.month == start.month
+                    && end.day == start.day
+                    && components_time_less_than(&end, &start));
+            if !(start_is_feb_29 && end_is_feb_28) && end_before_start_date {
+                years -= 1;
+            }
+            return years as i64;
         }
         let start = date_start.to_timestamp(tz);
         let end = date_end.to_timestamp(tz);
@@ -298,6 +409,14 @@ impl EvalISOYearsImpl {
     }
 
     pub fn eval_timestamp_diff(date_start: i64, date_end: i64, tz: &TimeZone) -> i64 {
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            let (start_year, _) = start.iso_year_week();
+            let (end_year, _) = end.iso_year_week();
+            return (end_year - start_year) as i64;
+        }
         let date_start = date_start.to_timestamp(tz);
         let date_end = date_end.to_timestamp(tz);
         date_end.date().iso_week_date().year() as i64 - date_start.iso_week_date().year() as i64
@@ -309,6 +428,23 @@ impl EvalISOYearsImpl {
         }
         if date_start > date_end {
             return -Self::eval_timestamp_between(date_end, date_start, tz);
+        }
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            let mut years = end.year - start.year;
+            let start_is_feb_29 = start.month == 2 && start.day == 29;
+            let end_is_feb_28 = end.month == 2 && end.day == 28;
+            let end_before_start_date = (end.month < start.month)
+                || (end.month == start.month && end.day < start.day)
+                || (end.month == start.month
+                    && end.day == start.day
+                    && components_time_less_than(&end, &start));
+            if !(start_is_feb_29 && end_is_feb_28) && end_before_start_date {
+                years -= 1;
+            }
+            return years as i64;
         }
 
         let start = date_start.to_timestamp(tz);
@@ -344,6 +480,11 @@ impl EvalYearWeeksImpl {
         (iso_week.year() as i32 * 100) + iso_week.week() as i32
     }
 
+    fn yearweek_from_components(components: &DateTimeComponents) -> i32 {
+        let (year, week) = components.iso_year_week();
+        year * 100 + week as i32
+    }
+
     pub fn eval_date_diff(date_start: i32, date_end: i32, tz: &TimeZone) -> i32 {
         let date_start = date_start.to_date(tz);
         let date_end = date_end.to_date(tz);
@@ -354,6 +495,14 @@ impl EvalYearWeeksImpl {
     }
 
     pub fn eval_timestamp_diff(date_start: i64, date_end: i64, tz: &TimeZone) -> i64 {
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            let start_yw = Self::yearweek_from_components(&start) as i64;
+            let end_yw = Self::yearweek_from_components(&end) as i64;
+            return end_yw - start_yw;
+        }
         let date_start = date_start.to_timestamp(tz);
         let date_end = date_end.to_timestamp(tz);
         let end = Self::yearweek(date_end.date()) as i64;
@@ -436,6 +585,14 @@ impl EvalQuartersImpl {
     }
 
     pub fn eval_timestamp_diff(date_start: i64, date_end: i64, tz: &TimeZone) -> i64 {
+        if let (Some(start), Some(end)) = (
+            fast_components_from_timestamp(date_start, tz),
+            fast_components_from_timestamp(date_end, tz),
+        ) {
+            let start_quarter = ((start.month as i64 - 1) / 3) + 1;
+            let end_quarter = ((end.month as i64 - 1) / 3) + 1;
+            return (end.year as i64 - start.year as i64) * 4 + end_quarter - start_quarter;
+        }
         let date_start = date_start.to_timestamp(tz);
         let date_end = date_end.to_timestamp(tz);
         (date_end.year() - date_start.year()) as i64 * 4 + ToQuarter::to_number(&date_end) as i64
@@ -565,6 +722,20 @@ impl EvalMonthsImpl {
         }
         if start > end {
             return -Self::eval_timestamp_between(end, start, tz);
+        }
+        if let (Some(start_c), Some(end_c)) = (
+            fast_components_from_timestamp(start, tz),
+            fast_components_from_timestamp(end, tz),
+        ) {
+            let year_diff = end_c.year - start_c.year;
+            let month_diff = end_c.month as i32 - start_c.month as i32;
+            let mut months = year_diff as i64 * 12 + month_diff as i64;
+            if (end_c.day < start_c.day)
+                || (end_c.day == start_c.day && components_time_less_than(&end_c, &start_c))
+            {
+                months -= 1;
+            }
+            return months;
         }
 
         let start = start.to_timestamp(tz);
@@ -714,6 +885,31 @@ impl EvalWeeksImpl {
         if start > end {
             return -Self::eval_timestamp_between(end, start, tz);
         }
+        if let (Some(start_c), Some(end_c)) = (
+            fast_components_from_timestamp(start, tz),
+            fast_components_from_timestamp(end, tz),
+        ) {
+            if let (Some(start_date), Some(end_date)) =
+                (date_from_components(&start_c), date_from_components(&end_c))
+            {
+                let mut weeks = Self::calculate_weeks_between_years(
+                    start_date.year() as i32,
+                    end_date.year() as i32,
+                    start_date.iso_week_date().week() as u32,
+                    end_date.iso_week_date().week() as u32,
+                ) as i64;
+                let days_since_monday = end_c.weekday.to_monday_one_offset() - 1;
+                let dur = SignedDuration::from_hours(days_since_monday as i64 * 24);
+                let monday_of_end_week = end_date.checked_sub(dur).unwrap();
+                let monday_dt = monday_of_end_week.at(0, 0, 0, 0);
+                if let Some(end_dt) = datetime_from_components(&end_c) {
+                    if end_dt < monday_dt {
+                        weeks -= 1;
+                    }
+                }
+                return weeks;
+            }
+        }
 
         let earlier = start.to_timestamp(tz);
         let later = end.to_timestamp(tz);
@@ -842,66 +1038,59 @@ pub fn today_date(now: &Zoned, tz: &TimeZone) -> i32 {
 // The working hours of all departments of The State Council are from 8 a.m. to 12 p.m. and from 1:30 p.m. to 5:30 p.m. The winter working hours will be implemented after September 17th.
 pub fn calc_date_to_timestamp(val: i32, tz: &TimeZone) -> std::result::Result<i64, String> {
     let ts = (val as i64) * 24 * 3600 * MICROS_PER_SEC;
-    let z = ts.to_timestamp(tz);
+    let local_date = val.to_date(tz);
+    let year = i32::from(local_date.year());
+    let month = local_date.month() as u8;
+    let day = local_date.day() as u8;
 
-    let tomorrow = z.date().tomorrow();
-    let yesterday = z.date().yesterday();
-
-    // If there were no yesterday or tomorrow, it might be the limit value.
-    // e.g. 9999-12-31
-    if tomorrow.is_err() || yesterday.is_err() {
-        let tz_offset_micros = tz
-            .to_timestamp(date(1970, 1, 1).at(0, 0, 0, 0))
-            .unwrap()
-            .as_microsecond();
-        return Ok(ts + tz_offset_micros);
+    if let Some(micros) = fast_utc_from_local(tz, year, month, day, 0, 0, 0, 0) {
+        return Ok(micros);
     }
 
-    // tomorrow midnight
-    let tomorrow_date = tomorrow.map_err(|e| format!("Calc tomorrow midnight with error {}", e))?;
+    let midnight = local_date.to_datetime(Time::midnight());
+    match midnight.to_zoned(tz.clone()) {
+        Ok(zoned) => Ok(zoned.timestamp().as_microsecond()),
+        Err(_err) => {
+            for minutes in 1..=1440 {
+                let delta = SignedDuration::from_secs((minutes * 60) as i64);
+                if let Ok(adj) = midnight.checked_add(delta) {
+                    if let Ok(zoned) = adj.to_zoned(tz.clone()) {
+                        return Ok(zoned.timestamp().as_microsecond());
+                    }
+                } else {
+                    break;
+                }
+            }
 
-    let tomorrow_zoned = tomorrow_date.to_zoned(tz.clone()).unwrap_or(z.clone());
-    let tomorrow_is_dst = tz.to_offset_info(tomorrow_zoned.timestamp()).dst().is_dst();
-
-    // yesterday midnight
-    let yesterday_date =
-        yesterday.map_err(|e| format!("Calc yesterday midnight with error {}", e))?;
-    let yesterday_zoned = yesterday_date.to_zoned(tz.clone()).unwrap_or(z.clone());
-    let yesterday_is_std = tz
-        .to_offset_info(yesterday_zoned.timestamp())
-        .dst()
-        .is_std();
-
-    // today midnight
-    let today_datetime_midnight = z.date().to_datetime(Time::midnight());
-    let today_zoned = today_datetime_midnight
-        .to_zoned(tz.clone())
-        .map_err(|e| format!("Calc today midnight with error {}", e))?;
-    let today_is_dst = tz.to_offset_info(today_zoned.timestamp()).dst().is_dst();
-
-    let tz_offset_micros = tz
-        .to_timestamp(date(1970, 1, 1).at(0, 0, 0, 0))
-        .unwrap()
-        .as_microsecond();
-
-    let base_res = ts + tz_offset_micros;
-
-    // Origin：(today_is_dst && tomorrow_is_dst && !yesterday_is_std) || (today_is_dst && !tomorrow_is_dst && yesterday_is_std)
-    if today_is_dst && (tomorrow_is_dst != yesterday_is_std) {
-        Ok(base_res - 3600 * MICROS_PER_SEC)
-    } else {
-        Ok(base_res)
+            // The timezone database might not have explicit rules for extremely
+            // old/new dates, so fall back to the legacy behavior that applies the
+            // canonical offset we use for 1970-01-01.
+            let tz_offset_micros = tz
+                .to_timestamp(date(1970, 1, 1).at(0, 0, 0, 0))
+                .unwrap()
+                .as_microsecond();
+            Ok(ts + tz_offset_micros)
+        }
     }
 }
 
 pub trait ToNumber<N> {
     fn to_number(dt: &Zoned) -> N;
+
+    fn from_components(_components: &DateTimeComponents) -> Option<N> {
+        None
+    }
 }
 
 pub struct ToNumberImpl;
 
 impl ToNumberImpl {
     pub fn eval_timestamp<T: ToNumber<R>, R>(us: i64, tz: &TimeZone) -> R {
+        if let Some(components) = fast_components_from_timestamp(us, tz) {
+            if let Some(value) = T::from_components(&components) {
+                return value;
+            }
+        }
         let dt = us.to_timestamp(tz);
         T::to_number(&dt)
     }
@@ -943,11 +1132,19 @@ impl ToNumber<u32> for ToYYYYMM {
     fn to_number(dt: &Zoned) -> u32 {
         dt.year() as u32 * 100 + dt.month() as u32
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u32> {
+        Some(components.year as u32 * 100 + components.month as u32)
+    }
 }
 
 impl ToNumber<u16> for ToMillennium {
     fn to_number(dt: &Zoned) -> u16 {
         dt.year() as u16 / 1000 + 1
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u16> {
+        Some(components.year as u16 / 1000 + 1)
     }
 }
 
@@ -955,11 +1152,21 @@ impl ToNumber<u32> for ToWeekOfYear {
     fn to_number(dt: &Zoned) -> u32 {
         dt.date().iso_week_date().week() as u32
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u32> {
+        Some(components.iso_year_week().1)
+    }
 }
 
 impl ToNumber<u32> for ToYYYYMMDD {
     fn to_number(dt: &Zoned) -> u32 {
         dt.year() as u32 * 10_000 + dt.month() as u32 * 100 + dt.day() as u32
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u32> {
+        Some(
+            components.year as u32 * 10_000 + components.month as u32 * 100 + components.day as u32,
+        )
     }
 }
 
@@ -969,6 +1176,15 @@ impl ToNumber<u64> for ToYYYYMMDDHH {
             + dt.month() as u64 * 10_000
             + dt.day() as u64 * 100
             + dt.hour() as u64
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u64> {
+        Some(
+            components.year as u64 * 1_000_000
+                + components.month as u64 * 10_000
+                + components.day as u64 * 100
+                + components.hour as u64,
+        )
     }
 }
 
@@ -981,11 +1197,26 @@ impl ToNumber<u64> for ToYYYYMMDDHHMMSS {
             + dt.minute() as u64 * 100
             + dt.second() as u64
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u64> {
+        Some(
+            components.year as u64 * 10_000_000_000
+                + components.month as u64 * 100_000_000
+                + components.day as u64 * 1_000_000
+                + components.hour as u64 * 10_000
+                + components.minute as u64 * 100
+                + components.second as u64,
+        )
+    }
 }
 
 impl ToNumber<u16> for ToYear {
     fn to_number(dt: &Zoned) -> u16 {
         dt.year() as u16
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u16> {
+        Some(components.year as u16)
     }
 }
 
@@ -993,17 +1224,29 @@ impl ToNumber<i16> for ToTimezoneHour {
     fn to_number(dt: &Zoned) -> i16 {
         dt.offset().seconds().div_ceil(3600) as i16
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<i16> {
+        Some(components.offset_seconds.div_ceil(3600) as i16)
+    }
 }
 
 impl ToNumber<i16> for ToTimezoneMinute {
     fn to_number(dt: &Zoned) -> i16 {
         (dt.offset().seconds() % 3600).div_ceil(60) as i16
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<i16> {
+        Some((components.offset_seconds % 3600).div_ceil(60) as i16)
+    }
 }
 
 impl ToNumber<u16> for ToISOYear {
     fn to_number(dt: &Zoned) -> u16 {
         dt.date().iso_week_date().year() as _
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u16> {
+        Some(components.iso_year_week().0 as u16)
     }
 }
 
@@ -1013,6 +1256,11 @@ impl ToNumber<u32> for ToYYYYWW {
         let year = week_date.year() as u32 * 100;
         year + dt.date().iso_week_date().week() as u32
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u32> {
+        let (iso_year, iso_week) = components.iso_year_week();
+        Some(iso_year as u32 * 100 + iso_week)
+    }
 }
 
 impl ToNumber<u8> for ToQuarter {
@@ -1020,11 +1268,19 @@ impl ToNumber<u8> for ToQuarter {
         // begin with 0
         ((dt.month() - 1) / 3 + 1) as u8
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u8> {
+        Some((components.month - 1) / 3 + 1)
+    }
 }
 
 impl ToNumber<u8> for ToMonth {
     fn to_number(dt: &Zoned) -> u8 {
         dt.month() as u8
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u8> {
+        Some(components.month)
     }
 }
 
@@ -1032,11 +1288,19 @@ impl ToNumber<u16> for ToDayOfYear {
     fn to_number(dt: &Zoned) -> u16 {
         dt.day_of_year() as u16
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u16> {
+        Some(components.day_of_year)
+    }
 }
 
 impl ToNumber<u8> for ToDayOfMonth {
     fn to_number(dt: &Zoned) -> u8 {
         dt.day() as u8
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u8> {
+        Some(components.day)
     }
 }
 
@@ -1044,17 +1308,29 @@ impl ToNumber<u8> for ToDayOfWeek {
     fn to_number(dt: &Zoned) -> u8 {
         dt.weekday().to_monday_one_offset() as u8
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u8> {
+        Some(components.weekday.to_monday_one_offset() as u8)
+    }
 }
 
 impl ToNumber<u8> for DayOfWeek {
     fn to_number(dt: &Zoned) -> u8 {
         dt.weekday().to_sunday_zero_offset() as u8
     }
+
+    fn from_components(components: &DateTimeComponents) -> Option<u8> {
+        Some(components.weekday.to_sunday_zero_offset() as u8)
+    }
 }
 
 impl ToNumber<i64> for ToUnixTimestamp {
     fn to_number(dt: &Zoned) -> i64 {
         dt.with_time_zone(TimeZone::UTC).timestamp().as_second()
+    }
+
+    fn from_components(components: &DateTimeComponents) -> Option<i64> {
+        Some(components.unix_seconds)
     }
 }
 

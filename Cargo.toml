@@ -27,6 +27,7 @@ members = [
     "src/common/tracing",
     "src/common/storage",
     "src/common/vector",
+    "src/common/timezone",
     "src/common/license",
     "src/common/version",
     "src/query/ast",
@@ -175,6 +176,7 @@ databend-common-storages-stage = { path = "src/query/storages/stage" }
 databend-common-storages-stream = { path = "src/query/storages/stream" }
 databend-common-storages-system = { path = "src/query/storages/system" }
 databend-common-telemetry = { path = "src/common/telemetry" }
+databend-common-timezone = { path = "src/common/timezone" }
 databend-common-tracing = { path = "src/common/tracing" }
 databend-common-users = { path = "src/query/users" }
 databend-common-vector = { path = "src/common/vector" }
@@ -352,7 +354,7 @@ jaq-core = "1.5.1"
 jaq-interpret = "1.5.0"
 jaq-parse = "1.0.3"
 jaq-std = "1.6.0"
-jiff = { version = "0.2.10", features = ["serde", "tzdb-bundle-always"] }
+jiff = { version = "0.2.16", features = ["serde", "tzdb-bundle-always"] }
 jsonb = "0.5.5"
 jwt-simple = { version = "0.12.10", default-features = false, features = ["pure-rust"] }
 lenient_semver = "0.4.2"
@@ -423,7 +425,7 @@ petgraph = { version = "0.6.2", features = ["serde-1"] }
 pin-project = "1"
 pin-project-lite = "0.2.9"
 poem = { version = "3.0", features = ["openssl-tls", "multipart", "compression", "cookie"] }
-pprof = { git = "https://github.com/datafuse-extras/pprof-rs", rev = "fe22b23", features = [
+pprof = { git = "https://github.com/datafuse-extras/pprof-rs", rev = "edecd74", features = [
     "flamegraph",
     "protobuf-codec",
     "protobuf",
@@ -471,7 +473,7 @@ serde_derive = "1"
 serde_ignored = "0.1.10"
 serde_json = { version = "1.0.85", default-features = false, features = ["preserve_order", "unbounded_depth"] }
 serde_repr = "0.1.9"
-serde_stacker = { version = "0.1" }
+serde_stacker = "0.1"
 serde_test = "1.0"
 serde_urlencoded = "0.7.1"
 serde_with = { version = "3.8.1" }
@@ -485,11 +487,13 @@ simple_hll = { version = "0.0.4", features = ["serde_borsh"] }
 simsearch = "0.2"
 siphasher = "0.3"
 sled = { version = "0.34", default-features = false }
+smallvec = "1.13.2"
 snailquote = "0.3.1"
 snap = "1"
 socket2 = "0.5.3"
 span-map = { version = "0.2.0" }
 sqlx = { version = "0.8", features = ["mysql", "runtime-tokio"] }
+stacker = "0.1"
 state = "0.6.0"
 state-machine-api = { version = "0.3.4" }
 stream-more = "0.1.3"
@@ -545,6 +549,7 @@ cargo_metadata = "0.19"
 fast-float2 = "0.2.3"
 gix = "0.71.0"
 indent = "0.1.1"
+inventory = "0.3.15"
 logos = "0.12.1"
 nom = "8.0.0"
 nom-rule = "0.5.1"

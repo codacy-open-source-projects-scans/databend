@@ -73,6 +73,16 @@
 //! [sbbf-paper]: https://arxiv.org/pdf/2101.01719
 //! [bf-formulae]: http://tfk.mit.edu/pdf/bloom.pdf
 
+use core::simd::cmp::SimdPartialEq;
+use core::simd::Simd;
+use std::mem::size_of;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use databend_common_base::runtime::Runtime;
+use databend_common_base::runtime::TrySpawn;
+
 /// Salt values as defined in the [spec](https://github.com/apache/parquet-format/blob/master/BloomFilter.md#technical-approach).
 const SALT: [u32; 8] = [
     0x47b6137b_u32,
@@ -90,20 +100,16 @@ const SALT: [u32; 8] = [
 #[derive(Debug, Copy, Clone)]
 #[repr(transparent)]
 struct Block([u32; 8]);
+
+type U32x8 = Simd<u32, 8>;
+
 impl Block {
     const ZERO: Block = Block([0; 8]);
 
     /// takes as its argument a single unsigned 32-bit integer and returns a block in which each
     /// word has exactly one bit set.
     fn mask(x: u32) -> Self {
-        let mut result = [0_u32; 8];
-        for i in 0..8 {
-            // wrapping instead of checking for overflow
-            let y = x.wrapping_mul(SALT[i]);
-            let y = y >> 27;
-            result[i] = 1 << y;
-        }
-        Self(result)
+        Self(Self::mask_simd(x).to_array())
     }
 
     #[inline]
@@ -136,13 +142,17 @@ impl Block {
 
     /// Returns true when every bit that is set in the result of mask is also set in the block.
     fn check(&self, hash: u32) -> bool {
-        let mask = Self::mask(hash);
-        for i in 0..8 {
-            if self[i] & mask[i] == 0 {
-                return false;
-            }
-        }
-        true
+        let mask = Self::mask_simd(hash);
+        let block_vec = U32x8::from_array(self.0);
+        (block_vec & mask).simd_ne(U32x8::splat(0)).all()
+    }
+
+    #[inline(always)]
+    fn mask_simd(x: u32) -> U32x8 {
+        let hash_vec = U32x8::splat(x);
+        let salt_vec = U32x8::from_array(SALT);
+        let bit_index = (hash_vec * salt_vec) >> U32x8::splat(27);
+        U32x8::splat(1) << bit_index
     }
 }
 
@@ -162,6 +172,23 @@ impl std::ops::IndexMut<usize> for Block {
     }
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+struct BlockAtomic([AtomicU32; 8]);
+
+impl BlockAtomic {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| AtomicU32::new(0)))
+    }
+
+    fn insert(&self, hash: u32) {
+        let mask = Block::mask(hash);
+        for (slot, value) in self.0.iter().zip(mask.0.iter()) {
+            slot.fetch_or(*value, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A split block Bloom filter.
 ///
 /// The creation of this structure is based on the [`crate::file::properties::BloomFilterProperties`]
@@ -169,8 +196,16 @@ impl std::ops::IndexMut<usize> for Block {
 #[derive(Debug, Clone)]
 pub struct Sbbf(Vec<Block>);
 
+#[derive(Debug)]
+pub struct SbbfAtomic(Vec<BlockAtomic>);
+
 pub(crate) const BITSET_MIN_LENGTH: usize = 32;
 pub(crate) const BITSET_MAX_LENGTH: usize = 128 * 1024 * 1024;
+
+#[inline]
+fn hash_to_block_index_for_blocks(hash: u64, num_blocks: usize) -> usize {
+    unsafe { (((hash >> 32).unchecked_mul(num_blocks as u64)) >> 32) as usize }
+}
 
 #[inline]
 fn optimal_num_of_bytes(num_bytes: usize) -> usize {
@@ -216,7 +251,7 @@ impl Sbbf {
     fn hash_to_block_index(&self, hash: u64) -> usize {
         // unchecked_mul is unstable, but in reality this is safe, we'd just use saturating mul
         // but it will not saturate
-        (((hash >> 32).saturating_mul(self.0.len() as u64)) >> 32) as usize
+        hash_to_block_index_for_blocks(hash, self.0.len())
     }
 
     /// Insert a hash into the filter. The caller must provide a well-distributed 64-bit hash.
@@ -225,12 +260,31 @@ impl Sbbf {
         self.0[block_index].insert(hash as u32)
     }
 
+    /// Insert a batch of hashes into the filter.
+    pub fn insert_hash_batch(&mut self, hashes: &[u64]) {
+        for &hash in hashes {
+            let block_index = self.hash_to_block_index(hash);
+            self.0[block_index].insert(hash as u32);
+        }
+    }
+
     /// Check if a hash is in the filter. May return
     /// true for values that was never inserted ("false positive")
     /// but will always return false if a hash has not been inserted.
     pub fn check_hash(&self, hash: u64) -> bool {
         let block_index = self.hash_to_block_index(hash);
         self.0[block_index].check(hash as u32)
+    }
+
+    /// Check a batch of hashes. The callback is triggered for each matching hash index.
+    pub fn check_hash_batch<F>(&self, hashes: &[u64], mut on_match: F)
+    where F: FnMut(usize) {
+        for (idx, &hash) in hashes.iter().enumerate() {
+            let block_index = self.hash_to_block_index(hash);
+            if self.0[block_index].check(hash as u32) {
+                on_match(idx);
+            }
+        }
     }
 
     /// Merge another bloom filter into this one (bitwise OR operation)
@@ -252,6 +306,109 @@ impl Sbbf {
     /// Return the total in memory size of this bloom filter in bytes
     pub fn estimated_memory_size(&self) -> usize {
         self.0.capacity() * std::mem::size_of::<Block>()
+    }
+}
+
+impl SbbfAtomic {
+    pub fn new_with_ndv_fpp(ndv: u64, fpp: f64) -> Result<Self, String> {
+        if !(0.0..1.0).contains(&fpp) {
+            return Err(format!(
+                "False positive probability must be between 0.0 and 1.0, got {fpp}"
+            ));
+        }
+        let num_bits = num_of_bits_from_ndv_fpp(ndv, fpp);
+        Ok(Self::new_with_num_of_bytes(num_bits / 8))
+    }
+
+    pub(crate) fn new_with_num_of_bytes(num_bytes: usize) -> Self {
+        let num_bytes = optimal_num_of_bytes(num_bytes);
+        assert_eq!(size_of::<BlockAtomic>(), size_of::<Block>());
+        assert_eq!(num_bytes % size_of::<BlockAtomic>(), 0);
+        let num_blocks = num_bytes / size_of::<BlockAtomic>();
+        let bitset = (0..num_blocks).map(|_| BlockAtomic::new()).collect();
+        Self(bitset)
+    }
+
+    #[inline]
+    fn hash_to_block_index(&self, hash: u64) -> usize {
+        hash_to_block_index_for_blocks(hash, self.0.len())
+    }
+
+    pub fn insert_hash(&self, hash: u64) {
+        let block_index = self.hash_to_block_index(hash);
+        self.0[block_index].insert(hash as u32)
+    }
+
+    pub fn insert_hash_batch(&self, hashes: &[u64]) {
+        for &hash in hashes {
+            self.insert_hash(hash);
+        }
+    }
+
+    pub fn insert_hash_batch_parallel(self, hashes: Vec<u64>, max_threads: usize) -> Self {
+        if hashes.is_empty() || max_threads <= 1 || self.0.len() < 2 {
+            self.insert_hash_batch(&hashes);
+            return self;
+        }
+
+        let worker_nums = max_threads.min(hashes.len()).max(1);
+        let chunk_size = hashes.len().div_ceil(worker_nums).max(1);
+        let runtime = Runtime::with_worker_threads(worker_nums, Some("sbbf-insert".to_string()))
+            .expect("failed to create runtime for inserting bloom filter hashes");
+
+        let hashes = Arc::new(hashes);
+        let builder = Arc::new(self);
+        let total = hashes.len();
+        let mut join_handlers = Vec::with_capacity(total.div_ceil(chunk_size));
+
+        for start in (0..total).step_by(chunk_size) {
+            let end = (start + chunk_size).min(total);
+            let hashes = hashes.clone();
+            let builder = builder.clone();
+
+            let handler = runtime
+                .try_spawn(
+                    async move {
+                        for hash in &hashes[start..end] {
+                            builder.insert_hash(*hash);
+                        }
+                    },
+                    None,
+                )
+                .expect("failed to spawn runtime task for inserting bloom filter hashes");
+            join_handlers.push(handler);
+        }
+
+        runtime
+            .block_on(async move {
+                for handler in join_handlers {
+                    handler.await?;
+                }
+                Ok(())
+            })
+            .expect("runtime bloom filter insert tasks failed");
+
+        Arc::try_unwrap(builder)
+            .expect("unexpected extra references when finishing bloom filter insert")
+    }
+
+    pub fn finish(self) -> Sbbf {
+        let blocks: Vec<Block> = self
+            .0
+            .into_iter()
+            .map(|block| {
+                let mut arr = [0u32; 8];
+                for (dst, src) in arr.iter_mut().zip(block.0.iter()) {
+                    *dst = src.load(Ordering::Relaxed);
+                }
+                Block(arr)
+            })
+            .collect();
+        Sbbf(blocks)
+    }
+
+    pub fn estimated_memory_size(&self) -> usize {
+        self.0.capacity() * size_of::<BlockAtomic>()
     }
 }
 
@@ -286,6 +443,16 @@ mod tests {
     }
 
     #[test]
+    fn test_sbbf_batch_insert_and_check() {
+        let mut sbbf = Sbbf(vec![Block::ZERO; 1_000]);
+        let hashes: Vec<u64> = (0..10_000).collect();
+        sbbf.insert_hash_batch(&hashes);
+        let mut matched = 0;
+        sbbf.check_hash_batch(&hashes, |_| matched += 1);
+        assert_eq!(matched, hashes.len());
+    }
+
+    #[test]
     fn test_sbbf_union() {
         let mut filter1 = Sbbf::new_with_ndv_fpp(100, 0.01).unwrap();
         for i in 0..50 {
@@ -301,6 +468,28 @@ mod tests {
 
         for i in 0..100 {
             assert!(filter1.check_hash(i));
+        }
+    }
+
+    #[test]
+    fn test_sbbf_atomic_parallel_matches_serial() {
+        let hashes: Vec<u64> = (0..100_000)
+            .map(|i| {
+                let val = i as u64;
+                val.wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407)
+            })
+            .collect();
+
+        let mut serial = Sbbf::new_with_ndv_fpp(hashes.len() as u64, 0.01).unwrap();
+        serial.insert_hash_batch(&hashes);
+
+        let builder = SbbfAtomic::new_with_ndv_fpp(hashes.len() as u64, 0.01).unwrap();
+        let builder = builder.insert_hash_batch_parallel(hashes.clone(), 8);
+        let atomic = builder.finish();
+
+        for hash in &hashes {
+            assert_eq!(serial.check_hash(*hash), atomic.check_hash(*hash));
         }
     }
 

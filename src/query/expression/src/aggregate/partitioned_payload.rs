@@ -28,6 +28,28 @@ use crate::ProjectedBlock;
 use crate::StatesLayout;
 use crate::BATCH_SIZE;
 
+#[derive(Debug, Clone, Copy)]
+struct PartitionMask {
+    mask: u64,
+    shift: u64,
+}
+
+impl PartitionMask {
+    fn new(partition_count: u64) -> Self {
+        let radix_bits = partition_count.trailing_zeros() as u64;
+        debug_assert_eq!(1 << radix_bits, partition_count);
+
+        let shift = 48 - radix_bits;
+        let mask = ((1 << radix_bits) - 1) << shift;
+
+        Self { mask, shift }
+    }
+
+    pub fn index(&self, hash: u64) -> usize {
+        ((hash & self.mask) >> self.shift) as _
+    }
+}
+
 pub struct PartitionedPayload {
     pub payloads: Vec<Payload>,
     pub group_types: Vec<DataType>,
@@ -37,9 +59,7 @@ pub struct PartitionedPayload {
 
     pub arenas: Vec<Arc<Bump>>,
 
-    partition_count: u64,
-    mask_v: u64,
-    shift_v: u64,
+    partition_mask: PartitionMask,
 }
 
 unsafe impl Send for PartitionedPayload {}
@@ -52,9 +72,6 @@ impl PartitionedPayload {
         partition_count: u64,
         arenas: Vec<Arc<Bump>>,
     ) -> Self {
-        let radix_bits = partition_count.trailing_zeros() as u64;
-        debug_assert_eq!(1 << radix_bits, partition_count);
-
         let states_layout = if !aggrs.is_empty() {
             Some(get_states_layout(&aggrs).unwrap())
         } else {
@@ -72,7 +89,7 @@ impl PartitionedPayload {
             })
             .collect_vec();
 
-        let offsets = RowLayout {
+        let row_layout = RowLayout {
             states_layout,
             ..payloads[0].row_layout.clone()
         };
@@ -81,12 +98,10 @@ impl PartitionedPayload {
             payloads,
             group_types,
             aggrs,
-            row_layout: offsets,
-            partition_count,
+            row_layout,
 
             arenas,
-            mask_v: mask(radix_bits),
-            shift_v: shift(radix_bits),
+            partition_mask: PartitionMask::new(partition_count),
         }
     }
 
@@ -108,38 +123,35 @@ impl PartitionedPayload {
     ) {
         if self.payloads.len() == 1 {
             self.payloads[0].reserve_append_rows(
-                &state.empty_vector,
+                &state.empty_vector[..new_group_rows],
                 &state.group_hashes,
                 &mut state.addresses,
                 &mut state.page_index,
-                new_group_rows,
                 group_columns,
             );
         } else {
             // generate partition selection indices
             state.reset_partitions(self.partition_count());
-            let select_vector = &state.empty_vector;
+            for &row in &state.empty_vector[..new_group_rows] {
+                let hash = state.group_hashes[row];
+                let partition_idx = self.partition_mask.index(hash);
+                let (count, sel) = &mut state.partition_entries[partition_idx];
 
-            for idx in select_vector.iter().take(new_group_rows).copied() {
-                let hash = state.group_hashes[idx];
-                let partition_idx = ((hash & self.mask_v) >> self.shift_v) as usize;
-                let sel = &mut state.partition_entries[partition_idx];
-
-                sel[state.partition_count[partition_idx]] = idx;
-                state.partition_count[partition_idx] += 1;
+                sel[*count as usize] = row;
+                *count += 1;
             }
 
-            for partition_index in 0..self.payloads.len() {
-                let count = state.partition_count[partition_index];
-                if count > 0 {
-                    let sel = &state.partition_entries[partition_index];
-
-                    self.payloads[partition_index].reserve_append_rows(
-                        sel,
+            for (payload, (count, sel)) in self
+                .payloads
+                .iter_mut()
+                .zip(state.partition_entries.iter_mut())
+            {
+                if *count > 0 {
+                    payload.reserve_append_rows(
+                        &sel[..*count as _],
                         &state.group_hashes,
                         &mut state.addresses,
                         &mut state.page_index,
-                        count,
                         group_columns,
                     );
                 }
@@ -152,19 +164,27 @@ impl PartitionedPayload {
             return self;
         }
 
-        let mut new_partition_payload = PartitionedPayload::new(
-            self.group_types.clone(),
-            self.aggrs.clone(),
-            new_partition_count as u64,
-            self.arenas.clone(),
-        );
+        let PartitionedPayload {
+            payloads,
+            group_types,
+            aggrs,
+            arenas,
+            ..
+        } = self;
 
-        new_partition_payload.combine(self, state);
+        let mut new_partition_payload =
+            PartitionedPayload::new(group_types, aggrs, new_partition_count as u64, arenas);
+
+        state.clear();
+        for payload in payloads.into_iter() {
+            new_partition_payload.combine_single(payload, state, None)
+        }
+
         new_partition_payload
     }
 
     pub fn combine(&mut self, other: PartitionedPayload, state: &mut PayloadFlushState) {
-        if other.partition_count == self.partition_count {
+        if other.partition_count() == self.partition_count() {
             for (l, r) in self.payloads.iter_mut().zip(other.payloads.into_iter()) {
                 l.combine(r);
             }
@@ -180,30 +200,36 @@ impl PartitionedPayload {
     pub fn combine_single(
         &mut self,
         mut other: Payload,
-        state: &mut PayloadFlushState,
+        flush_state: &mut PayloadFlushState,
         only_bucket: Option<usize>,
     ) {
         if other.len() == 0 {
             return;
         }
 
-        if self.partition_count == 1 {
+        if self.partition_count() == 1 {
             self.payloads[0].combine(other);
         } else {
-            state.clear();
+            flush_state.clear();
 
             // flush for other's each page to correct partition
-            while self.gather_flush(&other, state) {
+            while self.gather_flush(&other, flush_state) {
                 // copy rows
-                for partition in (0..self.partition_count as usize)
-                    .filter(|x| only_bucket.is_none() || only_bucket == Some(*x))
-                {
-                    let payload = &mut self.payloads[partition];
-                    let count = state.probe_state.partition_count[partition];
+                let state = &*flush_state.probe_state;
 
-                    if count > 0 {
-                        let sel = &state.probe_state.partition_entries[partition];
-                        payload.copy_rows(sel, count, &state.addresses);
+                match only_bucket {
+                    Some(i) => {
+                        let (count, sel) = &state.partition_entries[i];
+                        self.payloads[i].copy_rows(&sel[..*count as _], &flush_state.addresses);
+                    }
+                    None => {
+                        for ((count, sel), payload) in
+                            state.partition_entries.iter().zip(self.payloads.iter_mut())
+                        {
+                            if *count > 0 {
+                                payload.copy_rows(&sel[..*count as _], &flush_state.addresses);
+                            }
+                        }
                     }
                 }
             }
@@ -212,39 +238,40 @@ impl PartitionedPayload {
     }
 
     // for each page's row, compute which partition it belongs to
-    pub fn gather_flush(&self, other: &Payload, state: &mut PayloadFlushState) -> bool {
-        if state.flush_page >= other.pages.len() {
+    pub fn gather_flush(&self, other: &Payload, flush_state: &mut PayloadFlushState) -> bool {
+        if flush_state.flush_page >= other.pages.len() {
             return false;
         }
 
-        let page = &other.pages[state.flush_page];
+        let page = &other.pages[flush_state.flush_page];
 
         // ToNext
-        if state.flush_page_row >= page.rows {
-            state.flush_page += 1;
-            state.flush_page_row = 0;
-            state.row_count = 0;
-            return self.gather_flush(other, state);
+        if flush_state.flush_page_row >= page.rows {
+            flush_state.flush_page += 1;
+            flush_state.flush_page_row = 0;
+            flush_state.row_count = 0;
+            return self.gather_flush(other, flush_state);
         }
 
-        let end = (state.flush_page_row + BATCH_SIZE).min(page.rows);
-        let rows = end - state.flush_page_row;
-        state.row_count = rows;
+        let end = (flush_state.flush_page_row + BATCH_SIZE).min(page.rows);
+        let rows = end - flush_state.flush_page_row;
+        flush_state.row_count = rows;
 
-        state.probe_state.reset_partitions(self.partition_count());
+        let state = &mut *flush_state.probe_state;
+        state.reset_partitions(self.partition_count());
 
         for idx in 0..rows {
-            state.addresses[idx] = other.data_ptr(page, idx + state.flush_page_row);
+            let row_ptr = other.data_ptr(page, idx + flush_state.flush_page_row);
+            flush_state.addresses[idx] = row_ptr;
 
-            let hash = state.addresses[idx].hash(&self.row_layout);
+            let hash = row_ptr.hash(&self.row_layout);
+            let partition_idx = self.partition_mask.index(hash);
 
-            let partition_idx = ((hash & self.mask_v) >> self.shift_v) as usize;
-
-            let sel = &mut state.probe_state.partition_entries[partition_idx];
-            sel[state.probe_state.partition_count[partition_idx]] = idx;
-            state.probe_state.partition_count[partition_idx] += 1;
+            let (count, sel) = &mut state.partition_entries[partition_idx];
+            sel[*count as usize] = idx.into();
+            *count += 1;
         }
-        state.flush_page_row = end;
+        flush_state.flush_page_row = end;
         true
     }
 
@@ -255,7 +282,7 @@ impl PartitionedPayload {
 
     #[inline]
     pub fn partition_count(&self) -> usize {
-        self.partition_count as usize
+        self.payloads.len()
     }
 
     #[allow(dead_code)]
@@ -267,14 +294,4 @@ impl PartitionedPayload {
     pub fn memory_size(&self) -> usize {
         self.payloads.iter().map(|x| x.memory_size()).sum()
     }
-}
-
-#[inline]
-fn shift(radix_bits: u64) -> u64 {
-    48 - radix_bits
-}
-
-#[inline]
-fn mask(radix_bits: u64) -> u64 {
-    ((1 << radix_bits) - 1) << shift(radix_bits)
 }

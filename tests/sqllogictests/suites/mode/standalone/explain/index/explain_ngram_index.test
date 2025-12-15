@@ -47,7 +47,7 @@ Filter
     ├── scan id: 0
     ├── output columns: [id (#0), content (#1)]
     ├── read rows: 16
-    ├── read size: 1.03 KiB
+    ├── read size: < 1 KiB
     ├── partitions total: 8
     ├── partitions scanned: 8
     ├── pruning stats: [segments: <range pruning: 1 to 1 cost: <slt:ignore>>, blocks: <range pruning: 8 to 8 cost: <slt:ignore>, bloom pruning: 8 to 8 cost: <slt:ignore>>]
@@ -104,7 +104,7 @@ Filter
     ├── scan id: 0
     ├── output columns: [id (#0), content (#1)]
     ├── read rows: 16
-    ├── read size: 1.03 KiB
+    ├── read size: < 1 KiB
     ├── partitions total: 8
     ├── partitions scanned: 8
     ├── pruning stats: [segments: <range pruning: 1 to 1 cost: <slt:ignore>>, blocks: <range pruning: 8 to 8 cost: <slt:ignore>, bloom pruning: 8 to 8 cost: <slt:ignore>>]
@@ -319,8 +319,8 @@ INSERT INTO t3 VALUES
 query II
 select block_size, bloom_filter_size, ngram_index_size from fuse_block('test_ngram_index_db', 't3');
 ----
-225 894 NULL
-256 894 NULL
+209 894 NULL
+240 894 NULL
 
 statement ok
 CREATE NGRAM INDEX idx1 ON t3(content1, content2) gram_size = 5 bloom_size = 1048576
@@ -331,8 +331,8 @@ REFRESH NGRAM INDEX idx1 ON t3
 query III
 select block_size, bloom_filter_size, ngram_index_size from fuse_block('test_ngram_index_db', 't3');
 ----
-225 2098570 2097234
-256 2098570 2097234
+209 2098570 2097234
+240 2098570 2097234
 
 query ITT
 SELECT * FROM t3 WHERE content1 like '%speak%'

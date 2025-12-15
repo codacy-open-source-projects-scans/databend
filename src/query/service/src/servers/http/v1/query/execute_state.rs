@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use databend_common_base::base::ProgressValues;
 use databend_common_base::base::SpillProgress;
 use databend_common_base::runtime::CatchUnwindFuture;
+use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_exception::ResultExt;
@@ -298,7 +299,7 @@ impl Executor {
             Starting(s) => {
                 info!(
                     query_id = guard.query_id, reason:? = reason;
-                    "[HTTP-QUERY] Query state transitioning from Starting to Stopped"
+                    "Query state transitioning from Starting to Stopped"
                 );
 
                 s.ctx.get_abort_notify().notify_waiters();
@@ -309,7 +310,7 @@ impl Executor {
                         Some(e.clone()),
                         false,
                     )
-                    .unwrap_or_else(|e| error!("[HTTP-QUERY] Failed to write query_log: {:?}", e));
+                    .unwrap_or_else(|e| error!("Failed to write query_log: {:?}", e));
                 }
                 if let Err(e) = &reason {
                     if e.code() != ErrorCode::CLOSED_QUERY {
@@ -330,7 +331,7 @@ impl Executor {
             }
             Running(r) => {
                 info!(
-                    "[HTTP-QUERY] Query {} state transitioning from Running to Stopped, reason: {:?}",
+                    "Query {} state transitioning from Running to Stopped, reason: {:?}",
                     &guard.query_id, reason,
                 );
                 if let Err(e) = &reason {
@@ -353,14 +354,14 @@ impl Executor {
             }
             Stopped(s) => {
                 debug!(
-                    "[HTTP-QUERY] Query {} already in Stopped state, original reason: {:?}, new reason: {:?}",
+                    "Query {} already in Stopped state, original reason: {:?}, new reason: {:?}",
                     &guard.query_id, s.reason, reason
                 );
                 return;
             }
         };
         info!(
-            "[HTTP-QUERY] Query {} state changed to Stopped, reason: {:?}",
+            "Query {} state changed to Stopped, reason: {:?}",
             &guard.query_id, reason
         );
         guard.state = Stopped(Box::new(state));
@@ -379,7 +380,7 @@ impl ExecuteState {
     ) -> Result<(), ExecutionError> {
         let make_error = || format!("failed to start query: {sql}");
 
-        info!("[HTTP-QUERY] Preparing to plan SQL query");
+        info!("Preparing to plan SQL query");
 
         // Use interpreter_plan_sql, we can write the query log if an error occurs.
         let (plan, _, queue_guard) = interpreter_plan_sql(ctx.clone(), &sql, true)
@@ -420,7 +421,7 @@ impl ExecuteState {
             result_format_settings,
             has_result_set,
         };
-        info!("[HTTP-QUERY] Query state changed to Running");
+        info!("Query state changed to Running");
         Executor::start_to_running(&executor, Running(running_state));
 
         let executor_clone = executor.clone();
@@ -481,7 +482,7 @@ impl ExecuteState {
                 if is_dynamic_schema {
                     if let Some(schema) = interpreter.get_dynamic_schema().await {
                         info!(
-                            "[HTTP-QUERY] Dynamic schema detected, updating schema to have {} fields",
+                            "Dynamic schema detected, updating schema to have {} fields",
                             schema.fields().len()
                         );
                         Executor::update_schema(&executor, schema);
@@ -530,7 +531,9 @@ impl ExecuteState {
 
         let spiller = if settings.get_enable_result_set_spilling()? {
             let temp_dir_manager = TempDirManager::instance();
-            let disk_bytes_limit = settings.get_result_set_spilling_to_disk_bytes_limit()?;
+            let disk_bytes_limit = GlobalConfig::instance()
+                .spill
+                .result_set_spill_bytes_limit();
             let enable_dio = settings.get_enable_dio()?;
             let disk_spill = temp_dir_manager
                 .get_disk_spill_dir(disk_bytes_limit, &ctx.get_id())

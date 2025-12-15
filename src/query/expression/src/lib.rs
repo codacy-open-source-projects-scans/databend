@@ -43,6 +43,8 @@
 #![feature(debug_closure_helpers)]
 #![feature(never_type)]
 #![feature(slice_as_array)]
+#![feature(new_zeroed_alloc)]
+#![feature(iter_map_windows)]
 
 #[allow(dead_code)]
 mod block;
@@ -54,6 +56,7 @@ mod evaluator;
 mod expression;
 pub mod filter;
 mod function;
+pub mod hash_util;
 mod hilbert;
 mod kernels;
 mod projected_block;

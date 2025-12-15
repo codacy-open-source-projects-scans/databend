@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Logs from this module will show up as "[SINK-COMMIT] ...".
+databend_common_tracing::register_module_tag!("[SINK-COMMIT]");
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +58,7 @@ use opendal::Operator;
 
 use crate::io::TableMetaLocationGenerator;
 use crate::operations::set_backoff;
+use crate::operations::set_compaction_num_block_hint;
 use crate::operations::vacuum::vacuum_table;
 use crate::operations::AppendGenerator;
 use crate::operations::CommitMeta;
@@ -344,7 +348,7 @@ where F: SnapshotGenerator + Send + Sync + 'static
             let respect_flash_back = true;
             vacuum_table(tbl, self.ctx.clone(), vacuum_handler, respect_flash_back).await;
         } else {
-            info!("[SINK-COMMIT] No vacuum handler available for auto vacuuming, please verify your license");
+            info!("No vacuum handler available for auto vacuuming, please verify your license");
         }
 
         Ok(())
@@ -439,6 +443,11 @@ where F: SnapshotGenerator + Send + Sync + 'static
                     table_stats_gen,
                 ) {
                     Ok(snapshot) => {
+                        set_compaction_num_block_hint(
+                            self.ctx.as_ref(),
+                            table_info.name.as_str(),
+                            &snapshot.summary,
+                        );
                         self.state = State::TryCommit {
                             data: snapshot.to_bytes()?,
                             snapshot,
@@ -599,7 +608,7 @@ where F: SnapshotGenerator + Send + Sync + 'static
                         {
                             let elapsed_time = self.start_time.elapsed();
                             let status = format!(
-                                "[SINK-COMMIT] Mutation committed successfully after {} retries in {:?}",
+                                "Mutation committed successfully after {} retries in {:?}",
                                 self.retries, elapsed_time
                             );
                             metrics_inc_commit_milliseconds(elapsed_time.as_millis());
@@ -627,7 +636,7 @@ where F: SnapshotGenerator + Send + Sync + 'static
                             (tbl, stream_descriptions)
                         };
                         info!(
-                            "[SINK-COMMIT] Mutation committed successfully, targets: {:?}",
+                            "Mutation committed successfully, targets: {:?}",
                             target_descriptions
                         );
                         self.state = State::Finish;
@@ -638,7 +647,7 @@ where F: SnapshotGenerator + Send + Sync + 'static
                             Some(d) => {
                                 let name = table_info.name.clone();
                                 debug!(
-                                    "[SINK-COMMIT] TableVersionMismatched error detected, transaction will retry in {} ms. Table: {}, ID: {}",
+                                    "TableVersionMismatched error detected, transaction will retry in {} ms. Table: {}, ID: {}",
                                     d.as_millis(),
                                     name.as_str(),
                                     table_info.ident
