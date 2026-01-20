@@ -23,7 +23,6 @@ use dashmap::DashMap;
 use databend_common_base::base::Progress;
 use databend_common_base::base::ProgressValues;
 use databend_common_base::base::WatchNotify;
-use databend_common_base::base::tokio;
 use databend_common_catalog::catalog::Catalog;
 use databend_common_catalog::cluster_info::Cluster;
 use databend_common_catalog::database::Database;
@@ -627,6 +626,14 @@ impl TableContext for CtxDelegation {
         todo!()
     }
 
+    fn add_cache_key_extra(&self, extra: String) {
+        self.ctx.add_cache_key_extra(extra)
+    }
+
+    fn get_cache_key_extras(&self) -> Vec<String> {
+        self.ctx.get_cache_key_extras()
+    }
+
     fn get_cacheable(&self) -> bool {
         todo!()
     }
@@ -1082,7 +1089,7 @@ impl TableContext for CtxDelegation {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_get_same_table_once() -> Result<()> {
+async fn test_get_same_table_once() -> anyhow::Result<()> {
     let fixture = TestFixture::setup().await?;
     fixture.create_default_database().await?;
 
