@@ -422,6 +422,10 @@ impl Settings {
         Ok(self.try_get_u64("inlist_to_join_threshold")? as usize)
     }
 
+    pub fn get_nested_loop_join_threshold(&self) -> Result<u64> {
+        self.try_get_u64("nested_loop_join_threshold")
+    }
+
     pub fn get_bloom_runtime_filter(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_bloom_runtime_filter")? != 0)
     }
@@ -1149,6 +1153,10 @@ impl Settings {
 
     pub fn get_max_aggregate_spill_level(&self) -> Result<u64> {
         self.try_get_u64("max_aggregate_spill_level")
+    }
+
+    pub fn get_max_hash_join_spill_level(&self) -> Result<u64> {
+        self.try_get_u64("max_hash_join_spill_level")
     }
 
     pub fn get_enable_experimental_table_ref(&self) -> Result<bool> {
