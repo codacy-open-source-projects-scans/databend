@@ -27,9 +27,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub use data_version::DataVersion;
+use databend_common_meta_runtime_api::SpawnApi;
 use databend_common_meta_sled_store::SledTree;
 use databend_common_meta_sled_store::init_get_sled_db;
-use databend_common_meta_stoerr::MetaStorageError;
 pub use header::Header;
 use log::info;
 use raft_log::codeq::error_context_ext::ErrorContextExt;
@@ -93,7 +93,7 @@ impl OnDisk {
 
     /// Initialize data version for local store, returns the loaded version.
     #[fastrace::trace]
-    pub async fn open(config: &RaftConfig) -> Result<OnDisk, MetaStorageError> {
+    pub async fn open(config: &RaftConfig) -> Result<OnDisk, io::Error> {
         info!(config :? =(config); "open and initialize data-version");
 
         Self::ensure_dirs(&config.raft_dir)?;
@@ -241,7 +241,7 @@ impl OnDisk {
 
     /// Upgrade the on-disk data to latest version `DATA_VERSION`.
     #[fastrace::trace]
-    pub async fn upgrade(&mut self) -> Result<(), MetaStorageError> {
+    pub async fn upgrade<SP: SpawnApi>(&mut self) -> Result<(), io::Error> {
         self.progress(format_args!(
             "Upgrade ondisk data if out of date: {}",
             self.header
@@ -272,7 +272,7 @@ impl OnDisk {
                     );
                 }
                 DataVersion::V004 => {
-                    self.clean_in_progress_v003_to_v004().await?;
+                    self.clean_in_progress_v003_to_v004::<SP>().await?;
                 }
             }
 
@@ -304,7 +304,7 @@ impl OnDisk {
                     )
                 }
                 DataVersion::V003 => {
-                    self.upgrade_v003_to_v004().await?;
+                    self.upgrade_v003_to_v004::<SP>().await?;
                 }
                 DataVersion::V004 => {
                     unreachable!("{} is the latest version", self.header.version)
@@ -324,7 +324,7 @@ impl OnDisk {
     ///
     /// When it crashes before upgrading finishes, it can redo the upgrading.
     #[allow(dead_code)]
-    async fn begin_upgrading(&mut self, from_ver: DataVersion) -> Result<(), MetaStorageError> {
+    async fn begin_upgrading(&mut self, from_ver: DataVersion) -> Result<(), io::Error> {
         assert_eq!(from_ver, self.header.version);
 
         let next = self.header.version.next().unwrap();
@@ -352,7 +352,7 @@ impl OnDisk {
     }
 
     /// Reset upgrading flag indicating the upgrading is finished, and set header.version to next version.
-    fn finish_upgrading(&mut self) -> Result<(), MetaStorageError> {
+    fn finish_upgrading(&mut self) -> Result<(), io::Error> {
         self.header.version = self.header.upgrading.unwrap();
         self.header.upgrading = None;
         self.header.cleaning = false;
@@ -362,7 +362,7 @@ impl OnDisk {
         Ok(())
     }
 
-    pub fn write_header(&self, header: &Header) -> Result<(), MetaStorageError> {
+    pub fn write_header(&self, header: &Header) -> Result<(), io::Error> {
         Self::write_header_to_fs(&self.config, header)?;
         Ok(())
     }
