@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+databend_common_tracing::register_module_tag!("[META_CLIENT]", "databend_common_meta_client");
+
 pub(crate) mod local;
 
 use std::ops::Deref;
@@ -21,10 +23,10 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use databend_common_grpc::RpcClientConf;
 use databend_common_meta_client::ClientHandle;
 use databend_common_meta_client::MGetKVReq;
 use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_client::RpcClientConf;
 use databend_common_meta_client::Streamed;
 use databend_common_meta_client::errors::CreationError;
 use databend_common_meta_kvapi::kvapi;

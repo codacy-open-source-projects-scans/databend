@@ -13,18 +13,36 @@
 // limitations under the License.
 
 use std::future::Future;
+use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::thread::JoinHandle as ThreadJoinHandle;
+use std::time::Duration;
 
+use hickory_resolver::TokioResolver;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tonic::transport::Certificate;
+use tonic::transport::ClientTlsConfig;
+use tonic::transport::Endpoint;
 
 use crate::BoxFuture;
+use crate::Channel;
+use crate::ChannelError;
 use crate::ClientMetricsApi;
 use crate::RuntimeApi;
 use crate::SpawnApi;
+use crate::TlsConfig;
 use crate::TrackingData;
+
+/// Global DNS resolver instance for TokioRuntime.
+static DNS_RESOLVER: LazyLock<io::Result<TokioResolver>> =
+    LazyLock::new(|| match TokioResolver::builder_tokio() {
+        Ok(builder) => Ok(builder.build()),
+        Err(e) => Err(io::Error::other(e)),
+    });
 
 /// No-op metrics implementation for lightweight/testing scenarios.
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +119,26 @@ impl std::fmt::Debug for TokioRuntime {
     }
 }
 
+async fn build_tls_config(
+    cfg: Option<&TlsConfig>,
+) -> Result<Option<ClientTlsConfig>, ChannelError> {
+    let Some(cfg) = cfg else { return Ok(None) };
+
+    let pem =
+        tokio::fs::read(&cfg.root_ca_cert_path)
+            .await
+            .map_err(|e| ChannelError::TlsConfig {
+                action: format!("read '{}'", cfg.root_ca_cert_path),
+                message: e.to_string(),
+            })?;
+
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(pem))
+        .domain_name(&cfg.domain_name);
+
+    Ok(Some(tls))
+}
+
 #[expect(clippy::disallowed_methods)]
 impl SpawnApi for TokioRuntime {
     type ClientMetrics = NoopMetrics;
@@ -161,6 +199,70 @@ impl SpawnApi for TokioRuntime {
 
     fn capture_tracking_context() -> Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send> {
         Box::new(|| Box::new(()))
+    }
+
+    /// Channel creation using tonic's built-in endpoint with optional TLS.
+    ///
+    /// Does not use custom DNS resolution - suitable for testing and simple deployments.
+    fn connect(
+        addr: String,
+        timeout: Option<Duration>,
+        tls_config: Option<TlsConfig>,
+    ) -> BoxFuture<'static, Result<Channel, ChannelError>> {
+        Box::pin(async move {
+            let tls = build_tls_config(tls_config.as_ref()).await?;
+            let scheme = if tls.is_some() { "https" } else { "http" };
+
+            let mut endpoint =
+                Endpoint::from_shared(format!("{scheme}://{addr}")).map_err(|e| {
+                    ChannelError::InvalidUri {
+                        uri: addr.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+
+            if let Some(t) = timeout {
+                endpoint = endpoint.connect_timeout(t).timeout(t);
+            }
+            if let Some(tls) = tls {
+                endpoint = endpoint
+                    .tls_config(tls)
+                    .map_err(|e| ChannelError::TlsConfig {
+                        action: "apply".to_string(),
+                        message: e.to_string(),
+                    })?;
+            }
+
+            endpoint
+                .connect()
+                .await
+                .map_err(|e| ChannelError::CannotConnect {
+                    uri: addr,
+                    message: e.to_string(),
+                })
+        })
+    }
+
+    fn resolve(hostname: &str) -> BoxFuture<'static, io::Result<Vec<IpAddr>>> {
+        let hostname = hostname.to_string();
+        Box::pin(async move {
+            let resolver = DNS_RESOLVER
+                .as_ref()
+                .map_err(|e: &io::Error| io::Error::other(e.to_string()))?;
+            let lookup = resolver
+                .lookup_ip(&hostname)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(lookup.into_iter().collect())
+        })
+    }
+
+    fn init_test_logging() -> Box<dyn std::any::Any + Send> {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+        Box::new(())
     }
 }
 
