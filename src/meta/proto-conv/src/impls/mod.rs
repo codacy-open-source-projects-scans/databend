@@ -12,16 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::unnecessary_unwrap, clippy::uninlined_format_args)]
-
-pub mod admin;
-pub mod args;
-pub mod dump_raft_log_wal;
-pub mod export_from_disk;
-pub mod export_from_grpc;
-pub mod import;
-mod import_v004;
-pub mod keys_layout_from_grpc;
-pub mod lua_support;
-pub(crate) mod reading;
-mod upgrade;
+mod catalog;
+mod client_session;
+mod config;
+mod connection;
+mod data_mask;
+mod database;
+mod datetime;
+mod dictionary;
+mod file_format;
+mod id;
+mod index;
+mod least_visible_time;
+mod lock;
+mod mask_policy_table_id;
+mod owner;
+mod ownership;
+mod procedure;
+mod role;
+mod row_access_policy;
+mod row_access_policy_table_id;
+mod schema;
+mod sequence;
+mod stage;
+mod table;
+mod tag;
+mod task;
+mod tenant_quota;
+mod tident;
+mod token;
+mod udf;
+mod user;
+mod vacuum_watermark;
