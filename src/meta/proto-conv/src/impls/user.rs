@@ -345,6 +345,9 @@ impl FromToProto for mt::principal::UserGrantSet {
             // If we add new GrantObject in new version
             // Rollback to old version, GrantEntry.object will be None
             // GrantEntry::from_pb will return err so user can not login in old version.
+            // Silently dropping unrecognized grant entries and logging the error is
+            // intentional: the node must still start and serve other users even when
+            // some grant entries are unrecognizable (e.g. during a version rollback).
             match mt::principal::GrantEntry::from_pb(entry) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => log::error!("GrantEntry::from_pb with error : {e}"),
@@ -363,10 +366,11 @@ impl FromToProto for mt::principal::UserGrantSet {
             entries.push(entry.to_pb()?);
         }
 
-        let mut roles = BTreeMap::new();
-        for role in self.roles().iter() {
-            roles.insert(role.clone(), true);
-        }
+        let roles = self
+            .roles()
+            .iter()
+            .map(|role| (role.clone(), true))
+            .collect::<BTreeMap<_, _>>();
 
         Ok(pb::UserGrantSet {
             ver: VER,
