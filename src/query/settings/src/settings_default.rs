@@ -181,6 +181,13 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(1..=1024)),
                 }),
+                ("system_tables_count_db_concurrency", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(16),
+                    desc: "Sets the DB-level concurrency used by system.tables count optimization.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=256)),
+                }),
                 ("max_vacuum_threads", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
                     desc: "Sets the maximum number of threads to execute vacuum operation.",
@@ -1169,7 +1176,7 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
-                // this setting will be removed when geometry type stable.
+                // This setting has been deprecated, retained to prevent set errors.
                 ("enable_geo_create_table", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
                     desc: "Create and alter table with geometry/geography type",
@@ -1257,6 +1264,13 @@ impl DefaultSettings {
                 ("enable_fixed_rows_sort", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
                     desc: "Enable fixed rows sort serialize",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("enable_sort_spill_prefetch", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Enable asynchronous restore prefetch for spilled sort blocks",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
