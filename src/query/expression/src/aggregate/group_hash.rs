@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
+
 use databend_common_base::base::OrderedFloat;
 use databend_common_column::bitmap::Bitmap;
 use databend_common_column::buffer::Buffer;
@@ -40,23 +44,28 @@ const NULL_HASH_VAL: u64 = 0xd1cefa08eb382d69;
 pub fn group_hash_entries(entries: ProjectedBlock, values: &mut [u64]) {
     debug_assert!(!entries.is_empty());
     for (i, entry) in entries.iter().enumerate() {
-        debug_assert_eq!(entry.len(), values.len());
-        match entry {
-            BlockEntry::Const(scalar, data_type, _) => {
-                if i == 0 {
-                    combine_group_hash_const::<true>(scalar, data_type, values);
-                } else {
-                    combine_group_hash_const::<false>(scalar, data_type, values);
-                }
-            }
-            BlockEntry::Column(column) => {
-                if i == 0 {
-                    combine_group_hash_column::<true>(column, values);
-                } else {
-                    combine_group_hash_column::<false>(column, values);
-                }
-            }
+        group_hash_entry(entry, values, i == 0);
+    }
+}
+
+/// Hash one group key into `values`.
+///
+/// The first key initializes the hashes; subsequent keys are merged into them.
+pub fn group_hash_entry(entry: &BlockEntry, values: &mut [u64], is_first: bool) {
+    debug_assert_eq!(entry.len(), values.len());
+    if is_first {
+        combine_group_hash_entry::<true>(entry, values);
+    } else {
+        combine_group_hash_entry::<false>(entry, values);
+    }
+}
+
+fn combine_group_hash_entry<const IS_FIRST: bool>(entry: &BlockEntry, values: &mut [u64]) {
+    match entry {
+        BlockEntry::Const(scalar, data_type, _) => {
+            combine_group_hash_const::<IS_FIRST>(scalar, data_type, values);
         }
+        BlockEntry::Column(column) => combine_group_hash_column::<IS_FIRST>(column, values),
     }
 }
 
@@ -72,7 +81,9 @@ fn combine_group_hash_const<const IS_FIRST: bool>(
     values: &mut [u64],
 ) {
     match data_type {
-        DataType::Null | DataType::EmptyArray | DataType::EmptyMap => {}
+        DataType::Null | DataType::EmptyArray | DataType::EmptyMap => {
+            apply_const_hash::<IS_FIRST>(values, NULL_HASH_VAL);
+        }
         DataType::Nullable(inner) => {
             if scalar.is_null() {
                 apply_const_hash::<IS_FIRST>(values, NULL_HASH_VAL);
@@ -254,7 +265,9 @@ impl<const IS_FIRST: bool> ValueVisitor for HashVisitor<'_, IS_FIRST> {
 
     fn visit_column(&mut self, column: Column) -> Result<()> {
         match column {
-            Column::Null { .. } | Column::EmptyArray { .. } | Column::EmptyMap { .. } => (),
+            Column::Null { .. } | Column::EmptyArray { .. } | Column::EmptyMap { .. } => {
+                apply_const_hash::<IS_FIRST>(self.values, NULL_HASH_VAL);
+            }
             _ => {
                 Self::default_visit_column(column, self)?;
             }
@@ -332,8 +345,7 @@ where I: Index
 {
     fn visit_scalar(&mut self, scalar: Scalar) -> Result<()> {
         let hash = match scalar {
-            Scalar::EmptyArray | Scalar::EmptyMap => return Ok(()),
-            Scalar::Null => NULL_HASH_VAL,
+            Scalar::Null | Scalar::EmptyArray | Scalar::EmptyMap => NULL_HASH_VAL,
             Scalar::Number(v) => with_number_type!(|NUM_TYPE| match v {
                 NumberScalar::NUM_TYPE(v) => v.agg_hash(),
             }),
@@ -357,15 +369,15 @@ where I: Index
     }
 
     fn visit_null(&mut self, _len: usize) -> Result<()> {
-        Ok(())
+        self.visit_indices(|_| NULL_HASH_VAL)
     }
 
     fn visit_empty_array(&mut self, _len: usize) -> Result<()> {
-        Ok(())
+        self.visit_indices(|_| NULL_HASH_VAL)
     }
 
     fn visit_empty_map(&mut self, _len: usize) -> Result<()> {
-        Ok(())
+        self.visit_indices(|_| NULL_HASH_VAL)
     }
 
     fn visit_any_number(&mut self, column: crate::types::NumberColumn) -> Result<()> {
@@ -596,25 +608,20 @@ impl AggHash for i256 {
     }
 }
 
+// Float keys hash the bits of the canonical class representative so that
+// `-0.0`/`+0.0` and every NaN payload share one hash. See
+// `OrderedFloat::canonicalize`.
 impl AggHash for OrderedFloat<f32> {
     #[inline(always)]
     fn agg_hash(&self) -> u64 {
-        if self.is_nan() {
-            f32::NAN.to_bits().agg_hash()
-        } else {
-            self.to_bits().agg_hash()
-        }
+        self.canonicalize().to_bits().agg_hash()
     }
 }
 
 impl AggHash for OrderedFloat<f64> {
     #[inline(always)]
     fn agg_hash(&self) -> u64 {
-        if self.is_nan() {
-            f64::NAN.to_bits().agg_hash()
-        } else {
-            self.to_bits().agg_hash()
-        }
+        self.canonicalize().to_bits().agg_hash()
     }
 }
 
@@ -627,7 +634,9 @@ impl AggHash for OpaqueScalarRef<'_> {
 impl AggHash for ScalarRef<'_> {
     #[inline(always)]
     fn agg_hash(&self) -> u64 {
-        self.to_string().as_bytes().agg_hash()
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -684,6 +693,76 @@ mod tests {
             );
             assert_eq!(const_hashes, col_hashes);
         }
+    }
+
+    #[test]
+    fn test_singleton_group_hash_ignores_previous_hashes() {
+        let num_rows = 3;
+        let block = sample_block(num_rows);
+        let full_block = block.convert_to_full();
+
+        // Null, EmptyArray and EmptyMap have only one possible value. Each must
+        // initialize the first key even when the hash buffer is reused.
+        for singleton in 0..3 {
+            for projection in [vec![singleton], vec![singleton, 6], vec![6, singleton]] {
+                let mut expected = vec![0; num_rows];
+                group_hash_entries(ProjectedBlock::project(&projection, &block), &mut expected);
+
+                for input in [&block, &full_block] {
+                    let entries = ProjectedBlock::project(&projection, input);
+                    let mut hashes = vec![u64::MAX; num_rows];
+                    group_hash_entries(entries, &mut hashes);
+                    assert_eq!(hashes, expected, "projection: {projection:?}");
+                    group_hash_entries(entries, &mut hashes);
+                    assert_eq!(hashes, expected, "reused buffer: {projection:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_singleton_group_hash_value_spread_matches_entries() -> Result<()> {
+        let num_rows = 3;
+        let block = sample_block(num_rows);
+        let full_block = block.convert_to_full();
+        let indices = [0_u32, 2];
+
+        for singleton in 0..3 {
+            for projection in [vec![singleton], vec![singleton, 6], vec![6, singleton]] {
+                let mut expected = vec![0; num_rows];
+                group_hash_entries(ProjectedBlock::project(&projection, &block), &mut expected);
+
+                for input in [&block, &full_block] {
+                    let mut hashes = vec![u64::MAX; num_rows];
+                    for (i, entry) in ProjectedBlock::project(&projection, input)
+                        .iter()
+                        .enumerate()
+                    {
+                        group_hash_value_spread(&indices, entry.value(), i == 0, &mut hashes)?;
+                    }
+                    assert_eq!(hashes[0], expected[0], "projection: {projection:?}");
+                    assert_eq!(hashes[1], u64::MAX, "unselected row must be unchanged");
+                    assert_eq!(hashes[2], expected[2], "projection: {projection:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_group_hash_equals_projected_block() {
+        let block = sample_block(5).convert_to_full();
+        let projection = (0..block.num_columns()).collect::<Vec<_>>();
+        let entries = ProjectedBlock::project(&projection, &block);
+        let mut projected_hashes = vec![0; block.num_rows()];
+        let mut incremental_hashes = vec![0; block.num_rows()];
+
+        group_hash_entries(entries, &mut projected_hashes);
+        for (index, entry) in entries.iter().enumerate() {
+            group_hash_entry(entry, &mut incremental_hashes, index == 0);
+        }
+
+        assert_eq!(projected_hashes, incremental_hashes);
     }
 
     fn sample_block(num_rows: usize) -> DataBlock {

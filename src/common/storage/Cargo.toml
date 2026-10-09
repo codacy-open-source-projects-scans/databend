@@ -17,7 +17,6 @@ databend-common-exception = { workspace = true }
 databend-common-expression = { workspace = true }
 databend-common-meta-app = { workspace = true }
 databend-common-metrics = { workspace = true }
-databend-common-native = { workspace = true }
 databend-enterprise-storage-encryption = { workspace = true }
 
 ahash = { workspace = true }
@@ -29,6 +28,7 @@ borsh = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
 iceberg = { workspace = true }
 log = { workspace = true }
@@ -36,15 +36,18 @@ lru = { workspace = true }
 opendal = { workspace = true }
 parquet = { workspace = true }
 prometheus-client = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 simple_hll = { workspace = true, features = ["serde_borsh"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["gzip"] }
 
 [lints]
 workspace = true

@@ -19,20 +19,46 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use databend_common_catalog::lock::LockTableOption;
+use databend_common_pipeline::core::ExecutionInfo;
 use databend_common_pipeline::core::Pipeline;
+use databend_common_pipeline::core::SharedLockGuard;
+use databend_common_pipeline::core::always_callback;
 use databend_common_sql::executor::physical_plans::MutationKind;
-use log::info;
 use log::warn;
 
 use crate::interpreters::hook::analyze_hook::AnalyzeDesc;
 use crate::interpreters::hook::analyze_hook::hook_analyze;
 use crate::interpreters::hook::compact_hook::CompactHookTraceCtx;
 use crate::interpreters::hook::compact_hook::CompactTargetTableDescription;
+use crate::interpreters::hook::compact_hook::compact_after_write_enabled;
 use crate::interpreters::hook::compact_hook::hook_compact;
 use crate::interpreters::hook::refresh_hook::RefreshDesc;
 use crate::interpreters::hook::refresh_hook::hook_refresh;
+use crate::interpreters::hook::table_hook_scheduler::TableHookScheduler;
+use crate::interpreters::hook::table_hook_scheduler::TableHookTask;
+use crate::interpreters::hook::table_hook_scheduler::TableHookTaskSettings;
 use crate::sessions::QueryContext;
-use crate::sessions::TableContextSettings;
+use crate::sessions::TableContextTableAccess;
+
+/// Register the release point of a handed-over table lock on the finished-callback chain.
+///
+/// The release is a normal callback so it runs in chain order: callbacks registered before it
+/// still run under the lock, callbacks registered after it run without the lock. An always
+/// callback is added as a safety net in case an earlier callback failed and interrupted the
+/// normal chain. Both are no-ops once the guard has been taken.
+pub(crate) fn register_lock_release(pipeline: &mut Pipeline, lock_guard: &SharedLockGuard) {
+    let guard = lock_guard.clone();
+    pipeline.set_on_finished(move |_info: &ExecutionInfo| {
+        drop(guard.try_take());
+        Ok(())
+    });
+
+    let guard = lock_guard.clone();
+    pipeline.set_on_finished(always_callback(move |_info: &ExecutionInfo| {
+        drop(guard.try_take());
+        Ok(())
+    }));
+}
 
 /// Hook operator.
 pub struct HookOperator {
@@ -42,6 +68,12 @@ pub struct HookOperator {
     table: String,
     mutation_kind: MutationKind,
     lock_opt: LockTableOption,
+    /// The table lock acquired by the main operation, if any.
+    ///
+    /// The main pipeline and the compact/refresh hooks run under this lock. It is released
+    /// before the analyze hook, which only reads snapshots and commits statistics through a
+    /// sequence CAS, so it must not extend the lock hold time.
+    lock_guard: Option<SharedLockGuard>,
 }
 
 impl HookOperator {
@@ -60,7 +92,19 @@ impl HookOperator {
             table,
             mutation_kind,
             lock_opt,
+            lock_guard: None,
         }
+    }
+
+    /// Hand the main operation's table lock over to the hook chain.
+    ///
+    /// The caller must not also register the guard on the pipeline; the hook chain owns its
+    /// release point. Callers that hand over a lock should pass `LockTableOption::NoLock` as
+    /// `lock_opt`, otherwise the compact hook would queue a second lock revision behind the
+    /// one it already holds.
+    pub fn with_lock_guard(mut self, lock_guard: Option<SharedLockGuard>) -> Self {
+        self.lock_guard = lock_guard;
+        self
     }
 
     /// Execute the hook operator.
@@ -71,37 +115,93 @@ impl HookOperator {
     #[fastrace::trace]
     #[async_backtrace::framed]
     pub async fn execute(&self, pipeline: &mut Pipeline) {
+        if TableHookScheduler::is_async_enabled() {
+            self.execute_async(pipeline).await;
+            return;
+        }
+
         self.execute_compact(pipeline).await;
         self.execute_refresh(pipeline).await;
+        // Compaction and reclustering mutate the table and rely on the main operation's lock.
+        // Analyze only reads snapshots and commits statistics with a sequence CAS, so the lock
+        // is released here to keep other maintenance jobs from waiting on it.
+        self.release_lock_guard(pipeline);
         self.execute_analyze(pipeline).await;
+    }
+
+    fn release_lock_guard(&self, pipeline: &mut Pipeline) {
+        if let Some(lock_guard) = &self.lock_guard {
+            register_lock_release(pipeline, lock_guard);
+        }
+    }
+
+    #[fastrace::trace]
+    #[async_backtrace::framed]
+    pub async fn execute_async(&self, pipeline: &mut Pipeline) {
+        // Async hooks acquire their own lock with retry, so the main operation's lock is
+        // released as soon as the main pipeline finishes.
+        self.release_lock_guard(pipeline);
+        if pipeline.is_empty() {
+            return;
+        }
+
+        let table_id = match self
+            .ctx
+            .get_table(&self.catalog, &self.database, &self.table)
+            .await
+        {
+            Ok(table) => table.get_id(),
+            Err(e) => {
+                warn!(
+                    "Failed to resolve table id for async table hook {}.{}.{}: {}",
+                    self.catalog, self.database, self.table, e
+                );
+                return;
+            }
+        };
+
+        let task = TableHookTask {
+            ctx: self.ctx.clone(),
+            table_id,
+            compact_target: CompactTargetTableDescription {
+                catalog: self.catalog.clone(),
+                database: self.database.clone(),
+                table: self.table.clone(),
+                table_id: Some(table_id),
+            },
+            hook_settings: TableHookTaskSettings::create(&self.ctx),
+            // The async hook may start from on_finished before the parent lock guard
+            // has been released, so it must acquire its own lock with retry.
+            lock_opt: LockTableOption::LockWithRetry,
+            operation_name: self.mutation_kind.to_string(),
+            main_operation_start: Instant::now(),
+        };
+
+        pipeline.set_on_finished(move |info: &ExecutionInfo| {
+            if info.res.is_ok() {
+                match TableHookScheduler::try_instance() {
+                    Some(scheduler) => scheduler.enqueue(task),
+                    None => warn!("Async table hook scheduler is not initialized"),
+                }
+            }
+
+            Ok(())
+        });
     }
 
     /// Execute the compact hook operator.
     #[fastrace::trace]
     #[async_backtrace::framed]
     pub async fn execute_compact(&self, pipeline: &mut Pipeline) {
-        match self.ctx.get_settings().get_enable_compact_after_write() {
-            Ok(false) => {
-                info!("Auto compaction is disabled");
-                return;
-            }
-            Err(e) => {
-                // swallow the exception, compaction hook should not prevent the main operation.
-                warn!(
-                    "Failed to retrieve compaction settings, continuing without compaction: {}",
-                    e
-                );
-                return;
-            }
-            Ok(true) => {
-                // auto compaction is enabled, proceed with the compaction process.
-            }
+        if !compact_after_write_enabled(&self.ctx) {
+            return;
         }
 
         let compact_target = CompactTargetTableDescription {
             catalog: self.catalog.to_owned(),
             database: self.database.to_owned(),
             table: self.table.to_owned(),
+            table_id: None,
         };
 
         let trace_ctx = CompactHookTraceCtx {
@@ -119,9 +219,7 @@ impl HookOperator {
         .await;
     }
 
-    /// Execute the refresh hook operator.
-    // 1. Refresh aggregating index.
-    // 2. Refresh virtual columns.
+    /// Execute the table-index refresh hook operator.
     #[fastrace::trace]
     #[async_backtrace::framed]
     pub async fn execute_refresh(&self, pipeline: &mut Pipeline) {
@@ -129,6 +227,7 @@ impl HookOperator {
             catalog: self.catalog.to_owned(),
             database: self.database.to_owned(),
             table: self.table.to_owned(),
+            table_id: None,
         };
 
         hook_refresh(self.ctx.clone(), pipeline, refresh_desc).await;
@@ -142,8 +241,111 @@ impl HookOperator {
             catalog: self.catalog.to_owned(),
             database: self.database.to_owned(),
             table: self.table.to_owned(),
+            table_id: None,
         };
 
         hook_analyze(self.ctx.clone(), pipeline, desc).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use databend_common_exception::ErrorCode;
+    use databend_common_exception::Result;
+    use databend_common_pipeline::core::LockGuard;
+    use databend_common_pipeline::core::UnlockApi;
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MockUnlock {
+        unlocked: AtomicBool,
+    }
+
+    impl MockUnlock {
+        fn unlocked(&self) -> bool {
+            self.unlocked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl UnlockApi for MockUnlock {
+        fn unlock(&self, _revision: u64) {
+            self.unlocked.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct LockedPipeline {
+        pipeline: Pipeline,
+        guard: SharedLockGuard,
+        unlock: Arc<MockUnlock>,
+        /// Lock state seen by each observing callback, in execution order. Callback panics
+        /// are caught by the finished chain, so the states are asserted after it ran.
+        observed: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl LockedPipeline {
+        fn create() -> Self {
+            let unlock = Arc::new(MockUnlock::default());
+            let guard = SharedLockGuard::new(Arc::new(LockGuard::new(unlock.clone(), 1)));
+            LockedPipeline {
+                pipeline: Pipeline::create(),
+                guard,
+                unlock,
+                observed: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn observe_lock(&mut self) {
+            let unlock = self.unlock.clone();
+            let observed = self.observed.clone();
+            self.pipeline.set_on_finished(move |_info: &ExecutionInfo| {
+                observed.lock().push(unlock.unlocked());
+                Ok(())
+            });
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            self.pipeline
+                .take_on_finished()
+                .apply(ExecutionInfo::create(Ok(()), HashMap::new()))
+        }
+    }
+
+    #[test]
+    fn test_lock_released_between_callbacks_in_order() -> Result<()> {
+        let mut locked = LockedPipeline::create();
+        // Compact and refresh hooks register before the release and run under the lock.
+        locked.observe_lock();
+        register_lock_release(&mut locked.pipeline, &locked.guard);
+        // The analyze hook registers after the release and runs without the lock.
+        locked.observe_lock();
+
+        locked.finish()?;
+        assert_eq!(*locked.observed.lock(), vec![false, true]);
+        assert!(locked.unlock.unlocked());
+        assert!(locked.guard.try_take().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_lock_released_after_earlier_callback_fails() {
+        let mut locked = LockedPipeline::create();
+        locked
+            .pipeline
+            .set_on_finished(|_info: &ExecutionInfo| Err(ErrorCode::Internal("hook failed")));
+        register_lock_release(&mut locked.pipeline, &locked.guard);
+        locked.observe_lock();
+
+        assert!(locked.finish().is_err());
+        // The failure interrupts the normal chain, so neither the normal release nor the
+        // later callback runs; the always callback still releases the lock.
+        assert!(locked.observed.lock().is_empty());
+        assert!(locked.unlock.unlocked());
+        assert!(locked.guard.try_take().is_none());
     }
 }

@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use databend_common_exception::Result;
 use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::OwnershipObject;
 use databend_common_meta_app::principal::RoleInfo;
 use databend_common_meta_app::principal::UserInfo;
 use databend_common_meta_app::principal::UserPrivilegeType;
@@ -37,11 +40,23 @@ pub trait TableContextAuthorization: Send + Sync {
         check_current_role_only: bool,
     ) -> Result<()>;
 
+    async fn has_ownership(
+        &self,
+        _object: &OwnershipObject,
+        _check_current_role_only: bool,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn get_all_available_roles(&self) -> Result<Vec<RoleInfo>>;
 
     async fn get_visibility_checker(
         &self,
         ignore_ownership: bool,
         object: Object,
-    ) -> Result<GrantObjectVisibilityChecker>;
+    ) -> Result<Arc<GrantObjectVisibilityChecker>>;
+
+    /// Returns a grant-only visibility checker (no ownership loaded).
+    /// Callers handle ownership lazily via the public helper.
+    async fn get_db_table_grant_checker(&self) -> Result<GrantObjectVisibilityChecker>;
 }

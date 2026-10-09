@@ -63,7 +63,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 }
 
 fn is_string_like(dt: &DataType) -> bool {
-    matches!(dt, DataType::String | DataType::Nullable(box DataType::String))
+    matches!(
+        dt,
+        DataType::String | DataType::Nullable(deref!(DataType::String))
+    )
 }
 
 pub fn regexp_split_to_vec(
@@ -209,7 +212,9 @@ fn build_regexp_split_to_table(
                         arg2_type.clone(),
                         arg3_type.unwrap().clone(),
                     ],
-                    return_type: DataType::Tuple(vec![DataType::String]),
+                    return_type: DataType::Tuple(vec![DataType::Nullable(Box::new(
+                        DataType::String,
+                    ))]),
                 },
                 eval: FunctionEval::SRF {
                     eval: Box::new(|args, ctx, max_nums_per_row| {
@@ -244,7 +249,7 @@ fn build_regexp_split_to_table(
             signature: FunctionSignature {
                 name: "regexp_split_to_table".to_string(),
                 args_type: vec![arg_type.clone(), arg2_type.clone()],
-                return_type: DataType::Tuple(vec![DataType::String]),
+                return_type: DataType::Tuple(vec![DataType::Nullable(Box::new(DataType::String))]),
             },
             eval: FunctionEval::SRF {
                 eval: Box::new(|args, ctx, max_nums_per_row| {

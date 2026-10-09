@@ -33,6 +33,7 @@ use databend_common_sql::optimizer::ir::SExpr;
 use databend_common_sql::plans::Aggregate;
 use databend_common_sql::plans::AggregateMode;
 use databend_common_sql::plans::ConstantTableScan;
+use databend_common_sql::plans::GroupingSets;
 use databend_common_sql::plans::ScalarItem;
 use itertools::Itertools;
 
@@ -150,11 +151,6 @@ impl IPhysicalPlan for AggregateFinal {
         let max_block_rows = builder.settings.get_max_block_size()? as usize;
         let max_block_bytes = builder.settings.get_max_block_bytes()? as usize;
 
-        let max_spill_io_requests = builder.settings.get_max_spill_io_requests()?;
-        let max_restore_worker = builder.settings.get_max_aggregate_restore_worker()?;
-        let enable_experiment_aggregate = builder.settings.get_enable_experiment_aggregate()?;
-        let enable_experiment_hash_index = builder.settings.get_enable_experiment_hash_index()?;
-
         let mut is_cluster_aggregate = false;
         if ExchangeSource::check_physical_plan(&self.input) {
             is_cluster_aggregate = true;
@@ -165,9 +161,6 @@ impl IPhysicalPlan for AggregateFinal {
             &self.group_by,
             &self.agg_funcs,
             is_cluster_aggregate,
-            max_spill_io_requests as usize,
-            enable_experiment_aggregate,
-            enable_experiment_hash_index,
             max_block_rows,
             max_block_bytes,
         )?;
@@ -188,19 +181,11 @@ impl IPhysicalPlan for AggregateFinal {
         let old_inject = builder.exchange_injector.clone();
 
         if ExchangeSource::check_physical_plan(&self.input) {
-            builder.exchange_injector = if params.enable_experiment_aggregate {
-                AggregateInjector::<true>::create(
-                    builder.ctx.clone(),
-                    params.clone(),
-                    self.shuffle_mode.clone(),
-                )
-            } else {
-                AggregateInjector::<false>::create(
-                    builder.ctx.clone(),
-                    params.clone(),
-                    self.shuffle_mode.clone(),
-                )
-            };
+            builder.exchange_injector = AggregateInjector::create(
+                builder.ctx.clone(),
+                params.clone(),
+                self.shuffle_mode.clone(),
+            );
         }
 
         self.input.build_pipeline(builder)?;
@@ -216,7 +201,6 @@ impl IPhysicalPlan for AggregateFinal {
         build_partition_bucket(
             &mut builder.main_pipeline,
             params.clone(),
-            max_restore_worker,
             after_group_parallel,
             builder.ctx.clone(),
             self.shuffle_mode.clone(),
@@ -236,7 +220,7 @@ impl PhysicalPlanBuilder {
         let mut used = vec![];
         for item in &agg.aggregate_functions {
             if required.contains(&item.index) {
-                required.extend(item.scalar.used_columns());
+                item.scalar.collect_used_columns(&mut required);
                 used.push(item.clone());
             }
         }
@@ -291,19 +275,17 @@ impl PhysicalPlanBuilder {
                 let shuffle_mode = determine_shuffle_mode(self.ctx.clone(), is_cluster_aggregate)?;
 
                 if let Some(grouping_sets) = agg.grouping_sets.as_ref() {
-                    // ignore `_grouping_id`.
-                    // If the aggregation function argument if a group item,
-                    // we cannot use the group item directly.
-                    // It's because the group item will be wrapped with nullable and fill dummy NULLs (in `AggregateExpand` plan),
-                    // which will cause panic while executing aggregation function.
-                    // To avoid the panic, we will duplicate (`Arc::clone`) original group item columns in `AggregateExpand`,
-                    // we should use these columns instead.
+                    // AggregateExpand makes grouping columns nullable and fills in dummy
+                    // NULLs for rolled-up sets. Aggregate arguments and ORDER BY keys must
+                    // use its preserved copies instead, or aggregation can panic or sort
+                    // by the dummy NULLs rather than the original values.
                     for func in agg_funcs.iter_mut() {
                         for arg in func.arg_indices.iter_mut() {
                             if let Some(pos) = group_items.iter().position(|g| g == arg) {
                                 *arg = grouping_sets.dup_group_items[pos].0;
                             }
                         }
+                        remap_grouping_set_order_by(&mut func.sig, &group_items, grouping_sets);
                     }
                 }
 
@@ -434,7 +416,8 @@ impl PhysicalPlanBuilder {
                     build_aggregate_function(&agg.aggregate_functions, &input_schema)?;
 
                 if let Some(grouping_sets) = agg.grouping_sets.as_ref() {
-                    // The argument types are wrapped nullable due to `AggregateExpand` plan. We should recover them to original types.
+                    // Recover aggregate arguments and ORDER BY keys to the original,
+                    // unmasked columns and types from before `AggregateExpand`.
                     for func in agg_funcs.iter_mut() {
                         for (arg, ty) in func.arg_indices.iter_mut().zip(func.sig.args.iter_mut()) {
                             if let Some(pos) = group_items.iter().position(|g| g == arg) {
@@ -442,6 +425,7 @@ impl PhysicalPlanBuilder {
                                 *ty = grouping_sets.dup_group_items[pos].1.clone();
                             }
                         }
+                        remap_grouping_set_order_by(&mut func.sig, &group_items, grouping_sets);
                     }
                 }
 
@@ -552,6 +536,21 @@ fn determine_shuffle_mode(
     Ok(shuffle_mode)
 }
 
+// Use the original grouping columns and types, not AggregateExpand's masked keys.
+fn remap_grouping_set_order_by(
+    signature: &mut AggregateFunctionSignature,
+    group_items: &[Symbol],
+    grouping_sets: &GroupingSets,
+) {
+    for item in &mut signature.order_by {
+        if let Some(pos) = group_items.iter().position(|g| *g == item.index) {
+            let (index, data_type) = &grouping_sets.dup_group_items[pos];
+            item.index = *index;
+            item.data_type = data_type.clone();
+        }
+    }
+}
+
 fn build_aggregate_function(
     agg_functions: &[ScalarItem],
     input_schema: &DataSchemaRef,
@@ -573,20 +572,6 @@ fn build_aggregate_function(
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let sort_desc_indices = agg
-                    .sort_descs
-                    .iter()
-                    .map(|desc| {
-                        if let ScalarExpr::BoundColumnRef(col) = &desc.expr {
-                            Ok(col.column.index)
-                        } else {
-                            Err(ErrorCode::Internal(
-                                "Aggregate function sort description must be a BoundColumnRef"
-                                    .to_string(),
-                            ))
-                        }
-                    })
-                    .collect::<Result<_>>()?;
                 let args = arg_indices
                     .iter()
                     .map(|i| {
@@ -596,11 +581,6 @@ fn build_aggregate_function(
                             .clone())
                     })
                     .collect::<Result<_>>()?;
-                let sort_descs = agg
-                    .sort_descs
-                    .iter()
-                    .map(|desc| desc.try_into())
-                    .collect::<Result<_>>()?;
                 Ok(AggregateFunctionDesc {
                     sig: AggregateFunctionSignature {
                         name: agg.func_name.clone(),
@@ -608,11 +588,10 @@ fn build_aggregate_function(
                         return_type: *agg.return_type.clone(),
                         args,
                         params: agg.params.clone(),
-                        sort_descs,
+                        order_by: agg.bound_order_by()?,
                     },
                     output_column: v.index,
                     arg_indices,
-                    sort_desc_indices,
                     display: v.scalar.as_expr()?.sql_display(),
                 })
             }
@@ -647,11 +626,10 @@ fn build_aggregate_function(
                         return_type: *udaf.return_type.clone(),
                         args,
                         params: vec![],
-                        sort_descs: vec![],
+                        order_by: vec![],
                     },
                     output_column: v.index,
                     arg_indices,
-                    sort_desc_indices: vec![],
                     display: v.scalar.as_expr()?.sql_display(),
                 })
             }

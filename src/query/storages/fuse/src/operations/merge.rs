@@ -23,15 +23,14 @@ use databend_storages_common_index::BloomIndex;
 use databend_storages_common_index::RangeIndex;
 use databend_storages_common_table_meta::meta::Location;
 use databend_storages_common_table_meta::meta::TableMetaTimestamps;
-use tokio::sync::Semaphore;
 
 use super::merge_into::MatchedAggregator;
+use super::merge_into::MatchedAggregatorConfig;
 use super::mutation::SegmentIndex;
 use crate::FuseTable;
 use crate::io::BlockBuilder;
-use crate::io::SpatialIndexBuilder;
-use crate::io::VectorIndexBuilder;
-use crate::io::create_inverted_index_builders;
+use crate::io::JsonPathStatisticsBuilder;
+use crate::io::block_index::create_block_index_specs;
 use crate::statistics::ClusterStatsGenerator;
 
 impl FuseTable {
@@ -83,7 +82,6 @@ impl FuseTable {
         &self,
         ctx: Arc<dyn TableContext>,
         cluster_stats_gen: ClusterStatsGenerator,
-        io_request_semaphore: Arc<Semaphore>,
         segment_locations: Vec<(SegmentIndex, Location)>,
         target_build_optimization: bool,
         table_meta_timestamps: TableMetaTimestamps,
@@ -98,45 +96,37 @@ impl FuseTable {
         let ndv_columns_map = self
             .approx_distinct_cols()
             .distinct_column_fields(new_schema.clone(), RangeIndex::supported_table_type)?;
-        let ngram_args = FuseTable::create_ngram_index_args(
-            &self.table_info.meta.indexes,
-            &self.table_info.meta.schema,
-            true,
-        )?;
-        let inverted_index_builders = create_inverted_index_builders(&self.table_info.meta);
-        let vector_index_builder =
-            VectorIndexBuilder::try_create(&self.table_info.meta.indexes, new_schema.clone(), true);
-        let spatial_index_builder = SpatialIndexBuilder::try_create(
-            &self.table_info.meta.indexes,
-            new_schema.clone(),
-            true,
-        );
+        let block_index_specs = create_block_index_specs(self, new_schema.clone())?;
+
+        let json_path_statistics_builder = if self.enable_virtual_column() {
+            JsonPathStatisticsBuilder::try_create(
+                new_schema.clone(),
+                self.virtual_column_layout_policy(),
+            )
+            .ok()
+        } else {
+            None
+        };
 
         let block_builder = BlockBuilder {
             ctx: ctx.clone(),
+            operator: self.get_operator(),
             meta_locations: self.meta_location_generator().clone(),
             source_schema: new_schema,
             write_settings: self.get_write_settings(),
             cluster_stats_gen,
             bloom_columns_map,
             ndv_columns_map,
-            ngram_args,
-            inverted_index_builders,
-            vector_index_builder,
-            spatial_index_builder,
-            // todo
+            top_n: None,
+            block_index_specs,
             virtual_column_builder: None,
+            json_path_statistics_builder,
             table_meta_timestamps,
             serialize_hll: true,
         };
-        let aggregator = MatchedAggregator::create(
-            ctx,
-            self,
-            block_builder,
-            io_request_semaphore,
-            segment_locations,
-            target_build_optimization,
-        )?;
+        let config = MatchedAggregatorConfig::try_create(self, block_builder)?;
+        let aggregator =
+            MatchedAggregator::create(config, segment_locations, target_build_optimization);
         Ok(aggregator.into_pipe_item())
     }
 }

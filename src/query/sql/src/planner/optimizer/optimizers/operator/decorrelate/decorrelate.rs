@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -29,6 +30,8 @@ use databend_common_expression::types::NumberScalar;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 
 use super::DerivedColumnScope;
+use super::row_value::row_value_equality;
+use super::row_value::row_value_fields;
 use crate::ColumnSet;
 use crate::binder::ColumnBindingBuilder;
 use crate::binder::JoinPredicate;
@@ -204,6 +207,7 @@ impl SubqueryDecorrelatorOptimizer {
             is_lateral: false,
             single_to_inner: None,
             build_side_cache_info: None,
+            spatial_join: None,
         };
 
         // Rewrite plan to semi-join.
@@ -273,10 +277,16 @@ impl SubqueryDecorrelatorOptimizer {
                     &mut left_conditions,
                 )?;
 
+                // These conditions reconnect the flattened subquery result to the outer row.
+                // They are internal correlation keys rather than user-written equality
+                // predicates, so NULL correlation groups must match each other.
+                let is_null_equal =
+                    Self::nullable_condition_indexes(&left_conditions, &right_conditions);
+
                 let join_type = if matches!(subquery.contain_agg, Some(true)) && {
                     let rel_expr = RelExpr::with_s_expr(&subquery.subquery);
                     rel_expr
-                        .derive_cardinality()?
+                        .derive_cardinality(self.ctx.get_stat_context())?
                         .statistics
                         .precise_cardinality
                         .is_some()
@@ -290,7 +300,7 @@ impl SubqueryDecorrelatorOptimizer {
                     equi_conditions: JoinEquiCondition::new_conditions(
                         left_conditions,
                         right_conditions,
-                        vec![],
+                        is_null_equal,
                     ),
                     non_equi_conditions: vec![],
                     join_type,
@@ -300,6 +310,7 @@ impl SubqueryDecorrelatorOptimizer {
                     is_lateral: false,
                     single_to_inner: None,
                     build_side_cache_info: None,
+                    spatial_join: None,
                 };
                 let s_expr = SExpr::create_binary(
                     Arc::new(join_plan.into()),
@@ -336,21 +347,13 @@ impl SubqueryDecorrelatorOptimizer {
                     &mut left_conditions,
                     &mut right_conditions,
                 )?;
-                let mut is_null_equal = Vec::new();
-                for (i, (l, r)) in left_conditions
-                    .iter()
-                    .zip(right_conditions.iter())
-                    .enumerate()
-                {
-                    if l.data_type()?.is_nullable() || r.data_type()?.is_nullable() {
-                        is_null_equal.push(i);
-                    }
-                }
+                let is_null_equal =
+                    Self::nullable_condition_indexes(&left_conditions, &right_conditions);
 
                 let marker_index = if let Some(idx) = subquery.projection_index {
                     idx
                 } else {
-                    self.metadata.write().add_derived_column(
+                    self.ctx.get_metadata().write().add_derived_column(
                         "marker".to_string(),
                         DataType::Nullable(Box::new(DataType::Boolean)),
                     )
@@ -369,6 +372,7 @@ impl SubqueryDecorrelatorOptimizer {
                     is_lateral: false,
                     single_to_inner: None,
                     build_side_cache_info: None,
+                    spatial_join: None,
                 };
                 let s_expr = SExpr::create_binary(
                     Arc::new(join_plan.into()),
@@ -400,16 +404,8 @@ impl SubqueryDecorrelatorOptimizer {
                     &mut right_conditions,
                 )?;
 
-                let mut is_null_equal = Vec::new();
-                for (i, (l, r)) in left_conditions
-                    .iter()
-                    .zip(right_conditions.iter())
-                    .enumerate()
-                {
-                    if l.data_type()?.is_nullable() || r.data_type()?.is_nullable() {
-                        is_null_equal.push(i);
-                    }
-                }
+                let is_null_equal =
+                    Self::nullable_condition_indexes(&left_conditions, &right_conditions);
 
                 let output_column = subquery.output_column.clone();
                 let column_name = format!("subquery_{}", output_column.index);
@@ -427,16 +423,23 @@ impl SubqueryDecorrelatorOptimizer {
                 let op = subquery.compare_op.as_ref().unwrap().clone();
                 // Make <child_expr op right_condition> as non_equi_conditions even if op is equal operator.
                 // Because it's not null-safe.
-                let non_equi_conditions = vec![ScalarExpr::FunctionCall(op.to_func_call(
-                    subquery.span,
-                    child_expr,
-                    right_condition,
-                ))];
+                let non_equi_conditions = if subquery.row_columns.is_empty() {
+                    vec![ScalarExpr::FunctionCall(op.to_func_call(
+                        subquery.span,
+                        child_expr,
+                        right_condition,
+                    )?)]
+                } else {
+                    // Row values are compared field by field so a NULL field
+                    // yields NULL instead of the tuple comparison result.
+                    let (left, right) = row_value_fields(subquery)?;
+                    vec![row_value_equality(subquery, &left, &right)?]
+                };
 
                 let marker_index = if let Some(idx) = subquery.projection_index {
                     idx
                 } else {
-                    self.metadata.write().add_derived_column(
+                    self.ctx.get_metadata().write().add_derived_column(
                         "marker".to_string(),
                         DataType::Nullable(Box::new(DataType::Boolean)),
                     )
@@ -456,6 +459,7 @@ impl SubqueryDecorrelatorOptimizer {
                     is_lateral: false,
                     single_to_inner: None,
                     build_side_cache_info: None,
+                    spatial_join: None,
                 }
                 .into();
                 Ok((
@@ -483,7 +487,7 @@ impl SubqueryDecorrelatorOptimizer {
         let mut correlated_columns = correlated_columns.iter().copied().collect::<Vec<_>>();
         correlated_columns.sort();
         for correlated_column in correlated_columns {
-            let metadata = self.metadata.read();
+            let metadata = self.ctx.metadata_read();
             let column_entry = metadata.column(correlated_column);
             let right_column = ScalarExpr::BoundColumnRef(BoundColumnRef {
                 span,
@@ -515,6 +519,20 @@ impl SubqueryDecorrelatorOptimizer {
             right_conditions.push(right_column);
         }
         Ok(())
+    }
+
+    pub(crate) fn nullable_condition_indexes(
+        left_conditions: &[ScalarExpr],
+        right_conditions: &[ScalarExpr],
+    ) -> Vec<usize> {
+        left_conditions
+            .iter()
+            .zip(right_conditions)
+            .enumerate()
+            .filter_map(|(index, (left, right))| {
+                (left.data_type().is_nullable() || right.data_type().is_nullable()).then_some(index)
+            })
+            .collect()
     }
 
     // Check if need to join outer and inner table
@@ -620,13 +638,13 @@ impl SubqueryDecorrelatorOptimizer {
                 let scalar_expr = &eval.items[0].scalar;
                 let mut constant_scalar = None;
                 if scalar_expr.used_columns().is_empty() && !scalar_expr.has_subquery() {
-                    let func_ctx = self.ctx.get_function_context()?;
+                    let func_ctx = self.ctx.get_table_ctx().get_function_context()?;
                     let (folded, _) = ConstantFolder::fold(
-                        &scalar_expr.as_expr()?,
+                        Cow::Owned(scalar_expr.as_expr()?),
                         &func_ctx,
                         &BUILTIN_FUNCTIONS,
                     );
-                    if let EExpr::Constant(constant) = folded {
+                    if let EExpr::Constant(constant) = folded.into_owned() {
                         constant_scalar = Some(ScalarExpr::TypedConstantExpr(
                             ConstantExpr {
                                 span: scalar_expr.span(),
@@ -643,7 +661,7 @@ impl SubqueryDecorrelatorOptimizer {
                     let Ok(const_scalar) = ConstantExpr::try_from(scalar_expr.clone()) else {
                         return Ok(None);
                     };
-                    let scalar_data_type = scalar_expr.data_type()?.wrap_nullable();
+                    let scalar_data_type = scalar_expr.data_type().wrap_nullable();
                     ScalarExpr::TypedConstantExpr(const_scalar, scalar_data_type)
                 };
                 match (&subquery.child_expr, subquery.compare_op.clone()) {
@@ -652,7 +670,7 @@ impl SubqueryDecorrelatorOptimizer {
                             subquery.span,
                             *child_expr.clone(),
                             scalar,
-                        ))));
+                        )?)));
                     }
                     (None, None) => match subquery.typ {
                         SubqueryType::Scalar => {
@@ -763,11 +781,23 @@ impl SubqueryDecorrelatorOptimizer {
                             })));
                         }
                         // If the number of values more than `inlist_to_join_threshold`, need convert to join.
-                        if values.len() >= self.ctx.get_settings().get_inlist_to_join_threshold()? {
+                        if values.len()
+                            >= self
+                                .ctx
+                                .get_table_ctx()
+                                .get_settings()
+                                .get_inlist_to_join_threshold()?
+                        {
                             return Ok(None);
                         }
                         // If the number of values more than `max_inlist_to_or`, use contains function instead of or.
-                        if values.len() > self.ctx.get_settings().get_max_inlist_to_or()? as usize {
+                        if values.len()
+                            > self
+                                .ctx
+                                .get_table_ctx()
+                                .get_settings()
+                                .get_max_inlist_to_or()? as usize
+                        {
                             let value_type = values.first().unwrap().as_ref().infer_data_type();
                             let mut builder =
                                 ColumnBuilder::with_capacity(&value_type, values.len());
@@ -779,7 +809,7 @@ impl SubqueryDecorrelatorOptimizer {
                                 value: Scalar::Array(builder.build()),
                             });
 
-                            let expr_type = child_expr.data_type()?;
+                            let expr_type = child_expr.data_type().into_owned();
                             let common_type = common_super_type(
                                 value_type.clone(),
                                 expr_type.clone(),
@@ -788,40 +818,69 @@ impl SubqueryDecorrelatorOptimizer {
                             .ok_or_else(|| {
                                 ErrorCode::IllegalDataType(format!(
                                     "Cannot find common type for inlist subquery value {:?} and expr {:?}",
-                                    &array_value, &child_expr
+                                    array_value, child_expr
                                 ))
                             })?;
 
-                            let mut arguments = Vec::with_capacity(2);
-                            if value_type != common_type {
-                                arguments.push(ScalarExpr::CastExpr(CastExpr {
+                            let array_argument = if value_type != common_type {
+                                ScalarExpr::CastExpr(CastExpr {
                                     span: subquery.span,
                                     is_try: false,
                                     argument: Box::new(array_value),
                                     target_type: Box::new(DataType::Array(Box::new(
                                         common_type.clone(),
                                     ))),
-                                }));
+                                })
                             } else {
-                                arguments.push(array_value);
-                            }
-                            if expr_type != common_type {
-                                arguments.push(ScalarExpr::CastExpr(CastExpr {
+                                array_value
+                            };
+                            let value_argument = if expr_type != common_type {
+                                ScalarExpr::CastExpr(CastExpr {
                                     span: subquery.span,
                                     is_try: false,
                                     argument: Box::new(*child_expr.clone()),
                                     target_type: Box::new(common_type.clone()),
-                                }));
+                                })
                             } else {
-                                arguments.push(*child_expr.clone());
-                            }
-                            let func = ScalarExpr::FunctionCall(FunctionCall {
+                                *child_expr.clone()
+                            };
+                            let nullable_value = value_argument
+                                .data_type()
+                                .is_nullable_or_null()
+                                .then(|| value_argument.clone());
+                            let mut contains = FunctionCall {
                                 span: subquery.span,
                                 func_name: "contains".to_string(),
                                 params: vec![],
-                                arguments,
+                                arguments: vec![array_argument, value_argument],
+                                return_type: Box::new(DataType::Boolean),
+                            };
+                            contains.refresh_return_type()?;
+                            let contains = ScalarExpr::FunctionCall(contains);
+                            let Some(value_argument) = nullable_value else {
+                                return Ok(Some(contains));
+                            };
+                            let is_not_null = ScalarExpr::FunctionCall(FunctionCall {
+                                span: subquery.span,
+                                func_name: "is_not_null".to_string(),
+                                params: vec![],
+                                arguments: vec![value_argument],
+                                return_type: Box::new(DataType::Boolean),
                             });
-                            return Ok(Some(func));
+                            return Ok(Some(ScalarExpr::FunctionCall(FunctionCall {
+                                span: subquery.span,
+                                func_name: "if".to_string(),
+                                params: vec![],
+                                arguments: vec![
+                                    is_not_null,
+                                    contains,
+                                    ScalarExpr::ConstantExpr(ConstantExpr {
+                                        span: subquery.span,
+                                        value: Scalar::Null,
+                                    }),
+                                ],
+                                return_type: Box::new(DataType::Boolean.wrap_nullable()),
+                            })));
                         }
 
                         let mut funcs = Vec::with_capacity(values.len());
@@ -830,11 +889,17 @@ impl SubqueryDecorrelatorOptimizer {
                                 span: subquery.span,
                                 value,
                             });
+                            let return_type =
+                                ScalarExpr::passthrough_nullable_type(DataType::Boolean, [
+                                    child_expr.as_ref(),
+                                    &scalar_value,
+                                ]);
                             let func = ScalarExpr::FunctionCall(FunctionCall {
                                 span: subquery.span,
                                 func_name: "eq".to_string(),
                                 params: vec![],
                                 arguments: vec![*child_expr.clone(), scalar_value],
+                                return_type: Box::new(return_type),
                             });
                             funcs.push(func);
                         }
@@ -844,11 +909,16 @@ impl SubqueryDecorrelatorOptimizer {
                                 match acc.as_mut() {
                                     None => acc = Some(func),
                                     Some(acc) => {
+                                        let return_type = ScalarExpr::passthrough_nullable_type(
+                                            DataType::Boolean,
+                                            [&*acc, &func],
+                                        );
                                         *acc = ScalarExpr::FunctionCall(FunctionCall {
                                             span: subquery.span,
                                             func_name: "or".to_string(),
                                             params: vec![],
                                             arguments: vec![acc.clone(), func],
+                                            return_type: Box::new(return_type),
                                         });
                                     }
                                 }

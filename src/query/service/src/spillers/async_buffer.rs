@@ -20,6 +20,7 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -43,6 +44,7 @@ use databend_common_storages_parquet::parquet_reader::RowGroupCore;
 use databend_common_storages_parquet::parquet_reader::row_group::get_ranges;
 use fastrace::Span;
 use fastrace::future::FutureExt;
+use opendal::Buffer;
 use opendal::Metadata;
 use opendal::Operator;
 use opendal::Writer;
@@ -58,6 +60,7 @@ use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 
 use super::record_read_profile;
+use super::record_write_profile;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -82,18 +85,82 @@ impl SpillTarget {
 pub struct SpillsBufferPool {
     _runtime: Arc<Runtime>,
     working_queue: async_channel::Sender<BufferOperator>,
-    available_write_buffers: async_channel::Receiver<BytesMut>,
-    available_write_buffers_tx: async_channel::Sender<BytesMut>,
-    blocking_nanos: Arc<AtomicU64>,
-    blocking_count: Arc<AtomicU64>,
+}
+
+struct MemoryPool {
+    available_buffers: async_channel::Receiver<BytesMut>,
+    available_buffers_tx: async_channel::Sender<BytesMut>,
+    allocated_chunks: AtomicUsize,
+    max_chunks: usize,
+    blocking_nanos: AtomicU64,
+    blocking_count: AtomicU64,
+}
+
+impl MemoryPool {
+    fn create(pool_bytes: usize) -> Arc<Self> {
+        let (available_buffers_tx, available_buffers) = async_channel::unbounded();
+        let max_chunks = (pool_bytes / CHUNK_SIZE).max(1);
+
+        Arc::new(Self {
+            available_buffers,
+            available_buffers_tx,
+            allocated_chunks: AtomicUsize::new(0),
+            max_chunks,
+            blocking_nanos: AtomicU64::new(0),
+            blocking_count: AtomicU64::new(0),
+        })
+    }
+
+    fn alloc_buffer(&self) -> io::Result<BytesMut> {
+        if let Ok(buf) = self.available_buffers.try_recv() {
+            return Ok(buf);
+        }
+
+        let allocated = self.allocated_chunks.fetch_add(1, Ordering::AcqRel);
+        if allocated < self.max_chunks {
+            return Ok(BytesMut::with_capacity(CHUNK_SIZE));
+        }
+
+        self.allocated_chunks.fetch_sub(1, Ordering::AcqRel);
+
+        let start = Instant::now();
+        let result = match self.available_buffers.recv_blocking() {
+            Ok(buf) => Ok(buf),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "memory pool is closed",
+            )),
+        };
+        self.blocking_nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.blocking_count.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+
+    fn release_buffer(&self, buffer: BytesMut) {
+        if self.available_buffers_tx.try_send(buffer).is_err() {
+            unreachable!("MemoryPool available_buffers need unbounded.");
+        }
+    }
+}
+
+impl Drop for MemoryPool {
+    fn drop(&mut self) {
+        let blocking_count = self.blocking_count.load(Ordering::Relaxed);
+        if blocking_count > 0 {
+            let blocking_nanos = self.blocking_nanos.load(Ordering::Relaxed);
+            log::debug!(
+                "spill writer memory pool alloc blocked {} times, total {:.2}ms",
+                blocking_count,
+                blocking_nanos as f64 / 1_000_000.0,
+            );
+        }
+    }
 }
 
 impl SpillsBufferPool {
     pub fn init(config: &SpillConfig) -> Result<()> {
-        GlobalInstance::set(SpillsBufferPool::create(
-            config.buffer_pool_memory as usize,
-            config.buffer_pool_workers,
-        )?);
+        GlobalInstance::set(SpillsBufferPool::create(config.buffer_pool_workers)?);
         Ok(())
     }
 
@@ -101,22 +168,13 @@ impl SpillsBufferPool {
         GlobalInstance::get()
     }
 
-    pub fn create(memory: usize, workers: usize) -> Result<Arc<SpillsBufferPool>> {
+    pub fn create(workers: usize) -> Result<Arc<SpillsBufferPool>> {
         let runtime = Arc::new(Runtime::with_worker_threads(
             workers,
             Some("spill-worker".to_owned()),
         )?);
 
         let (working_tx, working_rx) = async_channel::unbounded();
-        let (buffers_tx, buffers_rx) = async_channel::unbounded();
-
-        let memory = memory / CHUNK_SIZE * CHUNK_SIZE;
-
-        for _ in 0..memory / CHUNK_SIZE {
-            buffers_tx
-                .try_send(BytesMut::with_capacity(CHUNK_SIZE))
-                .expect("Buffer pool available_write_buffers need unbounded.");
-        }
 
         for _ in 0..workers {
             let working_queue: async_channel::Receiver<BufferOperator> = working_rx.clone();
@@ -131,55 +189,10 @@ impl SpillsBufferPool {
             );
         }
 
-        let blocking_nanos = Arc::new(AtomicU64::new(0));
-        let blocking_count = Arc::new(AtomicU64::new(0));
-
-        {
-            let blocking_nanos = Arc::clone(&blocking_nanos);
-            let blocking_count = Arc::clone(&blocking_count);
-            runtime.spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    let count = blocking_count.swap(0, Ordering::Relaxed);
-                    let nanos = blocking_nanos.swap(0, Ordering::Relaxed);
-                    if count > 0 {
-                        log::info!(
-                            "SpillsBufferPool alloc blocked {} times, total {:.2}ms in last 60s",
-                            count,
-                            nanos as f64 / 1_000_000.0,
-                        );
-                    }
-                }
-            });
-        }
-
         Ok(Arc::new(SpillsBufferPool {
             _runtime: runtime,
             working_queue: working_tx,
-            available_write_buffers: buffers_rx,
-            available_write_buffers_tx: buffers_tx,
-            blocking_nanos,
-            blocking_count,
         }))
-    }
-
-    pub(crate) fn alloc_buffer(&self) -> std::io::Result<BytesMut> {
-        if let Ok(buf) = self.available_write_buffers.try_recv() {
-            return Ok(buf);
-        }
-
-        let start = Instant::now();
-        let result = match self.available_write_buffers.recv_blocking() {
-            Ok(buf) => Ok(buf),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "buffer pool is closed",
-            )),
-        };
-        self.blocking_nanos
-            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.blocking_count.fetch_add(1, Ordering::Relaxed);
-        result
     }
 
     pub(crate) fn operator(&self, op: BufferOperator) {
@@ -188,8 +201,9 @@ impl SpillsBufferPool {
             .expect("Buffer pool working queue need unbounded.");
     }
 
-    pub fn buffer_write(self: &Arc<SpillsBufferPool>, writer: Writer) -> BufferWriter {
+    pub fn buffer_write(self: &Arc<Self>, writer: Writer, pool_bytes: usize) -> BufferWriter {
         let (buffer_tx, buffer_rx) = async_channel::unbounded::<Bytes>();
+        let memory_pool = MemoryPool::create(pool_bytes);
 
         let response = BufferOperatorResp::pending();
 
@@ -197,27 +211,34 @@ impl SpillsBufferPool {
             writer,
             buffer_rx,
             response: response.clone(),
-            available_buffers: self.available_write_buffers_tx.clone(),
+            memory_pool: memory_pool.clone(),
             span: Span::enter_with_local_parent("BufferWriterTask"),
         }));
 
         BufferWriter {
             buffer_tx,
             current_bytes: None,
-            buffer_pool: self.clone(),
+            memory_pool,
             response,
         }
     }
 
-    pub fn writer(self: &Arc<Self>, op: Operator, path: String) -> Result<SpillsDataWriter> {
-        let writer = self.buffer_writer(op, path)?;
-        Ok(SpillsDataWriter::Uninitialize(Some(writer)))
+    pub fn writer(
+        self: &Arc<Self>,
+        op: Operator,
+        path: String,
+        pool_bytes: usize,
+        target: SpillTarget,
+    ) -> Result<SpillsDataWriter> {
+        let writer = self.buffer_writer(op, path, pool_bytes)?;
+        Ok(SpillsDataWriter::create(writer, target))
     }
 
     pub(super) fn buffer_writer(
         self: &Arc<Self>,
         op: Operator,
         path: String,
+        pool_bytes: usize,
     ) -> Result<BufferWriter> {
         let pending_response = BufferOperatorResp::pending();
 
@@ -232,7 +253,7 @@ impl SpillsBufferPool {
             .try_send(operator)
             .expect("Buffer pool working queue need unbounded.");
 
-        Ok(self.buffer_write(pending_response.wait_and_take()?))
+        Ok(self.buffer_write(pending_response.wait_and_take()?, pool_bytes))
     }
 
     pub fn reader(
@@ -255,6 +276,21 @@ impl SpillsBufferPool {
         )
     }
 
+    pub(super) fn read_buffer(
+        &self,
+        op: Operator,
+        path: String,
+    ) -> async_channel::Receiver<Result<Buffer>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.operator(BufferOperator::ReadBuffer(ReadBufferOperator {
+            span: Span::enter_with_local_parent("ReadBuffer"),
+            op,
+            path,
+            sender,
+        }));
+        receiver
+    }
+
     pub fn fetch_ranges(
         &self,
         op: Operator,
@@ -275,34 +311,17 @@ impl SpillsBufferPool {
 
         response.wait_and_take()
     }
-
-    fn release_buffer(&self, buffer: BytesMut) {
-        if self.available_write_buffers_tx.try_send(buffer).is_err() {
-            unreachable!("Buffer pool available_write_buffers need unbounded.");
-        }
-    }
 }
 
 pub struct BufferWriter {
     current_bytes: Option<BytesMut>,
-    buffer_pool: Arc<SpillsBufferPool>,
+    memory_pool: Arc<MemoryPool>,
     buffer_tx: async_channel::Sender<Bytes>,
     response: Arc<BufferOperatorResp<io::Result<Metadata>>>,
 }
 
 impl BufferWriter {
     pub fn close(mut self) -> io::Result<Metadata> {
-        if let Some(b) = self.current_bytes.take() {
-            if self.buffer_tx.try_send(b.freeze()).is_err() {
-                return Err(io::ErrorKind::BrokenPipe.into());
-            }
-        }
-
-        self.buffer_tx.close();
-        self.response.wait_and_take()
-    }
-
-    pub(super) fn finish(&mut self) -> std::io::Result<Metadata> {
         if let Some(b) = self.current_bytes.take() {
             if self.buffer_tx.try_send(b.freeze()).is_err() {
                 return Err(io::ErrorKind::BrokenPipe.into());
@@ -341,7 +360,7 @@ impl io::Write for BufferWriter {
 
         let mut current_bytes = match self.current_bytes.take() {
             Some(bytes) => bytes,
-            None => self.buffer_pool.alloc_buffer()?,
+            None => self.memory_pool.alloc_buffer()?,
         };
 
         let mut written = 0;
@@ -354,7 +373,7 @@ impl io::Write for BufferWriter {
                     return Err(io::ErrorKind::BrokenPipe.into());
                 }
 
-                current_bytes = self.buffer_pool.alloc_buffer()?;
+                current_bytes = self.memory_pool.alloc_buffer()?;
                 available_space = current_bytes.capacity() - current_bytes.len();
             }
 
@@ -376,12 +395,6 @@ impl io::Write for BufferWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(b) = self.current_bytes.take() {
-            if self.buffer_tx.try_send(b.freeze()).is_err() {
-                return Err(io::ErrorKind::BrokenPipe.into());
-            }
-        }
-
         self.last_error()
     }
 }
@@ -390,7 +403,7 @@ impl Drop for BufferWriter {
     fn drop(&mut self) {
         if let Some(mut b) = self.current_bytes.take() {
             b.clear();
-            self.buffer_pool.release_buffer(b);
+            self.memory_pool.release_buffer(b);
         }
     }
 }
@@ -401,18 +414,35 @@ pub struct InitializedBlocksStreamWriter {
 }
 
 pub enum SpillsDataWriter {
-    Uninitialize(Option<BufferWriter>),
-    Initialized(InitializedBlocksStreamWriter),
+    Uninitialize {
+        writer: Option<BufferWriter>,
+        target: SpillTarget,
+        write_duration: Duration,
+    },
+    Initialized {
+        writer: InitializedBlocksStreamWriter,
+        target: SpillTarget,
+        write_duration: Duration,
+    },
 }
 
 impl SpillsDataWriter {
-    pub fn create(writer: BufferWriter) -> Self {
-        Self::Uninitialize(Some(writer))
+    pub fn create(writer: BufferWriter, target: SpillTarget) -> Self {
+        Self::Uninitialize {
+            writer: Some(writer),
+            target,
+            write_duration: Duration::default(),
+        }
     }
 
     pub fn write(&mut self, block: DataBlock) -> Result<()> {
         match self {
-            SpillsDataWriter::Uninitialize(writer) => {
+            SpillsDataWriter::Uninitialize {
+                writer,
+                target,
+                write_duration,
+            } => {
+                let start = Instant::now();
                 let data_schema = block.infer_schema();
                 let table_schema = infer_table_schema(&data_schema)?;
 
@@ -428,47 +458,92 @@ impl SpillsDataWriter {
                 let mut writer = ArrowWriter::try_new(buffer_writer, arrow_schema, Some(props))?;
                 let record_batch = block.to_record_batch(&table_schema)?;
                 writer.write(&record_batch)?;
-                *self = SpillsDataWriter::Initialized(InitializedBlocksStreamWriter {
-                    writer,
-                    table_schema,
-                });
+                let write_duration = *write_duration + start.elapsed();
+                *self = SpillsDataWriter::Initialized {
+                    writer: InitializedBlocksStreamWriter {
+                        writer,
+                        table_schema,
+                    },
+                    target: *target,
+                    write_duration,
+                };
 
                 Ok(())
             }
-            SpillsDataWriter::Initialized(writer) => {
+            SpillsDataWriter::Initialized {
+                writer,
+                write_duration,
+                ..
+            } => {
+                let start = Instant::now();
                 let record_batch = block.to_record_batch(&writer.table_schema)?;
-                Ok(writer.writer.write(&record_batch)?)
+                writer.writer.write(&record_batch)?;
+                *write_duration += start.elapsed();
+                Ok(())
             }
         }
     }
 
     pub fn flush(&mut self) -> Result<()> {
         match self {
-            SpillsDataWriter::Uninitialize(_) => Err(ErrorCode::Internal(
+            SpillsDataWriter::Uninitialize { .. } => Err(ErrorCode::Internal(
                 "Bad state, BlockStreamWriter is uninitialized",
             )),
-            SpillsDataWriter::Initialized(writer) => {
+            SpillsDataWriter::Initialized {
+                writer,
+                write_duration,
+                ..
+            } => {
+                let start = Instant::now();
                 writer.writer.flush()?;
-                Ok(writer.writer.inner_mut().flush()?)
+                writer.writer.inner_mut().flush()?;
+                *write_duration += start.elapsed();
+                Ok(())
+            }
+        }
+    }
+
+    /// Flush current buffered data as complete row groups and return the total flushed row group count.
+    pub fn flush_row_groups(&mut self) -> Result<usize> {
+        match self {
+            SpillsDataWriter::Uninitialize { .. } => Err(ErrorCode::Internal(
+                "Bad state, BlockStreamWriter is uninitialized",
+            )),
+            SpillsDataWriter::Initialized {
+                writer,
+                write_duration,
+                ..
+            } => {
+                let start = Instant::now();
+                writer.writer.flush()?;
+                writer.writer.inner_mut().flush()?;
+                *write_duration += start.elapsed();
+                Ok(writer.writer.flushed_row_groups().len())
             }
         }
     }
 
     pub fn close(self) -> Result<(usize, Vec<RowGroupMetaData>)> {
         match self {
-            SpillsDataWriter::Uninitialize(mut writer) => {
+            SpillsDataWriter::Uninitialize { mut writer, .. } => {
                 if let Some(writer) = writer.take() {
                     writer.close()?;
                 }
 
                 Ok((0, vec![]))
             }
-            SpillsDataWriter::Initialized(mut writer) => {
+            SpillsDataWriter::Initialized {
+                mut writer,
+                target,
+                mut write_duration,
+            } => {
+                let start = Instant::now();
                 writer.writer.flush()?;
                 let row_groups = writer.writer.flushed_row_groups().to_vec();
                 let bytes_written = writer.writer.bytes_written();
                 writer.writer.into_inner()?.close()?;
-
+                write_duration += start.elapsed();
+                record_write_profile(target, write_duration, bytes_written);
                 Ok((bytes_written, row_groups))
             }
         }
@@ -551,7 +626,7 @@ impl SpillsDataReader {
         )?;
         let batch = reader.next().transpose()?.unwrap();
         debug_assert!(reader.next().is_none());
-        record_read_profile(self.target, &start, fetched.read_bytes);
+        record_read_profile(self.target, start.elapsed(), fetched.read_bytes);
         Ok(Some(DataBlock::from_record_batch(
             &self.data_schema,
             &batch,
@@ -564,6 +639,13 @@ pub struct CreateWriterOperator {
     op: Operator,
     path: String,
     response: Arc<BufferOperatorResp<opendal::Result<Writer>>>,
+}
+
+pub struct ReadBufferOperator {
+    span: Span,
+    op: Operator,
+    path: String,
+    sender: async_channel::Sender<Result<Buffer>>,
 }
 
 pub struct FetchOperator {
@@ -579,7 +661,7 @@ pub struct BufferWriterTaskOperator {
     span: Span,
     writer: Writer,
     buffer_rx: async_channel::Receiver<Bytes>,
-    available_buffers: async_channel::Sender<BytesMut>,
+    memory_pool: Arc<MemoryPool>,
     response: Arc<BufferOperatorResp<io::Result<Metadata>>>,
 }
 
@@ -621,7 +703,7 @@ impl<T> BufferOperatorResp<T> {
         let locked = self.mutex.lock();
         let mut locked = locked.unwrap_or_else(PoisonError::into_inner);
 
-        if locked.is_none() {
+        while locked.is_none() {
             let waited = self.condvar.wait(locked);
             locked = waited.unwrap_or_else(PoisonError::into_inner);
         }
@@ -634,6 +716,7 @@ pub enum BufferOperator {
     WriterTask(BufferWriterTaskOperator),
     CreateWriter(CreateWriterOperator),
     Fetch(FetchOperator),
+    ReadBuffer(ReadBufferOperator),
     ReaderTask(ReaderTaskOperator),
 }
 
@@ -643,6 +726,7 @@ impl BufferOperator {
             BufferOperator::WriterTask(op) => &op.span,
             BufferOperator::CreateWriter(op) => &op.span,
             BufferOperator::Fetch(op) => &op.span,
+            BufferOperator::ReadBuffer(op) => &op.span,
             BufferOperator::ReaderTask(op) => &op.span,
         }
     }
@@ -671,6 +755,16 @@ impl Background {
                             op.response.done(writer);
                         },
                     ),
+                );
+            }
+            BufferOperator::ReadBuffer(op) => {
+                spawn(
+                    async_backtrace::location!(String::from("read_buffer")).frame(async move {
+                        if !op.sender.is_closed() {
+                            let result = op.op.read(&op.path).await.map_err(ErrorCode::from);
+                            let _ = op.sender.send(result).await;
+                        }
+                    }),
                 );
             }
             BufferOperator::Fetch(op) => {
@@ -717,14 +811,7 @@ async fn writer_task_loop(mut op: BufferWriterTaskOperator) {
                 }
             };
 
-            if op.available_buffers.send(buf).await.is_err() {
-                op.buffer_rx.close();
-                op.response.done(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "buffer pool is closed",
-                )));
-                return;
-            }
+            op.memory_pool.release_buffer(buf);
 
             if has_error {
                 release_buf = op.buffer_rx.try_recv().ok();
@@ -778,20 +865,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_buffer_pool_creation() {
-        let pool = SpillsBufferPool::create(16 * 1024 * 1024, 2).unwrap();
-        let buffer1 = pool.alloc_buffer();
-        assert!(buffer1.is_ok());
-        assert_eq!(buffer1.unwrap().capacity(), CHUNK_SIZE);
+    async fn test_buffer_writer_lazy_init() {
+        let pool = SpillsBufferPool::create(2).unwrap();
+        let operator = create_test_operator().unwrap();
+        let writer = operator.writer("lazy_init_file").await.unwrap();
+
+        let mut buffer_writer = pool.buffer_write(writer, 2 * CHUNK_SIZE);
+        assert_eq!(
+            buffer_writer
+                .memory_pool
+                .allocated_chunks
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        buffer_writer.write_all(b"lazy init").unwrap();
+        assert_eq!(
+            buffer_writer
+                .memory_pool
+                .allocated_chunks
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        buffer_writer.close().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_writer_basic_write() {
-        let pool = SpillsBufferPool::create(8 * 1024 * 1024, 1).unwrap();
+        let pool = SpillsBufferPool::create(1).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("test_file").await.unwrap();
 
-        let mut buffer_writer = pool.buffer_write(writer);
+        let mut buffer_writer = pool.buffer_write(writer, 2 * CHUNK_SIZE);
 
         let data = b"Hello, World!";
         let written = buffer_writer.write(data).unwrap();
@@ -804,11 +910,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_writer_large_write() {
-        let pool = SpillsBufferPool::create(16 * 1024 * 1024, 2).unwrap();
+        let pool = SpillsBufferPool::create(2).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("large_file").await.unwrap();
 
-        let mut buffer_writer = pool.buffer_write(writer);
+        let mut buffer_writer = pool.buffer_write(writer, 4 * CHUNK_SIZE);
 
         let large_data = vec![0u8; 8 * 1024 * 1024];
         let written = buffer_writer.write(&large_data).unwrap();
@@ -821,11 +927,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_writer_multiple_writes() {
-        let pool = SpillsBufferPool::create(8 * 1024 * 1024, 1).unwrap();
+        let pool = SpillsBufferPool::create(1).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("multi_write_file").await.unwrap();
 
-        let mut buffer_writer = pool.buffer_write(writer);
+        let mut buffer_writer = pool.buffer_write(writer, 2 * CHUNK_SIZE);
 
         let mut total_written = 0;
         for i in 0..100 {
@@ -841,11 +947,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_pool_exhaustion_and_backpressure() {
-        let pool = SpillsBufferPool::create(CHUNK_SIZE, 1).unwrap();
+        let pool = SpillsBufferPool::create(1).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("backpressure_test").await.unwrap();
 
-        let mut buffer_writer = pool.buffer_write(writer);
+        let mut buffer_writer = pool.buffer_write(writer, CHUNK_SIZE);
 
         let data = vec![0u8; CHUNK_SIZE];
         let written = buffer_writer.write(&data).unwrap();
@@ -859,12 +965,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_flush_keeps_partial_chunk_buffered() {
+        let pool = SpillsBufferPool::create(1).unwrap();
+        let operator = create_test_operator().unwrap();
+        let writer = operator.writer("flush_partial_test").await.unwrap();
+
+        let mut buffer_writer = pool.buffer_write(writer, CHUNK_SIZE);
+        buffer_writer.write_all(b"partial chunk").unwrap();
+
+        buffer_writer.flush().unwrap();
+
+        let current = buffer_writer.current_bytes.as_ref().unwrap();
+        assert_eq!(current.len(), b"partial chunk".len());
+
+        let metadata = buffer_writer.close().unwrap();
+        assert_eq!(metadata.content_length(), b"partial chunk".len() as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_empty_write() {
-        let pool = SpillsBufferPool::create(8 * 1024 * 1024, 1).unwrap();
+        let pool = SpillsBufferPool::create(1).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("empty_test").await.unwrap();
 
-        let mut buffer_writer = pool.buffer_write(writer);
+        let mut buffer_writer = pool.buffer_write(writer, 2 * CHUNK_SIZE);
 
         let written = buffer_writer.write(b"").unwrap();
         assert_eq!(written, 0);
@@ -876,18 +1000,32 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_close_without_writes() {
-        let pool = SpillsBufferPool::create(8 * 1024 * 1024, 1).unwrap();
+        let pool = SpillsBufferPool::create(1).unwrap();
         let operator = create_test_operator().unwrap();
         let writer = operator.writer("no_write_test").await.unwrap();
 
-        let buffer_writer = pool.buffer_write(writer);
+        let buffer_writer = pool.buffer_write(writer, 2 * CHUNK_SIZE);
         let metadata = buffer_writer.close().unwrap();
         assert_eq!(metadata.content_length(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_memory_pool_minimum_one_chunk() {
+        let pool = SpillsBufferPool::create(1).unwrap();
+        let operator = create_test_operator().unwrap();
+        let writer = operator.writer("minimum_chunk_test").await.unwrap();
+
+        let mut buffer_writer = pool.buffer_write(writer, 1);
+        assert_eq!(buffer_writer.memory_pool.max_chunks, 1);
+
+        buffer_writer.write_all(b"minimum chunk").unwrap();
+        let metadata = buffer_writer.close().unwrap();
+        assert!(metadata.content_length() > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_writers() {
-        let pool = SpillsBufferPool::create(16 * 1024 * 1024, 4).unwrap();
+        let pool = SpillsBufferPool::create(4).unwrap();
         let operator = create_test_operator().unwrap();
 
         let write_count = Arc::new(AtomicUsize::new(0));
@@ -903,13 +1041,17 @@ mod tests {
                     .writer(&format!("concurrent_{}", i))
                     .await
                     .unwrap();
-                let mut buffer_writer = pool_clone.buffer_write(writer);
+                let mut buffer_writer = pool_clone.buffer_write(writer, CHUNK_SIZE);
 
-                for j in 0..10 {
-                    let data = format!("Writer {} - Line {}\n", i, j);
-                    buffer_writer.write_all(data.as_bytes()).unwrap();
+                let data = vec![i as u8; CHUNK_SIZE];
+
+                for _ in 0..2 {
+                    buffer_writer.write_all(&data).unwrap();
                     write_count_clone.fetch_add(1, Ordering::Relaxed);
                 }
+
+                buffer_writer.write_all(b"done").unwrap();
+                write_count_clone.fetch_add(1, Ordering::Relaxed);
 
                 buffer_writer.flush().unwrap();
                 buffer_writer.close().unwrap()
@@ -922,6 +1064,6 @@ mod tests {
             let _metadata = handle.await.unwrap();
         }
 
-        assert_eq!(write_count.load(Ordering::Relaxed), 40);
+        assert_eq!(write_count.load(Ordering::Relaxed), 12);
     }
 }

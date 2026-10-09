@@ -96,6 +96,40 @@ async fn test_set_settings() {
         }
 
         {
+            assert!(settings.get_enable_top_n().unwrap());
+            settings
+                .set_setting("enable_top_n".to_string(), "0".to_string())
+                .unwrap();
+            assert!(!settings.get_enable_top_n().unwrap());
+            settings
+                .set_setting("enable_top_n".to_string(), "1".to_string())
+                .unwrap();
+            assert!(settings.get_enable_top_n().unwrap());
+
+            let result = settings.set_setting("enable_top_n".to_string(), "2".to_string());
+            let expect =
+                "WrongValueForVariable. Code: 2803, Text = Value 2 is not within the range [0, 1].";
+            assert_eq!(expect, format!("{}", result.unwrap_err()));
+        }
+
+        {
+            assert!(!settings.get_enable_spatial_join().unwrap());
+            assert_eq!(
+                settings.get_spatial_join_max_build_rows().unwrap(),
+                1_000_000
+            );
+            settings
+                .set_setting("enable_spatial_join".to_string(), "1".to_string())
+                .unwrap();
+            assert!(settings.get_enable_spatial_join().unwrap());
+
+            let result = settings.set_setting("enable_spatial_join".to_string(), "2".to_string());
+            let expect =
+                "WrongValueForVariable. Code: 2803, Text = Value 2 is not within the range [0, 1].";
+            assert_eq!(expect, format!("{}", result.unwrap_err()));
+        }
+
+        {
             settings
                 .set_setting(
                     "prewhere_selectivity_threshold".to_string(),
@@ -301,6 +335,29 @@ async fn test_flight_keep_alive_settings() {
         err.to_string()
             .contains("flight_client_keep_alive_retries must be less than or equal to u32::MAX")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_flight_query_leak_timeout_setting() {
+    let settings = Settings::create(Tenant::new_literal("test"));
+
+    // Default keeps the historical hard-coded 180 seconds.
+    assert_eq!(settings.get_flight_query_leak_timeout_secs().unwrap(), 180);
+
+    settings
+        .set_setting(
+            "flight_query_leak_timeout_secs".to_string(),
+            "1800".to_string(),
+        )
+        .unwrap();
+    assert_eq!(settings.get_flight_query_leak_timeout_secs().unwrap(), 1800);
+
+    // 0 would remove leaked queries immediately, so it is rejected.
+    let result = settings.set_setting(
+        "flight_query_leak_timeout_secs".to_string(),
+        "0".to_string(),
+    );
+    assert!(result.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

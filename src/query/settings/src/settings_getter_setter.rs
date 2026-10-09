@@ -197,6 +197,10 @@ impl Settings {
         Ok(self.try_get_u64("enable_auto_fix_missing_bloom_index")? != 0)
     }
 
+    pub fn get_enable_table_schema_refresh(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_table_schema_refresh")? != 0)
+    }
+
     // Get max_block_size.
     pub fn get_max_block_size(&self) -> Result<u64> {
         self.try_get_u64("max_block_size")
@@ -231,6 +235,10 @@ impl Settings {
 
     pub fn get_max_vacuum_threads(&self) -> Result<u64> {
         self.try_get_u64("max_vacuum_threads")
+    }
+
+    pub fn get_storage_delete_batch_size(&self) -> Result<u64> {
+        self.try_get_u64("storage_delete_batch_size")
     }
 
     // Get storage_fetch_part_num.
@@ -295,6 +303,11 @@ impl Settings {
     // Get flight client timeout.
     pub fn get_flight_client_timeout(&self) -> Result<u64> {
         self.try_get_u64("flight_client_timeout")
+    }
+
+    // Get the timeout for a distributed query that never receives the start command.
+    pub fn get_flight_query_leak_timeout_secs(&self) -> Result<u64> {
+        self.try_get_u64("flight_query_leak_timeout_secs")
     }
 
     pub fn get_flight_keep_alive_params(&self) -> Result<FlightKeepAliveParams> {
@@ -365,10 +378,6 @@ impl Settings {
         self.try_get_u64("min_max_runtime_filter_threshold")
     }
 
-    pub fn get_spatial_runtime_filter_threshold(&self) -> Result<u64> {
-        self.try_get_u64("spatial_runtime_filter_threshold")
-    }
-
     pub fn get_unquoted_ident_case_sensitive(&self) -> Result<bool> {
         Ok(self.try_get_u64("unquoted_ident_case_sensitive")? != 0)
     }
@@ -410,8 +419,16 @@ impl Settings {
         Ok(self.try_get_u64("max_push_down_limit")? as usize)
     }
 
+    pub fn get_enable_top_n(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_top_n")? != 0)
+    }
+
     pub fn get_join_spilling_memory_ratio(&self) -> Result<usize> {
         Ok(self.try_get_u64("join_spilling_memory_ratio")? as usize)
+    }
+
+    pub fn get_materialized_cte_spilling_memory_ratio(&self) -> Result<usize> {
+        Ok(self.try_get_u64("materialized_cte_spilling_memory_ratio")? as usize)
     }
 
     pub fn get_join_spilling_partition_bits(&self) -> Result<usize> {
@@ -420,6 +437,10 @@ impl Settings {
 
     pub fn get_join_spilling_buffer_threshold_per_proc(&self) -> Result<usize> {
         Ok(self.try_get_u64("join_spilling_buffer_threshold_per_proc_mb")? as usize)
+    }
+
+    pub fn get_spill_writer_memory_pool_size_mb(&self) -> Result<usize> {
+        Ok(self.try_get_u64("spill_writer_memory_pool_size_mb")? as usize)
     }
 
     pub fn get_spilling_file_format(&self) -> Result<SpillFileFormat> {
@@ -444,6 +465,14 @@ impl Settings {
 
     pub fn get_enable_join_runtime_filter(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_join_runtime_filter")? != 0)
+    }
+
+    pub fn get_enable_spatial_join(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_spatial_join")? != 0)
+    }
+
+    pub fn get_spatial_join_max_build_rows(&self) -> Result<u64> {
+        self.try_get_u64("spatial_join_max_build_rows")
     }
 
     pub fn get_join_runtime_filter_selectivity_threshold(&self) -> Result<u64> {
@@ -599,6 +628,10 @@ impl Settings {
         Ok(self.try_get_u64("grouping_sets_to_union")? == 1)
     }
 
+    pub fn get_enable_cascading_grouping_sets(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_cascading_grouping_sets")? == 1)
+    }
+
     pub fn get_lazy_read_threshold(&self) -> Result<u64> {
         self.try_get_u64("lazy_read_threshold")
     }
@@ -699,12 +732,37 @@ impl Settings {
         Ok(self.try_get_u64("enable_analyze_histogram")? != 0)
     }
 
+    pub fn get_analyze_histogram_algorithm(&self) -> Result<String> {
+        Ok(self
+            .try_get_string("analyze_histogram_algorithm")?
+            .to_lowercase())
+    }
+
+    pub fn get_analyze_histogram_kll_relative_error(&self) -> Result<f64> {
+        let value = self.try_get_string("analyze_histogram_kll_relative_error")?;
+        let relative_error = value.parse::<f64>().map_err(|_| {
+            ErrorCode::WrongValueForVariable(format!(
+                "Invalid analyze_histogram_kll_relative_error value: {value}"
+            ))
+        })?;
+        if relative_error <= 0.0 || !relative_error.is_finite() {
+            return Err(ErrorCode::WrongValueForVariable(format!(
+                "analyze_histogram_kll_relative_error must be finite and greater than zero, got {relative_error}"
+            )));
+        }
+        Ok(relative_error)
+    }
+
     pub fn get_enable_auto_analyze(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_auto_analyze")? != 0)
     }
 
     pub fn get_enable_aggregating_index_scan(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_aggregating_index_scan")? != 0)
+    }
+
+    pub fn get_enable_materialized_view_rewrite(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_materialized_view_rewrite")? != 0)
     }
 
     pub fn get_enable_compact_after_write(&self) -> Result<bool> {
@@ -750,6 +808,14 @@ impl Settings {
 
     pub fn get_recluster_timeout_secs(&self) -> Result<u64> {
         self.try_get_u64("recluster_timeout_secs")
+    }
+
+    pub fn get_enable_recluster_inverted_index_merge(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_recluster_inverted_index_merge")? != 0)
+    }
+
+    pub fn get_enable_recluster_multiway_merge(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_recluster_multiway_merge")? != 0)
     }
 
     pub fn set_recluster_block_size(&self, val: u64) -> Result<()> {
@@ -875,6 +941,10 @@ impl Settings {
         Ok(self.try_get_u64("disable_variant_check")? != 0)
     }
 
+    pub fn get_enable_parse_json_variant_reparse(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_parse_json_variant_reparse")? != 0)
+    }
+
     pub fn get_cost_factor_hash_table_per_row(&self) -> Result<u64> {
         self.try_get_u64("cost_factor_hash_table_per_row")
     }
@@ -897,6 +967,10 @@ impl Settings {
 
     pub fn get_use_legacy_query_executor(&self) -> Result<bool> {
         Ok(self.try_get_u64("use_legacy_query_executor")? == 1)
+    }
+
+    pub fn get_enable_decimal_sum_widening(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_decimal_sum_widening")? != 0)
     }
 
     pub fn get_statement_queued_timeout(&self) -> Result<u64> {
@@ -983,10 +1057,6 @@ impl Settings {
         Ok(self.try_get_u64("enable_backpressure_spiller")? != 0)
     }
 
-    pub fn get_max_spill_io_requests(&self) -> Result<u64> {
-        self.try_get_u64("max_spill_io_requests")
-    }
-
     // Get grouping_sets_channel_size.
     pub fn get_grouping_sets_channel_size(&self) -> Result<u64> {
         self.try_get_u64("grouping_sets_channel_size")
@@ -1041,26 +1111,22 @@ impl Settings {
         self.try_get_string("network_policy")
     }
 
+    pub fn get_max_public_keys_per_user(&self) -> Result<u64> {
+        self.try_get_u64("max_public_keys_per_user")
+    }
+
     pub fn get_stream_consume_batch_size_hint(&self) -> Result<Option<u64>> {
         let v = self.try_get_u64("stream_consume_batch_size_hint")?;
         Ok(if v == 0 { None } else { Some(v) })
     }
 
+    pub fn get_enable_stream_batch_snapshot_forward_scan(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_stream_batch_snapshot_forward_scan")? != 0)
+    }
+
     /// # Safety
     pub unsafe fn set_warehouse(&self, warehouse: String) -> Result<()> {
         unsafe { self.unchecked_set_setting(String::from("warehouse"), warehouse) }
-    }
-
-    pub fn get_hilbert_num_range_ids(&self) -> Result<u64> {
-        self.try_get_u64("hilbert_num_range_ids")
-    }
-
-    pub fn get_hilbert_sample_size_per_block(&self) -> Result<u64> {
-        self.try_get_u64("hilbert_sample_size_per_block")
-    }
-
-    pub fn get_hilbert_clustering_min_bytes(&self) -> Result<u64> {
-        self.try_get_u64("hilbert_clustering_min_bytes")
     }
 
     pub fn get_copy_dedup_full_path_by_default(&self) -> Result<bool> {
@@ -1111,6 +1177,10 @@ impl Settings {
         Ok(self.try_get_u64("force_aggregate_data_spill")? == 1)
     }
 
+    pub fn get_force_materialized_cte_spill(&self) -> Result<bool> {
+        Ok(self.try_get_u64("force_materialized_cte_spill")? == 1)
+    }
+
     pub fn get_enable_auto_vacuum(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_auto_vacuum")? == 1)
     }
@@ -1154,10 +1224,6 @@ impl Settings {
         self.try_set_u64("enable_auto_materialize_cte", val)
     }
 
-    pub fn get_max_aggregate_restore_worker(&self) -> Result<u64> {
-        self.try_get_u64("max_aggregate_restore_worker")
-    }
-
     pub fn get_enable_parallel_union_all(&self) -> Result<bool> {
         Ok(self.try_get_u64("enable_parallel_union_all")? == 1)
     }
@@ -1192,10 +1258,6 @@ impl Settings {
         })
     }
 
-    pub fn get_enable_experiment_aggregate(&self) -> Result<bool> {
-        Ok(self.try_get_u64("enable_experiment_aggregate")? != 0)
-    }
-
     pub fn get_max_aggregate_spill_level(&self) -> Result<u64> {
         self.try_get_u64("max_aggregate_spill_level")
     }
@@ -1210,10 +1272,6 @@ impl Settings {
 
     pub fn get_force_aggregate_shuffle_mode(&self) -> Result<String> {
         self.try_get_string("force_aggregate_shuffle_mode")
-    }
-
-    pub fn get_enable_experiment_hash_index(&self) -> Result<bool> {
-        Ok(self.try_get_u64("enable_experiment_hash_index")? != 0)
     }
 
     pub fn get_system_tables_count_db_concurrency(&self) -> Result<u64> {

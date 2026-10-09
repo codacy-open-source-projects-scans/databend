@@ -19,12 +19,12 @@ use databend_common_catalog::table::Table;
 use databend_common_catalog::table_context::AbortChecker;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::Result;
+use databend_common_meta_app::schema::TableInfo;
 use databend_enterprise_vacuum_handler::VacuumHandler;
 use databend_enterprise_vacuum_handler::VacuumHandlerWrapper;
 use databend_enterprise_vacuum_handler::vacuum_handler::VacuumDropTablesResult;
 use databend_enterprise_vacuum_handler::vacuum_handler::VacuumTempOptions;
 
-use crate::storages::fuse::do_vacuum;
 use crate::storages::fuse::operations::vacuum_table_v2::do_vacuum2;
 use crate::storages::fuse::operations::vacuum_temporary_files::do_vacuum_temporary_files;
 use crate::storages::fuse::vacuum_drop_tables;
@@ -32,31 +32,21 @@ pub struct RealVacuumHandler {}
 
 #[async_trait::async_trait]
 impl VacuumHandler for RealVacuumHandler {
-    async fn do_vacuum(
-        &self,
-        table: &dyn Table,
-        ctx: Arc<dyn TableContext>,
-        dry_run: bool,
-    ) -> Result<Option<Vec<String>>> {
-        do_vacuum(table, ctx, dry_run).await
-    }
-
     async fn do_vacuum2(
         &self,
         table: &dyn Table,
         ctx: Arc<dyn TableContext>,
         respect_flash_back: bool,
-    ) -> Result<Vec<String>> {
+    ) -> Result<()> {
         do_vacuum2(table, ctx, respect_flash_back).await
     }
 
     async fn do_vacuum_drop_tables(
         &self,
         threads_nums: usize,
-        tables: Vec<Arc<dyn Table>>,
-        dry_run_limit: Option<usize>,
+        tables: Vec<TableInfo>,
     ) -> VacuumDropTablesResult {
-        vacuum_drop_tables(threads_nums, tables, dry_run_limit).await
+        vacuum_drop_tables(threads_nums, tables).await
     }
 
     async fn do_vacuum_temporary_files(

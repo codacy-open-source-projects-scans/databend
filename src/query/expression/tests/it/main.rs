@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(box_patterns)]
-#![feature(try_blocks)]
+#![allow(incomplete_features)]
+#![feature(deref_patterns)]
 
 use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
@@ -23,11 +23,14 @@ use databend_common_expression::types::NumberDataType;
 
 extern crate core;
 
+mod aggregate;
 mod arrow;
 mod block;
 mod block_thresholds;
 mod block_vec;
 mod common;
+mod constant_folder;
+mod conversion;
 mod decimal;
 mod display;
 mod evaluator;
@@ -37,6 +40,7 @@ mod hilbert;
 mod kernel;
 mod meta_scalar;
 
+mod scalar_hash;
 mod schema;
 mod serde;
 mod sort;

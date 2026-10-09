@@ -20,6 +20,7 @@ use chrono::Utc;
 use databend_common_expression as ce;
 use databend_common_meta_app::schema as mt;
 use fastrace::func_name;
+use maplit::btreemap;
 
 use crate::common;
 
@@ -43,10 +44,12 @@ fn test_decode_v151_table_meta() -> anyhow::Result<()> {
         cluster_key: None,
         cluster_key_v2: None,
         cluster_key_seq: 0,
+        ttl: None,
         created_on: Utc.with_ymd_and_hms(2014, 11, 28, 12, 0, 9).unwrap(),
         updated_on: Utc.with_ymd_and_hms(2014, 11, 29, 12, 0, 10).unwrap(),
         comment: s(""),
         field_comments: vec![],
+        field_stats_truncate_len: btreemap! {},
         virtual_schema: None,
         drop_on: None,
         statistics: Default::default(),

@@ -26,12 +26,14 @@ use databend_common_meta_control::admin::MetaAdminClient;
 use databend_common_meta_control::args::BenchArgs;
 use databend_common_meta_control::args::DumpRaftLogWalArgs;
 use databend_common_meta_control::args::ExportArgs;
+use databend_common_meta_control::args::FilterTenantArgs;
 use databend_common_meta_control::args::GetArgs;
 use databend_common_meta_control::args::GlobalArgs;
 use databend_common_meta_control::args::ImportArgs;
 use databend_common_meta_control::args::KeysLayoutArgs;
 use databend_common_meta_control::args::ListFeatures;
 use databend_common_meta_control::args::LuaArgs;
+use databend_common_meta_control::args::LuaScript;
 use databend_common_meta_control::args::MemberListArgs;
 use databend_common_meta_control::args::MetricsArgs;
 use databend_common_meta_control::args::SetFeature;
@@ -42,6 +44,9 @@ use databend_common_meta_control::args::UpsertArgs;
 use databend_common_meta_control::args::WatchArgs;
 use databend_common_meta_control::export_from_disk;
 use databend_common_meta_control::export_from_grpc;
+use databend_common_meta_control::filter_tenant;
+use databend_common_meta_control::grpc_client_config::GrpcClientConfig;
+use databend_common_meta_control::grpc_client_config::GrpcClientConfigArgs;
 use databend_common_meta_control::import;
 use databend_common_meta_control::keys_layout_from_grpc;
 use databend_common_meta_control::lua_support;
@@ -70,6 +75,9 @@ struct App {
 
     #[clap(flatten)]
     globals: GlobalArgs,
+
+    #[clap(flatten)]
+    client_config: GrpcClientConfigArgs,
 }
 
 impl App {
@@ -79,15 +87,19 @@ impl App {
         Ok(())
     }
 
-    async fn show_status(&self, args: &StatusArgs) -> anyhow::Result<()> {
+    async fn show_status(
+        &self,
+        args: &StatusArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let addr = args.grpc_api_address.clone();
         let client = MetaGrpcClient::<DatabendRuntime>::try_create(
             vec![addr],
-            "root",
-            "xxx",
+            client_config.auth.username(),
+            client_config.auth.expose_password(),
             None,
             None,
-            None,
+            client_config.tls.clone(),
             DEFAULT_GRPC_MESSAGE_SIZE,
         )?;
 
@@ -153,7 +165,11 @@ impl App {
         Ok(())
     }
 
-    async fn bench_client_num_conn(&self, args: &BenchArgs) -> anyhow::Result<()> {
+    async fn bench_client_num_conn(
+        &self,
+        args: &BenchArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let addr = args.grpc_api_address.clone();
         println!(
             "loop: connect to metasrv {}, get_kv('foo'), do not drop the connection, num={}",
@@ -163,14 +179,14 @@ impl App {
         for i in 1..=args.num {
             let client = MetaGrpcClient::<DatabendRuntime>::try_create(
                 vec![addr.clone()],
-                "root",
-                "xxx",
+                client_config.auth.username(),
+                client_config.auth.expose_password(),
                 None,
                 None,
-                None,
+                client_config.tls.clone(),
                 DEFAULT_GRPC_MESSAGE_SIZE,
             )?;
-            let res = client.get_kv("foo").await;
+            let res = client.get_kv("foo").await?;
             println!("{}-th: get_kv(foo): {:?}", i, res);
             clients.push(client);
         }
@@ -196,10 +212,14 @@ impl App {
         Ok(())
     }
 
-    async fn export(&self, args: &ExportArgs) -> anyhow::Result<()> {
+    async fn export(
+        &self,
+        args: &ExportArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         match args.raft_dir {
             None => {
-                export_from_grpc::export_from_running_node(args).await?;
+                export_from_grpc::export_from_running_node(args, client_config).await?;
             }
             Some(ref _dir) => {
                 export_from_disk::export_from_dir::<DatabendRuntime>(args).await?;
@@ -213,14 +233,27 @@ impl App {
         Ok(())
     }
 
-    async fn keys_layout(&self, args: &KeysLayoutArgs) -> anyhow::Result<()> {
-        keys_layout_from_grpc::keys_layout_from_running_node(args).await?;
+    fn filter_tenant(&self, args: &FilterTenantArgs) -> anyhow::Result<()> {
+        filter_tenant::filter_tenant(args)?;
         Ok(())
     }
 
-    async fn watch(&self, args: &WatchArgs) -> anyhow::Result<()> {
+    async fn keys_layout(
+        &self,
+        args: &KeysLayoutArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
+        keys_layout_from_grpc::keys_layout_from_running_node(args, client_config).await?;
+        Ok(())
+    }
+
+    async fn watch(
+        &self,
+        args: &WatchArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let addresses = vec![args.grpc_api_address.clone()];
-        let client = self.new_grpc_client(addresses)?;
+        let client = self.new_grpc_client(addresses, client_config)?;
 
         let watch = WatchRequest::new_dir(&args.prefix).with_initial_flush(true);
 
@@ -231,9 +264,13 @@ impl App {
         Ok(())
     }
 
-    async fn upsert(&self, args: &UpsertArgs) -> anyhow::Result<()> {
+    async fn upsert(
+        &self,
+        args: &UpsertArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let addresses = vec![args.grpc_api_address.clone()];
-        let client = self.new_grpc_client(addresses)?;
+        let client = self.new_grpc_client(addresses, client_config)?;
 
         let upsert = UpsertKV::update(args.key.clone(), args.value.as_bytes());
 
@@ -247,41 +284,50 @@ impl App {
         Ok(())
     }
 
-    async fn get(&self, args: &GetArgs) -> anyhow::Result<()> {
+    async fn get(&self, args: &GetArgs, client_config: &GrpcClientConfig) -> anyhow::Result<()> {
         let addresses = vec![args.grpc_api_address.clone()];
-        let client = self.new_grpc_client(addresses)?;
+        let client = self.new_grpc_client(addresses, client_config)?;
 
         let res = client.get_kv(&args.key).await?;
         println!("{}", serde_json::to_string(&res)?);
         Ok(())
     }
 
-    async fn run_lua(&self, args: &LuaArgs) -> anyhow::Result<()> {
+    async fn run_lua(
+        &self,
+        args: &LuaArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let lua = Lua::new();
 
         // Setup Lua environment with gRPC client support
-        lua_support::setup_lua_environment(&lua)?;
-
-        let script = match &args.file {
-            Some(path) => std::fs::read_to_string(path)?,
-            None => {
-                let mut buffer = String::new();
-                io::stdin().read_to_string(&mut buffer)?;
-                buffer
-            }
-        };
+        lua_support::setup_lua_environment(&lua, client_config)?;
 
         #[allow(clippy::disallowed_types)]
         let local = tokio::task::LocalSet::new();
-        let res = local.run_until(lua.load(&script).exec_async()).await;
 
-        if let Err(e) = res {
-            return Err(anyhow::anyhow!("Lua execution error: {}", e));
+        if args.scripts.is_empty() {
+            let mut script = String::new();
+            io::stdin().read_to_string(&mut script)?;
+            return execute_lua_script(&lua, &local, &script).await;
         }
+
+        for source in &args.scripts {
+            let script = match source {
+                LuaScript::File(path) => std::fs::read_to_string(path)?,
+                LuaScript::Inline(script) => script.clone(),
+            };
+            execute_lua_script(&lua, &local, &script).await?;
+        }
+
         Ok(())
     }
 
-    async fn get_metrics(&self, args: &MetricsArgs) -> anyhow::Result<()> {
+    async fn get_metrics(
+        &self,
+        args: &MetricsArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let lua_script = format!(
             r#"
 local admin_client = metactl.new_admin_client("{}")
@@ -295,15 +341,19 @@ return metrics, nil
             args.admin_api_address
         );
 
-        match lua_support::run_lua_script_with_result(&lua_script).await? {
+        match lua_support::run_lua_script_with_result(&lua_script, client_config).await? {
             Ok(_result) => Ok(()),
             Err(error_msg) => Err(anyhow::anyhow!("Failed to get metrics: {}", error_msg)),
         }
     }
 
-    async fn member_list(&self, args: &MemberListArgs) -> anyhow::Result<()> {
+    async fn member_list(
+        &self,
+        args: &MemberListArgs,
+        client_config: &GrpcClientConfig,
+    ) -> anyhow::Result<()> {
         let addresses = vec![args.grpc_api_address.clone()];
-        let client = self.new_grpc_client(addresses)?;
+        let client = self.new_grpc_client(addresses, client_config)?;
 
         let res = client.get_member_list().await?;
         for member in res.data {
@@ -315,9 +365,22 @@ return metrics, nil
     fn new_grpc_client(
         &self,
         addresses: Vec<String>,
+        client_config: &GrpcClientConfig,
     ) -> Result<Arc<ClientHandle<DatabendRuntime>>, CreationError> {
-        lua_support::new_grpc_client(addresses)
+        lua_support::new_grpc_client(addresses, client_config)
     }
+}
+
+#[allow(clippy::disallowed_types)]
+async fn execute_lua_script(
+    lua: &Lua,
+    local: &tokio::task::LocalSet,
+    script: &str,
+) -> anyhow::Result<()> {
+    local
+        .run_until(lua.load(script).exec_async())
+        .await
+        .map_err(|e| anyhow::anyhow!("Lua execution error: {}", e))
 }
 
 #[derive(Debug, Clone, Deserialize, Subcommand)]
@@ -376,6 +439,21 @@ enum CtlCommand {
     ///     --initial-cluster 1=localhost:28103 \
     ///     --initial-cluster 2=localhost:28203
     Import(ImportArgs),
+
+    #[command(verbatim_doc_comment)]
+    /// Filter an exported metadata dump and keep only one tenant.
+    ///
+    /// The command keeps the export header, skips all raft-log records, and filters
+    /// state-machine GenericKV/Expire records by traversing tenant roots and their
+    /// referenced database/table ids. Every state-machine record must receive an
+    /// explicit keep/drop mark; otherwise the command fails.
+    ///
+    /// Example:
+    ///   metactl filter-tenant --tenant tenant1 --input meta.db --output tenant1.db
+    ///
+    /// Example (stdin/stdout):
+    ///   cat meta.db | metactl filter-tenant --tenant tenant1 > tenant1.db
+    FilterTenant(FilterTenantArgs),
 
     #[command(verbatim_doc_comment)]
     /// Dump state machine keys grouped by prefix.
@@ -524,12 +602,18 @@ enum CtlCommand {
     /// Example (from file):
     ///   metactl lua --file script.lua
     ///
+    /// Example (inline):
+    ///   metactl lua --script 'print("hello")'
+    ///
+    /// Sources run in command-line order:
+    ///   metactl lua --file define.lua --script 'callit()' --file cleanup.lua
+    ///
     /// Example (from stdin):
     ///   echo 'print("hello")' | metactl lua
     ///
     /// Sample Lua script:
     ///   local client = metactl.new_grpc_client("127.0.0.1:9191")
-    ///   local result, err = client:get_kv("mykey")
+    ///   local result, err = client:get("mykey")
     ///   if err then print("error:", err) else print(result) end
     Lua(LuaArgs),
 
@@ -591,6 +675,7 @@ enum CtlCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = App::parse();
+    let client_config = app.client_config.load()?;
 
     let log_config = LogConfig {
         file: FileConfig {
@@ -609,10 +694,10 @@ async fn main() -> anyhow::Result<()> {
     match app.command {
         Some(ref cmd) => match cmd {
             CtlCommand::Status(args) => {
-                app.show_status(args).await?;
+                app.show_status(args, &client_config).await?;
             }
             CtlCommand::BenchClientNumConn(args) => {
-                app.bench_client_num_conn(args).await?;
+                app.bench_client_num_conn(args, &client_config).await?;
             }
             CtlCommand::TransferLeader(args) => {
                 app.transfer_leader(args).await?;
@@ -634,31 +719,34 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             }
             CtlCommand::Export(args) => {
-                app.export(args).await?;
+                app.export(args, &client_config).await?;
             }
             CtlCommand::Import(args) => {
                 app.import(args).await?;
             }
+            CtlCommand::FilterTenant(args) => {
+                app.filter_tenant(args)?;
+            }
             CtlCommand::KeysLayout(args) => {
-                app.keys_layout(args).await?;
+                app.keys_layout(args, &client_config).await?;
             }
             CtlCommand::Watch(args) => {
-                app.watch(args).await?;
+                app.watch(args, &client_config).await?;
             }
             CtlCommand::Upsert(args) => {
-                app.upsert(args).await?;
+                app.upsert(args, &client_config).await?;
             }
             CtlCommand::Get(args) => {
-                app.get(args).await?;
+                app.get(args, &client_config).await?;
             }
             CtlCommand::Lua(args) => {
-                app.run_lua(args).await?;
+                app.run_lua(args, &client_config).await?;
             }
             CtlCommand::MemberList(args) => {
-                app.member_list(args).await?;
+                app.member_list(args, &client_config).await?;
             }
             CtlCommand::Metrics(args) => {
-                app.get_metrics(args).await?;
+                app.get_metrics(args, &client_config).await?;
             }
             CtlCommand::DumpRaftLogWal(args) => {
                 databend_common_meta_control::dump_raft_log_wal::dump_raft_log_wal(args)?;
@@ -674,7 +762,7 @@ async fn main() -> anyhow::Result<()> {
                     id: app.globals.id,
                     chunk_size: app.globals.export_chunk_size,
                 };
-                app.export(&args).await?;
+                app.export(&args, &client_config).await?;
             } else if app.globals.import {
                 let args = ImportArgs {
                     raft_dir: app.globals.raft_dir.clone(),

@@ -17,10 +17,12 @@ use std::sync::Arc;
 use databend_common_exception::Result;
 use databend_common_expression::Scalar;
 use databend_common_expression::types::NumberScalar;
+use databend_common_statistics::StatCount;
 
 use crate::optimizer::ir::Matcher;
 use crate::optimizer::ir::RelExpr;
 use crate::optimizer::ir::SExpr;
+use crate::optimizer::ir::StatContext;
 use crate::optimizer::optimizers::rule::Rule;
 use crate::optimizer::optimizers::rule::RuleID;
 use crate::optimizer::optimizers::rule::TransformResult;
@@ -36,12 +38,14 @@ use crate::plans::ScalarExpr;
 pub struct RuleFoldCountAggregate {
     id: RuleID,
     matchers: Vec<Matcher>,
+    stat_context: StatContext,
 }
 
 impl RuleFoldCountAggregate {
-    pub fn new() -> Self {
+    pub fn new(stat_context: StatContext) -> Self {
         Self {
             id: RuleID::FoldCountAggregate,
+            stat_context,
             //  Aggregate
             //  \
             //   *
@@ -66,7 +70,7 @@ impl Rule for RuleFoldCountAggregate {
         }
 
         let rel_expr = RelExpr::with_s_expr(s_expr);
-        let input_stat_info = rel_expr.derive_cardinality_child(0)?;
+        let input_stat_info = rel_expr.derive_cardinality_child(0, &self.stat_context)?;
 
         let is_simple_count = agg.group_items.is_empty()
             && agg.aggregate_functions.iter().all(|agg| match &agg.scalar {
@@ -83,26 +87,23 @@ impl Rule for RuleFoldCountAggregate {
         ) {
             let mut scalars = agg.aggregate_functions;
             for item in scalars.iter_mut() {
-                if let ScalarExpr::AggregateFunction(agg_func) = item.scalar.clone() {
-                    if agg_func.args.is_empty() {
-                        item.scalar = ScalarExpr::ConstantExpr(ConstantExpr {
-                            span: item.scalar.span(),
-                            value: Scalar::Number(NumberScalar::UInt64(*table_card)),
-                        });
-                    } else if let ScalarExpr::BoundColumnRef(col) = &agg_func.args[0] {
-                        if let Some(card) = column_stats.get(&col.column.index) {
-                            item.scalar = ScalarExpr::ConstantExpr(ConstantExpr {
-                                span: item.scalar.span(),
-                                value: Scalar::Number(NumberScalar::UInt64(
-                                    table_card - card.null_count,
-                                )),
-                            });
-                        } else {
-                            return Ok(());
-                        }
-                    } else {
-                        return Ok(());
-                    }
+                let ScalarExpr::AggregateFunction(agg_func) = item.scalar.clone() else {
+                    return Ok(());
+                };
+                if agg_func.args.is_empty() {
+                    item.scalar = ScalarExpr::ConstantExpr(ConstantExpr {
+                        span: item.scalar.span(),
+                        value: Scalar::Number(NumberScalar::UInt64(*table_card)),
+                    });
+                } else if let ScalarExpr::BoundColumnRef(col) = &agg_func.args[0]
+                    && let Some(card) = column_stats.get(&col.column.index)
+                    && let StatCount::Exact(null_count) = card.null_count()
+                    && let Some(card) = table_card.checked_sub(null_count)
+                {
+                    item.scalar = ScalarExpr::ConstantExpr(ConstantExpr {
+                        span: item.scalar.span(),
+                        value: Scalar::Number(NumberScalar::UInt64(card)),
+                    });
                 } else {
                     return Ok(());
                 }
@@ -126,6 +127,6 @@ impl Rule for RuleFoldCountAggregate {
 
 impl Default for RuleFoldCountAggregate {
     fn default() -> Self {
-        Self::new()
+        Self::new(StatContext::default())
     }
 }

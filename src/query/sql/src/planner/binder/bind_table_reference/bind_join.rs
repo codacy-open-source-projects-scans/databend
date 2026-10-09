@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_recursion::async_recursion;
@@ -24,12 +25,14 @@ use databend_common_ast::ast::split_equivalent_predicate_expr;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
 
 use crate::BindContext;
 use crate::ColumnBinding;
 use crate::ColumnSet;
 use crate::MetadataRef;
-use crate::binder::Finder;
+use crate::Symbol;
+use crate::binder::Any;
 use crate::binder::JoinPredicate;
 use crate::binder::Visibility;
 use crate::binder::reject_grouping_functions;
@@ -46,6 +49,7 @@ use crate::planner::semantic::NameResolutionContext;
 use crate::plans::BoundColumnRef;
 use crate::plans::EvalScalar;
 use crate::plans::Filter;
+use crate::plans::FunctionCall;
 use crate::plans::HashJoinBuildCacheInfo;
 use crate::plans::Join;
 use crate::plans::JoinEquiCondition;
@@ -60,6 +64,8 @@ pub struct JoinConditions {
     pub(crate) non_equi_conditions: Vec<ScalarExpr>,
     pub(crate) other_conditions: Vec<ScalarExpr>,
 }
+
+const ASOF_USING_RANGE_FUNC: &str = "gte";
 
 impl Binder {
     pub(crate) fn bind_join(
@@ -119,6 +125,15 @@ impl Binder {
             &mut right_derived_scalars,
             &mut right_column_bindings,
         );
+        if join.right.is_lateral_subquery()
+            && matches!(join.op, JoinOperator::LeftOuter | JoinOperator::FullOuter)
+        {
+            self.separate_lateral_outer_columns(
+                &left_column_bindings,
+                &mut right_derived_scalars,
+                &mut right_column_bindings,
+            );
+        }
 
         let join_conditions = self.generate_join_condition(
             &mut bind_context,
@@ -152,7 +167,7 @@ impl Binder {
         let build_side_cache_info = self.expression_scan_context.generate_cache_info(cache_idx);
 
         let join_type = join_type(&join.op);
-        let s_expr = self.bind_join_with_type(
+        let (s_expr, replacements) = self.bind_join_with_type(
             join_type,
             join_conditions,
             (left_child, &mut left_context),
@@ -167,6 +182,7 @@ impl Binder {
             left_context.clone(),
             right_context.clone(),
         );
+        replacements.apply(&mut bind_context);
 
         bind_context
             .cte_context
@@ -212,7 +228,7 @@ impl Binder {
         )?;
 
         let join_type = join_type(&join_op);
-        let s_expr = self.bind_join_with_type(
+        let (s_expr, replacements) = self.bind_join_with_type(
             join_type,
             join_conditions,
             (left_child, &mut left_context),
@@ -220,8 +236,9 @@ impl Binder {
             vec![],
             None,
         )?;
-        let bind_context =
+        let mut bind_context =
             join_bind_context(join_type, bind_context, left_context.clone(), right_context);
+        replacements.apply(&mut bind_context);
         Ok((s_expr, bind_context))
     }
 
@@ -276,6 +293,40 @@ impl Binder {
 
             column.index = new_index;
             column.data_type = Box::new(target_type);
+        }
+    }
+
+    /// A lateral subquery may project an outer column directly, e.g. `lateral (select o.k)`,
+    /// and its output binding then reuses the outer column's index. If the column is already
+    /// nullable, `replace_column_binding` keeps the index, so the left and right bindings share
+    /// it and NULL-extending the right side would also change the left column. Give such right
+    /// bindings their own derived column so the two sides never share an index.
+    fn separate_lateral_outer_columns(
+        &mut self,
+        left_column_bindings: &[ColumnBinding],
+        right_derived_scalars: &mut Vec<ScalarItem>,
+        right_column_bindings: &mut [ColumnBinding],
+    ) {
+        let left_indexes = left_column_bindings
+            .iter()
+            .map(|column| column.index)
+            .collect::<HashSet<_>>();
+        for column in right_column_bindings.iter_mut() {
+            if !left_indexes.contains(&column.index) {
+                continue;
+            }
+            let new_index = self
+                .metadata
+                .write()
+                .add_derived_column(column.column_name.clone(), *column.data_type.clone());
+            right_derived_scalars.push(ScalarItem {
+                scalar: ScalarExpr::BoundColumnRef(BoundColumnRef {
+                    span: None,
+                    column: column.clone(),
+                }),
+                index: new_index,
+            });
+            column.index = new_index;
         }
     }
 
@@ -360,14 +411,14 @@ impl Binder {
         (mut right_child, right_context): (SExpr, &mut BindContext),
         mut is_null_equal: Vec<usize>,
         build_side_cache_info: Option<HashJoinBuildCacheInfo>,
-    ) -> Result<SExpr> {
+    ) -> Result<(SExpr, RightColumnReplacements)> {
         match join_type {
             JoinType::Cross if !left_conditions.is_empty() || !right_conditions.is_empty() => {
                 return Err(ErrorCode::SemanticError(
                     "Join conditions should be empty in cross join",
                 ));
             }
-            JoinType::Asof | JoinType::LeftAsof | JoinType::RightAsof
+            JoinType::Asof | JoinType::LeftAsof | JoinType::RightAsof | JoinType::FullAsof
                 if non_equi_conditions.is_empty() =>
             {
                 return Err(ErrorCode::SemanticError("Missing inequality condition!"));
@@ -377,7 +428,7 @@ impl Binder {
 
         let mut other_condition_columns = ColumnSet::new();
         for predicate in other_conditions.iter() {
-            other_condition_columns.extend(predicate.used_columns());
+            predicate.collect_used_columns(&mut other_condition_columns);
         }
 
         self.push_down_other_conditions(
@@ -389,10 +440,35 @@ impl Binder {
         )?;
 
         let right_prop = RelExpr::with_s_expr(&right_child).derive_relational_prop()?;
+        if !right_prop.outer_columns.is_empty()
+            && is_null_equal.is_empty()
+            && build_side_cache_info.is_none()
+            && self.expression_scan_context.used_cache_indexes.is_empty()
+            && let Some(bound) = self.try_bind_lateral_scalar_aggregate(
+                join_type,
+                &left_child,
+                &right_child,
+                right_context,
+                (&left_conditions, &right_conditions),
+                &non_equi_conditions,
+            )?
+        {
+            if !other_condition_columns.is_empty() {
+                self.metadata
+                    .write()
+                    .add_non_lazy_columns(other_condition_columns);
+            }
+            return Ok(bound);
+        }
+
         let mut is_lateral = false;
         if !right_prop.outer_columns.is_empty() {
             // If there are outer columns in right child, then the join is a correlated lateral join
-            let opt_ctx = OptimizerContext::new(self.ctx.clone(), self.metadata.clone());
+            let opt_ctx = OptimizerContext::new(
+                self.ctx.clone(),
+                self.metadata.clone(),
+                self.ctx.get_function_context()?,
+            );
             let mut decorrelator = SubqueryDecorrelatorOptimizer::new(opt_ctx, Some(self.clone()));
             let (flatten_plan, derived_columns) = decorrelator.flatten_plan(
                 &left_child,
@@ -412,11 +488,20 @@ impl Binder {
                 &mut right_conditions,
                 &mut left_conditions,
             )?;
+            // These conditions reconnect the flattened lateral subquery to the outer row. They
+            // are internal correlation keys rather than user-written equality predicates, so
+            // NULL correlation groups must match each other.
             if build_side_cache_info.is_some() {
-                let num_conditions = left_conditions.len();
-                for i in original_num_conditions..num_conditions {
-                    is_null_equal.push(i);
-                }
+                is_null_equal.extend(original_num_conditions..left_conditions.len());
+            } else {
+                is_null_equal.extend(
+                    SubqueryDecorrelatorOptimizer::nullable_condition_indexes(
+                        &left_conditions[original_num_conditions..],
+                        &right_conditions[original_num_conditions..],
+                    )
+                    .into_iter()
+                    .map(|index| index + original_num_conditions),
+                );
             }
             if join_type == JoinType::Cross {
                 join_type = JoinType::Inner;
@@ -446,13 +531,13 @@ impl Binder {
             };
         let mut join_condition_columns = ColumnSet::new();
         for predicate in left_conditions.iter() {
-            join_condition_columns.extend(predicate.used_columns());
+            predicate.collect_used_columns(&mut join_condition_columns);
         }
         for predicate in right_conditions.iter() {
-            join_condition_columns.extend(predicate.used_columns());
+            predicate.collect_used_columns(&mut join_condition_columns);
         }
         for predicate in non_equi_conditions.iter() {
-            join_condition_columns.extend(predicate.used_columns());
+            predicate.collect_used_columns(&mut join_condition_columns);
         }
         join_condition_columns.extend(other_condition_columns);
         if !join_condition_columns.is_empty() {
@@ -475,17 +560,19 @@ impl Binder {
             is_lateral,
             single_to_inner: None,
             build_side_cache_info,
+            spatial_join: None,
         };
 
-        if logical_join.join_type.is_asof_join() {
-            self.rewrite_asof(logical_join, left_child, (right_child, right_context))
+        let s_expr = if logical_join.join_type.is_asof_join() {
+            self.rewrite_asof(logical_join, left_child, (right_child, right_context))?
         } else {
-            Ok(SExpr::create_binary(
+            SExpr::create_binary(
                 Arc::new(logical_join.into()),
                 Arc::new(left_child),
                 Arc::new(right_child),
-            ))
-        }
+            )
+        };
+        Ok((s_expr, RightColumnReplacements::default()))
     }
 
     fn push_down_other_conditions(
@@ -534,7 +621,9 @@ impl Binder {
                         need_push_down = true;
                         left_push_down.push(predicate.clone());
                     }
-                    JoinType::Full => non_equi_conditions.push(predicate.clone()),
+                    JoinType::Full | JoinType::FullAsof => {
+                        non_equi_conditions.push(predicate.clone())
+                    }
                 },
                 JoinPredicate::Left(_) => {
                     need_push_down = true;
@@ -603,7 +692,10 @@ impl Binder {
                     "cross join should not contain join conditions".to_string(),
                 ));
             }
-            JoinOperator::Asof | JoinOperator::LeftAsof | JoinOperator::RightAsof
+            JoinOperator::Asof
+            | JoinOperator::LeftAsof
+            | JoinOperator::RightAsof
+            | JoinOperator::FullAsof
                 if join_condition == &JoinCondition::None =>
             {
                 return Err(ErrorCode::SemanticError(
@@ -727,6 +819,7 @@ impl<'a> JoinConditionResolver<'a> {
                     using_columns,
                     left_join_conditions,
                     right_join_conditions,
+                    non_equi_conditions,
                     join_op,
                 )?;
             }
@@ -741,6 +834,7 @@ impl<'a> JoinConditionResolver<'a> {
                     using_columns,
                     left_join_conditions,
                     right_join_conditions,
+                    non_equi_conditions,
                     join_op,
                 )?
             }
@@ -773,9 +867,9 @@ impl<'a> JoinConditionResolver<'a> {
             )
         };
         for scalar in scalars {
-            let mut finder = Finder::new(&f);
-            finder.visit(scalar)?;
-            if !finder.scalars().is_empty() {
+            let mut any = Any::new(&f);
+            any.visit(scalar)?;
+            if any.result() {
                 return Err(ErrorCode::SemanticError(
                     "Join condition can't contain aggregate or window functions".to_string(),
                 )
@@ -902,6 +996,7 @@ impl<'a> JoinConditionResolver<'a> {
         using_columns: Vec<(Span, String)>,
         left_join_conditions: &mut Vec<ScalarExpr>,
         right_join_conditions: &mut Vec<ScalarExpr>,
+        non_equi_conditions: &mut Vec<ScalarExpr>,
         join_op: &JoinOperator,
     ) -> Result<()> {
         bind_join_columns(
@@ -910,7 +1005,18 @@ impl<'a> JoinConditionResolver<'a> {
             self.join_context,
         );
         let left_columns_len = self.left_column_bindings.len();
-        for (span, join_key) in using_columns.iter() {
+        let asof_range_column = if matches!(
+            join_op,
+            JoinOperator::Asof
+                | JoinOperator::LeftAsof
+                | JoinOperator::RightAsof
+                | JoinOperator::FullAsof
+        ) {
+            using_columns.len().checked_sub(1)
+        } else {
+            None
+        };
+        for (index, (span, join_key)) in using_columns.iter().enumerate() {
             let join_key_name = join_key.as_str();
             let left_scalar = if let Some(col_binding) = self.join_context.columns
                 [0..left_columns_len]
@@ -945,7 +1051,8 @@ impl<'a> JoinConditionResolver<'a> {
                 ))
                 .set_span(*span));
             };
-            let idx = !matches!(join_op, JoinOperator::RightOuter) as usize;
+            let idx =
+                !matches!(join_op, JoinOperator::RightOuter | JoinOperator::RightAsof) as usize;
             if let Some(col_binding) = self
                 .join_context
                 .columns
@@ -956,16 +1063,30 @@ impl<'a> JoinConditionResolver<'a> {
                 })
                 .nth(idx)
             {
-                // Always make the second using column in the join_context invisible in unqualified wildcard.
+                // Make the duplicate USING column invisible in unqualified wildcard.
                 col_binding.visibility = Visibility::UnqualifiedWildcardInVisible;
             }
 
-            self.add_equi_conditions(
-                left_scalar,
-                right_scalar,
-                left_join_conditions,
-                right_join_conditions,
-            )?;
+            if Some(index) == asof_range_column {
+                let return_type = ScalarExpr::passthrough_nullable_type(DataType::Boolean, [
+                    &left_scalar,
+                    &right_scalar,
+                ]);
+                non_equi_conditions.push(ScalarExpr::FunctionCall(FunctionCall {
+                    span: *span,
+                    func_name: ASOF_USING_RANGE_FUNC.to_string(),
+                    params: vec![],
+                    arguments: vec![left_scalar, right_scalar],
+                    return_type: Box::new(return_type),
+                }));
+            } else {
+                self.add_equi_conditions(
+                    left_scalar,
+                    right_scalar,
+                    left_join_conditions,
+                    right_join_conditions,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1092,9 +1213,39 @@ fn join_type(join_type: &JoinOperator) -> JoinType {
         JoinOperator::Asof => JoinType::Asof,
         JoinOperator::LeftAsof => JoinType::LeftAsof,
         JoinOperator::RightAsof => JoinType::RightAsof,
+        JoinOperator::FullAsof => JoinType::FullAsof,
         JoinOperator::LeftAny => JoinType::LeftAny,
         JoinOperator::RightAny => JoinType::RightAny,
         JoinOperator::InnerAny => JoinType::InnerAny,
+    }
+}
+
+/// Right side column bindings replaced by `bind_join_with_type`.
+///
+/// A LEFT lateral join over a scalar aggregate NULL-extends its right side columns into new
+/// columns (see `try_bind_lateral_scalar_aggregate`). Bind contexts built from the right side
+/// bindings before the call, such as the join output context, must apply the replacements.
+/// Replacements are matched by column index, which is only safe because the right side
+/// columns of a LEFT lateral join never share an index with a left column: `bind_join`
+/// separates them (see `separate_lateral_outer_columns`), and the rewrite bails out otherwise.
+#[must_use]
+#[derive(Default)]
+pub(crate) struct RightColumnReplacements(pub(crate) Vec<(Symbol, ColumnBinding)>);
+
+impl RightColumnReplacements {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn apply(&self, bind_context: &mut BindContext) {
+        for (old_index, column) in self.0.iter() {
+            for binding in bind_context.columns.iter_mut() {
+                if binding.index == *old_index {
+                    binding.index = column.index;
+                    binding.data_type = column.data_type.clone();
+                }
+            }
+        }
     }
 }
 

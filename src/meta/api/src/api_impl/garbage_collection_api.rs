@@ -38,8 +38,12 @@ use databend_common_meta_app::schema::DroppedId;
 use databend_common_meta_app::schema::GcDroppedTableReq;
 use databend_common_meta_app::schema::IndexNameIdent;
 use databend_common_meta_app::schema::ListIndexesReq;
+use databend_common_meta_app::schema::MVDefinitionIdent;
+use databend_common_meta_app::schema::MVSourceBindingVersionIdent;
 use databend_common_meta_app::schema::ObjectTagIdRef;
 use databend_common_meta_app::schema::ObjectTagIdRefIdent;
+use databend_common_meta_app::schema::SourceTableMV;
+use databend_common_meta_app::schema::SourceTableMVIdent;
 use databend_common_meta_app::schema::TableCopiedFileNameIdent;
 use databend_common_meta_app::schema::TableId;
 use databend_common_meta_app::schema::TableIdHistoryIdent;
@@ -51,13 +55,14 @@ use databend_common_meta_app::schema::TaggableObject;
 use databend_common_meta_app::schema::VacuumWatermark;
 use databend_common_meta_app::schema::index_id_ident::IndexIdIdent;
 use databend_common_meta_app::schema::index_id_to_name_ident::IndexIdToNameIdent;
+use databend_common_meta_app::schema::is_materialized_view_engine;
 use databend_common_meta_app::schema::table_niv::TableNIV;
 use databend_common_meta_app::schema::vacuum_watermark_ident::VacuumWatermarkIdent;
 use databend_common_meta_app::tenant::Tenant;
 use databend_meta_client::kvapi;
 use databend_meta_client::kvapi::DirName;
-use databend_meta_client::kvapi::Key;
 use databend_meta_client::kvapi::ListOptions;
+use databend_meta_client::kvapi::StructKey;
 use databend_meta_client::types::MetaError;
 use databend_meta_client::types::SeqV;
 use databend_meta_client::types::TxnRequest;
@@ -72,6 +77,7 @@ use log::error;
 use log::info;
 use log::warn;
 
+use super::data_retention_util::is_drop_time_retainable;
 use super::index_api::IndexApi;
 use crate::kv_app_error::KVAppError;
 use crate::kv_pb_api::KVPbApi;
@@ -171,6 +177,14 @@ where
 
 pub const ORPHAN_POSTFIX: &str = "orphan";
 
+/// Returns true if `table_name` is the history name of a CTAS staging table,
+/// i.e. `orphan@<ts>`, created by `create_table` with `as_dropped = true`.
+fn is_orphan_table_name(table_name: &str) -> bool {
+    table_name
+        .strip_prefix(ORPHAN_POSTFIX)
+        .is_some_and(|rest| rest.starts_with('@'))
+}
+
 /// Remove copied files for a dropped table.
 ///
 /// Dropped table can not be accessed by any query,
@@ -248,6 +262,10 @@ async fn remove_copied_files_for_dropped_table(
 /// Lists all dropped and non-dropped tables belonging to a Database,
 /// returns those tables that are eligible for garbage collection,
 /// i.e., whose dropped time is in the specified range.
+///
+/// CTAS staging tables (`orphan@<ts>`) whose `drop_on` is within the default
+/// retention period are always skipped, to protect an in-progress CTAS from
+/// being vacuumed concurrently.
 #[logcall::logcall(input = "")]
 #[fastrace::trace]
 pub async fn get_history_tables_for_gc(
@@ -302,6 +320,7 @@ pub async fn get_history_tables_for_gc(
     let mut filter_tb_infos = vec![];
     const BATCH_SIZE: usize = 1000;
 
+    let now = Utc::now();
     let args_len = args.len();
     let mut num_out_of_time_range = 0;
     let mut num_processed = 0;
@@ -357,6 +376,23 @@ pub async fn get_history_tables_for_gc(
 
                 if !drop_time_range.contains(time_point) {
                     debug!("table {:?} is not in drop_time_range", seq_meta.data);
+                    num_out_of_time_range += 1;
+                    continue;
+                }
+
+                // A CTAS staging table (`orphan@<ts>`) is created with `drop_on = now` and is
+                // only turned into a visible table by `commit_table_meta` after all data is
+                // written. A vacuum with a short retention (e.g. 0 days) must not collect it
+                // while the CTAS may still be running, otherwise the files written afterward
+                // are left without any metadata. Keep such tables for at least the default
+                // retention period, regardless of the requested retention.
+                if is_orphan_table_name(table_name)
+                    && is_drop_time_retainable(seq_meta.drop_on, now)
+                {
+                    info!(
+                        "get_history_tables_for_gc: skip CTAS staging table {} {:?}, drop_on {:?} is within the minimum retention period",
+                        table_name, table_id, seq_meta.drop_on
+                    );
                     num_out_of_time_range += 1;
                     continue;
                 }
@@ -559,7 +595,7 @@ async fn gc_dropped_db_by_id(
     } else {
         // save new db id list
         txn.if_then
-            .push(txn_put_pb(&db_id_history_ident, &db_id_list)?);
+            .push(txn_put_pb(&db_id_history_ident, &db_id_list));
     }
 
     // Verify database_meta hasn't changed since the mark database meta as gc_in_progress phase.
@@ -722,7 +758,7 @@ async fn update_txn_to_remove_table_history(
     } else {
         // save new table id list
         txn.if_then
-            .push(txn_put_pb_with_ttl(table_id_history_ident, &history, None)?);
+            .push(txn_put_pb_with_ttl(table_id_history_ident, &history, None));
     }
 
     Ok(())
@@ -772,6 +808,45 @@ async fn remove_data_for_dropped_table(
     //     warn!("{}", err);
     //     return Ok(Err(err));
     // }
+    // DROP TABLE normally deletes the MV definition. Database GC may collect
+    // tables without first running the per-table DROP path, so keep this
+    // deletion idempotent here as well.
+    if is_materialized_view_engine(&seq_meta.data.engine) {
+        txn.if_then
+            .push(txn_del(&MVDefinitionIdent::new(tenant, table_id.table_id)));
+        match seq_meta.data.materialized_view_source_table_id() {
+            Ok(source_table_id) => {
+                txn.if_then.push(txn_del(&SourceTableMVIdent::new_generic(
+                    tenant,
+                    SourceTableMV::new(source_table_id, table_id.table_id),
+                )));
+            }
+            Err(err) => {
+                warn!(
+                    table_id = table_id.table_id,
+                    error :% = err;
+                    "GC materialized view can not remove its source relationship"
+                );
+            }
+        }
+    }
+
+    let source_mv_prefix = DirName::new(SourceTableMVIdent::new_generic(
+        tenant,
+        SourceTableMV::new(table_id.table_id, 0),
+    ));
+    let source_mvs = kv_api
+        .list_pb_vec(ListOptions::unlimited(&source_mv_prefix))
+        .await?;
+    // The source table or its database is already dropped, so no new MV can
+    // reference it. Concurrent relationship deletions are idempotent.
+    txn.if_then
+        .extend(source_mvs.into_iter().map(|(ident, _)| txn_del(&ident)));
+    txn.if_then.push(txn_del(&MVSourceBindingVersionIdent::new(
+        tenant,
+        table_id.table_id,
+    )));
+
     txn_delete_exact(txn, table_id, seq_meta.seq);
 
     // Get id -> name mapping

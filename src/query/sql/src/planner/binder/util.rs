@@ -71,6 +71,7 @@ impl Binder {
             | RelOperator::Limit(_)
             | RelOperator::Aggregate(_)
             | RelOperator::Window(_)
+            | RelOperator::WindowGroup(_)
             | RelOperator::Mutation(_)
             | RelOperator::MutationSource(_)
             | RelOperator::CompactBlock(_) => {
@@ -228,7 +229,7 @@ impl TableIdentifier {
                     Some(NameResolutionSuggest::Unquoted) => {
                         format!(
                             "Unknown database {catalog}.{database} (quoted). Did you mean {} (unquoted)?",
-                            &database.name
+                            database.name
                         )
                     }
                     None => format!("Unknown database {catalog}.{database} ."),
@@ -246,7 +247,7 @@ impl TableIdentifier {
                     Some(NameResolutionSuggest::Unquoted) => {
                         format!(
                             "Unknown table {catalog}.{database}.{table} (quoted). Did you mean {} (unquoted)?",
-                            &table.name
+                            table.name
                         )
                     }
                     None => format!("Unknown table {catalog}.{database}.{table} ."),

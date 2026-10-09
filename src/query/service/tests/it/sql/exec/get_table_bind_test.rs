@@ -52,11 +52,9 @@ use databend_common_expression::FunctionContext;
 use databend_common_expression::Scalar;
 use databend_common_io::prelude::InputFormatSettings;
 use databend_common_io::prelude::OutputFormatSettings;
-use databend_common_meta_app::principal::FileFormatParams;
 use databend_common_meta_app::principal::GrantObject;
 use databend_common_meta_app::principal::RoleInfo;
 use databend_common_meta_app::principal::UDTFServer;
-use databend_common_meta_app::principal::UserDefinedConnection;
 use databend_common_meta_app::principal::UserInfo;
 use databend_common_meta_app::principal::UserPrivilegeType;
 use databend_common_meta_app::schema::CatalogInfo;
@@ -66,8 +64,6 @@ use databend_common_meta_app::schema::CreateDatabaseReply;
 use databend_common_meta_app::schema::CreateDatabaseReq;
 use databend_common_meta_app::schema::CreateDictionaryReply;
 use databend_common_meta_app::schema::CreateDictionaryReq;
-use databend_common_meta_app::schema::CreateIndexReply;
-use databend_common_meta_app::schema::CreateIndexReq;
 use databend_common_meta_app::schema::CreateLockRevReply;
 use databend_common_meta_app::schema::CreateLockRevReq;
 use databend_common_meta_app::schema::CreateSequenceReply;
@@ -79,7 +75,6 @@ use databend_common_meta_app::schema::DeleteLockRevReq;
 use databend_common_meta_app::schema::DictionaryMeta;
 use databend_common_meta_app::schema::DropDatabaseReply;
 use databend_common_meta_app::schema::DropDatabaseReq;
-use databend_common_meta_app::schema::DropIndexReq;
 use databend_common_meta_app::schema::DropSequenceReply;
 use databend_common_meta_app::schema::DropSequenceReq;
 use databend_common_meta_app::schema::DropTableByIdReq;
@@ -89,24 +84,20 @@ use databend_common_meta_app::schema::ExtendLockRevReq;
 use databend_common_meta_app::schema::GetAutoIncrementNextValueReply;
 use databend_common_meta_app::schema::GetAutoIncrementNextValueReq;
 use databend_common_meta_app::schema::GetDictionaryReply;
-use databend_common_meta_app::schema::GetIndexReply;
-use databend_common_meta_app::schema::GetIndexReq;
 use databend_common_meta_app::schema::GetSequenceNextValueReply;
 use databend_common_meta_app::schema::GetSequenceNextValueReq;
 use databend_common_meta_app::schema::GetSequenceReply;
 use databend_common_meta_app::schema::GetSequenceReq;
 use databend_common_meta_app::schema::GetTableCopiedFileReply;
 use databend_common_meta_app::schema::GetTableCopiedFileReq;
-use databend_common_meta_app::schema::IndexMeta;
 use databend_common_meta_app::schema::ListDictionaryReq;
-use databend_common_meta_app::schema::ListIndexesByIdReq;
-use databend_common_meta_app::schema::ListIndexesReq;
 use databend_common_meta_app::schema::ListLockRevReq;
 use databend_common_meta_app::schema::ListLocksReq;
 use databend_common_meta_app::schema::ListSequencesReply;
 use databend_common_meta_app::schema::ListSequencesReq;
 use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockMeta;
+use databend_common_meta_app::schema::MVDefinition;
 use databend_common_meta_app::schema::RenameDatabaseReply;
 use databend_common_meta_app::schema::RenameDatabaseReq;
 use databend_common_meta_app::schema::RenameDictionaryReq;
@@ -125,10 +116,6 @@ use databend_common_meta_app::schema::TruncateTableReq;
 use databend_common_meta_app::schema::UndropDatabaseReply;
 use databend_common_meta_app::schema::UndropDatabaseReq;
 use databend_common_meta_app::schema::UndropTableReq;
-use databend_common_meta_app::schema::UpdateDictionaryReply;
-use databend_common_meta_app::schema::UpdateDictionaryReq;
-use databend_common_meta_app::schema::UpdateIndexReply;
-use databend_common_meta_app::schema::UpdateIndexReq;
 use databend_common_meta_app::schema::UpsertTableOptionReply;
 use databend_common_meta_app::schema::UpsertTableOptionReq;
 use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
@@ -145,6 +132,7 @@ use databend_common_users::GrantObjectVisibilityChecker;
 use databend_common_users::Object;
 use databend_meta_client::types::MetaId;
 use databend_meta_client::types::SeqV;
+use databend_query::interpreters::InterpreterFactory;
 use databend_query::sessions::BuildInfoRef;
 use databend_query::sessions::QueryContext;
 use databend_query::test_kits::*;
@@ -362,44 +350,6 @@ impl Catalog for FakedCatalog {
         todo!()
     }
 
-    #[async_backtrace::framed]
-    async fn create_index(&self, _req: CreateIndexReq) -> Result<CreateIndexReply> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn drop_index(&self, _req: DropIndexReq) -> Result<()> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn get_index(&self, _req: GetIndexReq) -> Result<GetIndexReply> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn update_index(&self, _req: UpdateIndexReq) -> Result<UpdateIndexReply> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn list_indexes(&self, _req: ListIndexesReq) -> Result<Vec<(u64, String, IndexMeta)>> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn list_index_ids_by_table_id(&self, _req: ListIndexesByIdReq) -> Result<Vec<u64>> {
-        unimplemented!()
-    }
-
-    #[async_backtrace::framed]
-    async fn list_indexes_by_table_id(
-        &self,
-        _req: ListIndexesByIdReq,
-    ) -> Result<Vec<(u64, String, IndexMeta)>> {
-        unimplemented!()
-    }
-
     fn as_any(&self) -> &dyn Any {
         todo!()
     }
@@ -430,7 +380,7 @@ impl Catalog for FakedCatalog {
     async fn get_sequence(
         &self,
         _req: GetSequenceReq,
-        _visibility_checker: &Option<GrantObjectVisibilityChecker>,
+        _visibility_checker: &Option<Arc<GrantObjectVisibilityChecker>>,
     ) -> Result<GetSequenceReply> {
         unimplemented!()
     }
@@ -442,7 +392,7 @@ impl Catalog for FakedCatalog {
     async fn get_sequence_next_value(
         &self,
         _req: GetSequenceNextValueReq,
-        _visibility_checker: &Option<GrantObjectVisibilityChecker>,
+        _visibility_checker: &Option<Arc<GrantObjectVisibilityChecker>>,
     ) -> Result<GetSequenceNextValueReply> {
         unimplemented!()
     }
@@ -455,11 +405,36 @@ impl Catalog for FakedCatalog {
         self.cat.get_table_meta_by_id(table_id).await
     }
 
-    async fn create_dictionary(&self, _req: CreateDictionaryReq) -> Result<CreateDictionaryReply> {
-        todo!()
+    async fn get_mv_definition(
+        &self,
+        tenant: &Tenant,
+        mv_id: u64,
+    ) -> Result<Option<SeqV<MVDefinition>>> {
+        self.cat.get_mv_definition(tenant, mv_id).await
     }
 
-    async fn update_dictionary(&self, _req: UpdateDictionaryReq) -> Result<UpdateDictionaryReply> {
+    async fn get_active_mv_definition(
+        &self,
+        tenant: &Tenant,
+        source_table_id: u64,
+        mv_table_id: u64,
+    ) -> Result<Option<SeqV<MVDefinition>>> {
+        self.cat
+            .get_active_mv_definition(tenant, source_table_id, mv_table_id)
+            .await
+    }
+
+    async fn get_mv_current_source_generation(
+        &self,
+        tenant: &Tenant,
+        source_table_id: u64,
+    ) -> Result<Option<u64>> {
+        self.cat
+            .get_mv_current_source_generation(tenant, source_table_id)
+            .await
+    }
+
+    async fn create_dictionary(&self, _req: CreateDictionaryReq) -> Result<CreateDictionaryReply> {
         todo!()
     }
 
@@ -553,10 +528,6 @@ impl TableContext for CtxDelegation {
         self.ctx.written_segment_locations()
     }
 
-    fn selected_segment_locations(&self) -> &SegmentLocationsState {
-        self.ctx.selected_segment_locations()
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -573,6 +544,10 @@ impl TableContextQueryState for CtxDelegation {
 
     fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         todo!()
+    }
+
+    fn get_nodes_memory_usage(&self) -> usize {
+        self.ctx.get_nodes_memory_usage()
     }
 
     fn push_warning(&self, _warn: String) {
@@ -727,7 +702,7 @@ impl TableContextAuthorization for CtxDelegation {
     }
 
     fn get_current_role(&self) -> Option<RoleInfo> {
-        todo!()
+        None
     }
 
     fn get_secondary_roles(&self) -> Option<Vec<String>> {
@@ -755,7 +730,11 @@ impl TableContextAuthorization for CtxDelegation {
         &self,
         _ignore_ownership: bool,
         _object: Object,
-    ) -> Result<GrantObjectVisibilityChecker> {
+    ) -> Result<Arc<GrantObjectVisibilityChecker>> {
+        todo!()
+    }
+
+    async fn get_db_table_grant_checker(&self) -> Result<GrantObjectVisibilityChecker> {
         todo!()
     }
 }
@@ -868,17 +847,8 @@ impl TableContextCopy for CtxDelegation {
     }
 }
 
-#[async_trait::async_trait]
 impl TableContextStage for CtxDelegation {
     fn get_stage_attachment(&self) -> Option<StageAttachment> {
-        todo!()
-    }
-
-    async fn get_file_format(&self, _name: &str) -> Result<FileFormatParams> {
-        todo!()
-    }
-
-    async fn get_connection(&self, _name: &str) -> Result<UserDefinedConnection> {
         todo!()
     }
 }
@@ -971,6 +941,15 @@ impl TableContextTableAccess for CtxDelegation {
         todo!()
     }
 
+    async fn acquire_table_lock_by_id(
+        self: Arc<Self>,
+        _catalog_name: &str,
+        _table_id: u64,
+        _lock_opt: &LockTableOption,
+    ) -> Result<Option<Arc<LockGuard>>> {
+        todo!()
+    }
+
     fn get_temp_table_prefix(&self) -> Result<String> {
         todo!()
     }
@@ -1048,14 +1027,6 @@ impl TableContextPartitionStats for CtxDelegation {
         todo!()
     }
 
-    fn get_can_scan_from_agg_index(&self) -> bool {
-        self.ctx.get_can_scan_from_agg_index()
-    }
-
-    fn set_can_scan_from_agg_index(&self, _enable: bool) {
-        todo!()
-    }
-
     fn get_enable_sort_spill(&self) -> bool {
         todo!()
     }
@@ -1078,10 +1049,6 @@ impl TableContextRuntimeFilter for CtxDelegation {
         todo!()
     }
 
-    fn assert_no_runtime_filter_state(&self) -> Result<()> {
-        Ok(())
-    }
-
     fn get_runtime_filters(&self, _id: usize) -> Vec<RuntimeFilterEntry> {
         Vec::<RuntimeFilterEntry>::new()
     }
@@ -1090,7 +1057,10 @@ impl TableContextRuntimeFilter for CtxDelegation {
         HashMap::new()
     }
 
-    fn get_bloom_runtime_filter_with_id(&self, _id: usize) -> Vec<(String, RuntimeBloomFilter)> {
+    fn get_bloom_runtime_filter_with_id(
+        &self,
+        _id: usize,
+    ) -> Vec<(Expr<String>, RuntimeBloomFilter)> {
         todo!()
     }
 
@@ -1132,6 +1102,72 @@ impl TableContextVariables for CtxDelegation {
     fn get_all_variables(&self) -> HashMap<String, Scalar> {
         HashMap::new()
     }
+}
+
+// Split binding and execution explicitly instead of relying on concurrent task
+// timing. A different context commits a DDL in between; the old plan must not
+// borrow that DDL's newer metadata sequence to commit its stale schema/expressions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_schema_bound_ddl_preserves_table_version() -> Result<()> {
+    let fixture = TestFixture::setup().await?;
+    // One representative case for each schema-bound ALTER interpreter.
+    let cases = [
+        ("SET TTL ts", "DROP COLUMN ts"),
+        ("CLUSTER BY (ts)", "DROP COLUMN ts"),
+        ("RENAME COLUMN ts TO renamed_ts", "ADD COLUMN extra INT"),
+        ("ADD COLUMN added INT", "ADD COLUMN extra INT"),
+        ("MODIFY COLUMN ts DATE", "ADD COLUMN extra INT"),
+    ];
+
+    for (i, (pending, concurrent)) in cases.iter().enumerate() {
+        let name = format!("ddl_table_version_{i}");
+        fixture
+            .execute_command(&format!(
+                "CREATE TABLE default.{name} (id INT, ts TIMESTAMP)"
+            ))
+            .await?;
+
+        let ctx = fixture.new_query_ctx().await?;
+        // Exercise optimistic concurrency without a binder-held table lock.
+        ctx.get_settings()
+            .set_setting("enable_table_lock".to_string(), "0".to_string())?;
+        let (plan, _) = Planner::new(ctx.clone())
+            .plan_sql(&format!("ALTER TABLE default.{name} {pending}"))
+            .await?;
+        let bound_table = ctx.get_table("default", "default", &name).await?;
+
+        fixture
+            .execute_command(&format!("ALTER TABLE default.{name} {concurrent}"))
+            .await?;
+        let catalog = ctx.get_catalog("default").await?;
+        let current = catalog
+            .get_table(&fixture.default_tenant(), "default", &name)
+            .await?;
+        assert_ne!(
+            bound_table.get_table_info().ident.seq,
+            current.get_table_info().ident.seq
+        );
+
+        let interpreter = InterpreterFactory::get(ctx.clone(), &plan).await?;
+        let err = match interpreter.execute2().await {
+            Ok(_) => panic!("stale ALTER {pending} succeeded after ALTER {concurrent}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::TABLE_VERSION_MISMATCHED,
+            "{pending}: {err}"
+        );
+
+        // A failed stale DDL must preserve the concurrent DDL's entire metadata,
+        // not just reject the TTL string or leave unrelated schema fields intact.
+        let after = catalog
+            .get_table(&fixture.default_tenant(), "default", &name)
+            .await?;
+        assert_eq!(current.get_table_info().ident, after.get_table_info().ident);
+        assert_eq!(current.get_table_info().meta, after.get_table_info().meta);
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

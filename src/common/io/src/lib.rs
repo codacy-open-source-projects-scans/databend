@@ -16,11 +16,8 @@
 #![allow(clippy::ptr_arg)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(internal_features)]
-#![feature(can_vector)]
-#![feature(read_buf)]
 #![feature(slice_internals)]
 #![feature(cursor_split)]
-#![feature(buf_read_has_data_left)]
 
 pub mod constants;
 pub mod datetime;
@@ -53,6 +50,11 @@ pub use bitmap::HYBRID_MAGIC;
 pub use bitmap::HYBRID_VERSION;
 pub use bitmap::HybridBitmap;
 pub use bitmap::LARGE_THRESHOLD;
+pub use bitmap::bitmap_contains;
+pub use bitmap::bitmap_has_all;
+pub use bitmap::bitmap_has_any;
+pub use bitmap::bitmap_max;
+pub use bitmap::bitmap_min;
 pub use bitmap::deserialize_bitmap;
 pub use bitmap::parse_bitmap;
 pub use decimal::display_decimal_128;
@@ -64,8 +66,12 @@ pub use escape::escape_string_with_quote;
 pub use geography::GEOGRAPHY_SRID;
 pub use geography::geography_format;
 pub use geometry::Axis;
+pub use geometry::Bbox;
+pub use geometry::EwkbBbox;
 pub use geometry::Extremum;
 pub use geometry::GeometryDataType;
+pub use geometry::UNKNOWN_SRID;
+pub use geometry::ewkb_to_bbox;
 pub use geometry::ewkb_to_geo;
 pub use geometry::geo_to_ewkb;
 pub use geometry::geo_to_ewkt;
@@ -76,5 +82,4 @@ pub use geometry::geometry_format;
 pub use geometry::geometry_from_ewkt;
 pub use geometry::geometry_type_name;
 pub use geometry::parse_bytes_to_ewkb;
-pub use geometry::read_srid;
 pub use interval::Interval;

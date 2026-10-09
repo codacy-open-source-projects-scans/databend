@@ -85,6 +85,7 @@ async fn apply_block_pruning(
         dal,
         schema,
         push_down,
+        None,
         bloom_index_cols,
         vec![],
         HashSet::new(),
@@ -150,8 +151,10 @@ async fn test_block_pruner() -> anyhow::Result<()> {
         ]
         .into(),
         field_comments: vec![],
+        field_stats_truncate_len: vec![],
         as_select: None,
         cluster_key: None,
+        ttl: None,
         table_indexes: Some(table_indexes),
         table_constraints: None,
         attached_columns: None,

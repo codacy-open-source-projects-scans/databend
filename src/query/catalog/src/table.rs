@@ -41,12 +41,12 @@ use databend_common_statistics::Histogram;
 use databend_common_storage::StorageMetrics;
 use databend_meta_client::types::MetaId;
 use databend_storages_common_table_meta::meta::ClusterKey;
+use databend_storages_common_table_meta::meta::ColumnCountMinSketch;
+use databend_storages_common_table_meta::meta::ColumnTopN;
 use databend_storages_common_table_meta::meta::SnapshotId;
 use databend_storages_common_table_meta::meta::TableMetaTimestamps;
 use databend_storages_common_table_meta::meta::TableSnapshot;
 use databend_storages_common_table_meta::table::ChangeType;
-use databend_storages_common_table_meta::table::ClusterType;
-use databend_storages_common_table_meta::table::OPT_KEY_CLUSTER_TYPE;
 use databend_storages_common_table_meta::table::OPT_KEY_TEMP_PREFIX;
 use databend_storages_common_table_meta::table_id_ranges::is_temp_table_id;
 
@@ -55,11 +55,16 @@ use crate::plan::DataSourcePlan;
 use crate::plan::PartStatistics;
 use crate::plan::Partitions;
 use crate::plan::PushDownInfo;
-use crate::plan::ReclusterParts;
 use crate::plan::StreamColumn;
 use crate::statistics::BasicColumnStatistics;
 use crate::table_args::TableArgs;
 use crate::table_context::TableContext;
+
+// Opaque engine-specific pruning payload that can be carried between
+// read_partitions calls. Proxy only forwards this handle across routing; the
+// engine that produced it is responsible for downcasting and validating the
+// concrete type before reuse.
+pub type ReusablePrunedMetas = Arc<dyn Any + Send + Sync>;
 
 #[async_trait::async_trait]
 pub trait Table: Sync + Send {
@@ -104,6 +109,15 @@ pub trait Table: Sync + Send {
 
     fn get_table_info(&self) -> &TableInfo;
 
+    /// Returns the source table whose data columns a stream exposes.
+    ///
+    /// Lineage intentionally passes through a stream to its source table.
+    /// Views are lineage boundaries and must not use this relation-level hook;
+    /// their output columns are annotated separately by the planner.
+    fn stream_source_table_info(&self) -> Option<&TableInfo> {
+        None
+    }
+
     fn get_data_source_info(&self) -> DataSourceInfo {
         DataSourceInfo::TableSource(self.get_table_info().clone())
     }
@@ -129,16 +143,6 @@ pub trait Table: Sync + Send {
 
     fn cluster_key_meta(&self) -> Option<ClusterKey> {
         None
-    }
-
-    fn cluster_type(&self) -> Option<ClusterType> {
-        self.cluster_key_meta()?;
-        let cluster_type = self
-            .options()
-            .get(OPT_KEY_CLUSTER_TYPE)
-            .and_then(|s| s.parse::<ClusterType>().ok())
-            .unwrap_or(ClusterType::Linear);
-        Some(cluster_type)
     }
 
     fn resolve_cluster_keys(&self) -> Option<Vec<Expr>> {
@@ -195,11 +199,6 @@ pub trait Table: Sync + Send {
         false
     }
 
-    /// Whether the table engine supports virtual columns optimization.
-    fn support_virtual_columns(&self) -> bool {
-        false
-    }
-
     fn storage_format_as_parquet(&self) -> bool {
         false
     }
@@ -219,6 +218,18 @@ pub trait Table: Sync + Send {
             self.name(),
             self.get_table_info().meta.engine
         )))
+    }
+
+    #[async_backtrace::framed]
+    async fn read_partitions_with_reusable_pruned_metas(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        push_downs: Option<PushDownInfo>,
+        dry_run: bool,
+        _reusable_pruned_metas: Option<ReusablePrunedMetas>,
+    ) -> Result<(PartStatistics, Partitions, Option<ReusablePrunedMetas>)> {
+        let (statistics, partitions) = self.read_partitions(ctx, push_downs, dry_run).await?;
+        Ok((statistics, partitions, None))
     }
 
     fn table_args(&self) -> Option<TableArgs> {
@@ -299,19 +310,6 @@ pub trait Table: Sync + Send {
         Ok(())
     }
 
-    #[async_backtrace::framed]
-    async fn purge(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        instant: Option<NavigationPoint>,
-        num_snapshot_limit: Option<usize>,
-        dry_run: bool,
-    ) -> Result<Option<Vec<String>>> {
-        let (_, _, _, _) = (ctx, instant, num_snapshot_limit, dry_run);
-
-        Ok(None)
-    }
-
     async fn table_statistics(
         &self,
         ctx: Arc<dyn TableContext>,
@@ -385,9 +383,10 @@ pub trait Table: Sync + Send {
     async fn compact_segments(
         &self,
         ctx: Arc<dyn TableContext>,
+        pipeline: &mut Pipeline,
         limit: Option<usize>,
     ) -> Result<()> {
-        let (_, _) = (ctx, limit);
+        let (_, _, _) = (ctx, pipeline, limit);
 
         Err(ErrorCode::Unimplemented(format!(
             "The operation 'compact_segments' is not supported for the table '{}', which is using the '{}' engine.",
@@ -406,23 +405,6 @@ pub trait Table: Sync + Send {
 
         Err(ErrorCode::Unimplemented(format!(
             "The 'compact_blocks' operation is not supported for the table '{}'. Table engine: '{}'.",
-            self.name(),
-            self.get_table_info().engine(),
-        )))
-    }
-
-    // return the selected block num.
-    #[async_backtrace::framed]
-    async fn recluster(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        push_downs: Option<PushDownInfo>,
-        limit: Option<usize>,
-    ) -> Result<Option<(ReclusterParts, Arc<TableSnapshot>)>> {
-        let (_, _, _) = (ctx, push_downs, limit);
-
-        Err(ErrorCode::Unimplemented(format!(
-            "The 'recluster' operation is not supported for the table '{}'. Table engine: '{}'.",
             self.name(),
             self.get_table_info().engine(),
         )))
@@ -451,12 +433,21 @@ pub trait Table: Sync + Send {
         false
     }
 
+    fn plan_can_be_cached(&self) -> bool {
+        true
+    }
+
     fn broadcast_truncate_to_warehouse(&self) -> bool {
         false
     }
 
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// Whether physical maintenance is forbidden (for example, on shared or attached data).
+    fn is_read_only_for_maintenance(&self) -> bool {
+        self.is_read_only()
     }
 
     fn is_temp(&self) -> bool {
@@ -467,15 +458,16 @@ pub trait Table: Sync + Send {
         self.engine() == "STREAM"
     }
 
+    /// Whether this table instance represents a CHANGE_TRACKING data source.
+    fn has_changes_source(&self) -> bool {
+        false
+    }
+
     fn use_own_sample_block(&self) -> bool {
         false
     }
 
-    async fn remove_aggregating_index_files(
-        &self,
-        _ctx: Arc<dyn TableContext>,
-        _index_id: u64,
-    ) -> Result<u64> {
+    async fn remove_aggregating_index_files(&self, _ctx: Arc<dyn TableContext>) -> Result<u64> {
         Ok(0)
     }
 
@@ -537,12 +529,24 @@ pub trait TableExt: Table {
             Ok(())
         }
     }
+
+    /// Owned derived tables allow physical maintenance while rejecting user DML.
+    fn check_mutable_for_maintenance(&self) -> Result<()> {
+        if self.is_read_only_for_maintenance() {
+            self.check_mutable()
+        } else {
+            Ok(())
+        }
+    }
 }
 impl<T: ?Sized> TableExt for T where T: Table {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TimeNavigation {
-    TimeTravel(NavigationPoint),
+    TimeTravel {
+        point: NavigationPoint,
+        no_check: bool,
+    },
     Changes {
         append_only: bool,
         desc: String,
@@ -604,6 +608,16 @@ pub trait ColumnStatisticsProvider: Send {
 
     // return histogram if any
     fn histogram(&self, _column_id: ColumnId) -> Option<Histogram> {
+        None
+    }
+
+    // return top-N frequency stats if any
+    fn top_n(&self, _column_id: ColumnId) -> Option<ColumnTopN> {
+        None
+    }
+
+    // return count-min sketch frequency stats if any
+    fn count_min_sketch(&self, _column_id: ColumnId) -> Option<ColumnCountMinSketch> {
         None
     }
 }

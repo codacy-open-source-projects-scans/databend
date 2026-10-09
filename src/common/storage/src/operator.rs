@@ -35,7 +35,6 @@ use databend_common_meta_app::storage::StorageHdfsConfig;
 use databend_common_meta_app::storage::StorageHttpConfig;
 use databend_common_meta_app::storage::StorageHuggingfaceConfig;
 use databend_common_meta_app::storage::StorageIpfsConfig;
-use databend_common_meta_app::storage::StorageMokaConfig;
 use databend_common_meta_app::storage::StorageNetworkParams;
 use databend_common_meta_app::storage::StorageObsConfig;
 use databend_common_meta_app::storage::StorageOssConfig;
@@ -48,7 +47,6 @@ use log::warn;
 use opendal::Builder;
 use opendal::Operator;
 use opendal::layers::AsyncBacktraceLayer;
-use opendal::layers::ConcurrentLimitLayer;
 use opendal::layers::FastraceLayer;
 use opendal::layers::HttpClientLayer;
 use opendal::layers::ImmutableIndexLayer;
@@ -61,7 +59,10 @@ use opendal::services;
 
 use crate::StorageConfig;
 use crate::StorageHttpClient;
+use crate::concurrent_limit_layer::ConcurrentLimitLayer;
 use crate::config::CredentialChainConfig;
+use crate::config::EndpointPolicyScope;
+use crate::fault_injection_layer::FaultInjectionLayer;
 use crate::http_client::get_storage_http_client;
 use crate::metrics_layer::METRICS_LAYER;
 use crate::operator_cache::get_operator_cache;
@@ -72,54 +73,90 @@ static METRIC_OPENDAL_RETRIES_COUNT: LazyLock<FamilyCounter<Vec<(&'static str, S
 
 /// init_operator will init an opendal operator based on storage config.
 pub fn init_operator(cfg: &StorageParams) -> Result<Operator> {
+    init_operator_with_policy_scope(cfg, EndpointPolicyScope::Trusted)
+}
+
+/// init_operator_with_policy_scope will init an opendal operator with an
+/// explicit endpoint egress policy scope.
+pub fn init_operator_with_policy_scope(
+    cfg: &StorageParams,
+    endpoint_policy_scope: EndpointPolicyScope,
+) -> Result<Operator> {
     let cache = get_operator_cache();
     cache
-        .get_or_create(cfg)
+        .get_or_create(cfg, endpoint_policy_scope)
         .map_err(|e| Error::other(anyhow!("Failed to get or create operator: {}", e)))
 }
 
 /// init_operator_uncached will init an opendal operator without caching.
 /// This function creates a new operator every time it's called.
-pub(crate) fn init_operator_uncached(cfg: &StorageParams) -> Result<Operator> {
+pub(crate) fn init_operator_uncached(
+    cfg: &StorageParams,
+    endpoint_policy_scope: EndpointPolicyScope,
+) -> Result<Operator> {
     let op = match &cfg {
-        StorageParams::Azblob(cfg) => {
-            build_operator(init_azblob_operator(cfg)?, cfg.network_config.as_ref())?
+        StorageParams::Azblob(cfg) => build_operator(
+            init_azblob_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Fs(cfg) => {
+            build_operator(init_fs_operator(cfg)?, None, endpoint_policy_scope)?
         }
-        StorageParams::Fs(cfg) => build_operator(init_fs_operator(cfg)?, None)?,
-        StorageParams::Gcs(cfg) => {
-            build_operator(init_gcs_operator(cfg)?, cfg.network_config.as_ref())?
-        }
+        StorageParams::Gcs(cfg) => build_operator(
+            init_gcs_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
         #[cfg(feature = "storage-hdfs")]
-        StorageParams::Hdfs(cfg) => {
-            build_operator(init_hdfs_operator(cfg)?, cfg.network_config.as_ref())?
-        }
+        StorageParams::Hdfs(cfg) => build_operator(
+            init_hdfs_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
         StorageParams::Http(cfg) => {
             let (builder, layer) = init_http_operator(cfg)?;
-            build_operator(builder, cfg.network_config.as_ref())?.layer(layer)
+            build_operator(builder, cfg.network_config.as_ref(), endpoint_policy_scope)?
+                .layer(layer)
         }
-        StorageParams::Ipfs(cfg) => {
-            build_operator(init_ipfs_operator(cfg)?, cfg.network_config.as_ref())?
+        StorageParams::Ipfs(cfg) => build_operator(
+            init_ipfs_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Memory => {
+            build_operator(init_memory_operator()?, None, endpoint_policy_scope)?
         }
-        StorageParams::Memory => build_operator(init_memory_operator()?, None)?,
-        StorageParams::Moka(cfg) => build_operator(init_moka_operator(cfg)?, None)?,
-        StorageParams::Obs(cfg) => {
-            build_operator(init_obs_operator(cfg)?, cfg.network_config.as_ref())?
-        }
-        StorageParams::S3(cfg) => {
-            build_operator(init_s3_operator(cfg)?, cfg.network_config.as_ref())?
-        }
-        StorageParams::Oss(cfg) => {
-            build_operator(init_oss_operator(cfg)?, cfg.network_config.as_ref())?
-        }
-        StorageParams::Webhdfs(cfg) => {
-            build_operator(init_webhdfs_operator(cfg)?, cfg.network_config.as_ref())?
-        }
-        StorageParams::Cos(cfg) => {
-            build_operator(init_cos_operator(cfg)?, cfg.network_config.as_ref())?
-        }
-        StorageParams::Huggingface(cfg) => {
-            build_operator(init_huggingface_operator(cfg)?, cfg.network_config.as_ref())?
-        }
+        StorageParams::Obs(cfg) => build_operator(
+            init_obs_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::S3(cfg) => build_operator(
+            init_s3_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Oss(cfg) => build_operator(
+            init_oss_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Webhdfs(cfg) => build_operator(
+            init_webhdfs_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Cos(cfg) => build_operator(
+            init_cos_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
+        StorageParams::Huggingface(cfg) => build_operator(
+            init_huggingface_operator(cfg)?,
+            cfg.network_config.as_ref(),
+            endpoint_policy_scope,
+        )?,
         v => {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -149,7 +186,11 @@ pub(crate) fn init_operator_uncached(cfg: &StorageParams) -> Result<Operator> {
 /// ```
 ///
 /// Please balance the performance and compile time.
-fn build_operator<B: Builder>(builder: B, cfg: Option<&StorageNetworkParams>) -> Result<Operator> {
+fn build_operator<B: Builder>(
+    builder: B,
+    cfg: Option<&StorageNetworkParams>,
+    endpoint_policy_scope: EndpointPolicyScope,
+) -> Result<Operator> {
     let ob = Operator::new(builder)?
         // Timeout layer is required to be the first layer so that internal
         // futures can be cancelled safely when the timeout is reached.
@@ -199,10 +240,20 @@ fn build_operator<B: Builder>(builder: B, cfg: Option<&StorageNetworkParams>) ->
         // storage operator so that all underlying storage operations
         // will send to storage runtime.
         .layer(RuntimeLayer::new(GlobalIORuntime::instance()))
+        // Test-only fault injection; inert unless a test installs a rule. Below the retry
+        // layer so that injected temporary errors are retried like real ones.
+        .layer(FaultInjectionLayer)
         .finish();
 
     // Make sure the http client has been updated.
-    let ob = ob.layer(HttpClientLayer::new(HttpClient::with(get_http_client(cfg))));
+    // HTTP-based storage backends built through this path, including S3,
+    // Azblob, GCS, OSS, OBS, COS and HTTP, share StorageHttpClient. Only
+    // operators built with EndpointPolicyScope::External apply request-time
+    // endpoint egress checks; trusted config-backed operators bypass them.
+    let ob = ob.layer(HttpClientLayer::new(HttpClient::with(get_http_client(
+        cfg,
+        endpoint_policy_scope,
+    ))));
 
     let mut op = ob
         // Add retry
@@ -237,7 +288,10 @@ fn build_operator<B: Builder>(builder: B, cfg: Option<&StorageNetworkParams>) ->
     Ok(op)
 }
 
-fn get_http_client(cfg: Option<&StorageNetworkParams>) -> StorageHttpClient {
+fn get_http_client(
+    cfg: Option<&StorageNetworkParams>,
+    endpoint_policy_scope: EndpointPolicyScope,
+) -> StorageHttpClient {
     let mut pool_max_idle_per_host = usize::MAX;
 
     if let Some(cfg) = cfg {
@@ -280,7 +334,12 @@ fn get_http_client(cfg: Option<&StorageNetworkParams>) -> StorageHttpClient {
         }
     }
 
-    get_storage_http_client(pool_max_idle_per_host, connect_timeout, keepalive)
+    get_storage_http_client(
+        pool_max_idle_per_host,
+        connect_timeout,
+        keepalive,
+        endpoint_policy_scope,
+    )
 }
 
 /// init_azblob_operator will init an opendal azblob operator.
@@ -472,25 +531,22 @@ fn init_obs_operator(cfg: &StorageObsConfig) -> Result<impl Builder> {
 
 /// init_oss_operator will init an opendal OSS operator with input oss config.
 fn init_oss_operator(cfg: &StorageOssConfig) -> Result<impl Builder> {
-    let builder = services::Oss::default()
+    let mut builder = services::Oss::default()
         .endpoint(&cfg.endpoint_url)
         .presign_endpoint(&cfg.presign_endpoint_url)
         .access_key_id(&cfg.access_key_id)
         .access_key_secret(&cfg.access_key_secret)
         .bucket(&cfg.bucket)
         .root(&cfg.root)
+        .role_arn(&cfg.role_arn)
         .server_side_encryption(&cfg.server_side_encryption)
         .server_side_encryption_key_id(&cfg.server_side_encryption_key_id);
 
-    Ok(builder)
-}
-
-/// init_moka_operator will init a moka operator.
-fn init_moka_operator(v: &StorageMokaConfig) -> Result<impl Builder> {
-    let builder = services::Moka::default()
-        .max_capacity(v.max_capacity)
-        .time_to_live(std::time::Duration::from_secs(v.time_to_live as u64))
-        .time_to_idle(std::time::Duration::from_secs(v.time_to_idle as u64));
+    // When role_arn is set, we should not force anonymous access so that
+    // the credential chain can assume the role.
+    if cfg.role_arn.is_empty() && cfg.access_key_id.is_empty() && cfg.access_key_secret.is_empty() {
+        builder = builder.allow_anonymous();
+    }
 
     Ok(builder)
 }
@@ -686,6 +742,28 @@ impl IcebergFileIO {
         Self { scheme, props }
     }
 
+    fn validate_s3_credentials(&self) -> Result<()> {
+        let has_access_key = self.props.contains_key("s3.access-key-id");
+        let has_secret_key = self.props.contains_key("s3.secret-access-key");
+        let has_session_token = self.props.contains_key("s3.session-token");
+
+        if has_access_key != has_secret_key {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "s3.access-key-id and s3.secret-access-key must be configured together",
+            ));
+        }
+
+        if has_session_token && !(has_access_key && has_secret_key) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "s3.session-token requires s3.access-key-id and s3.secret-access-key",
+            ));
+        }
+
+        Ok(())
+    }
+
     fn build_operator(&self, location: &str) -> Result<(Operator, usize)> {
         let url = url::Url::parse(location)
             .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
@@ -708,12 +786,12 @@ impl IcebergFileIO {
             let bucket = url
                 .host_str()
                 .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing bucket in URL"))?;
-            let prefix = format!("{}://{}/", scheme, bucket);
-            let relative_path_pos = if location.starts_with(&prefix) {
-                prefix.len()
-            } else {
-                url.scheme().len() + 3 + bucket.len() + 1
-            };
+            // The relative path starts after the authority, which can carry userinfo:
+            // abfss://<filesystem>@<account>.dfs.core.windows.net/<path>.
+            let authority_start = scheme.len() + 3;
+            let relative_path_pos = location[authority_start..]
+                .find('/')
+                .map_or(location.len(), |i| authority_start + i + 1);
             (Some(bucket), relative_path_pos)
         };
 
@@ -724,6 +802,12 @@ impl IcebergFileIO {
             opendal_config.insert("bucket".to_string(), bucket.to_string());
         }
 
+        self.validate_s3_credentials()?;
+
+        let has_s3_credentials = self.props.contains_key("s3.access-key-id")
+            || self.props.contains_key("s3.secret-access-key")
+            || self.props.contains_key("s3.session-token");
+
         for (key, value) in &self.props {
             let opendal_key = match key.as_str() {
                 "s3.endpoint" => Some("endpoint"),
@@ -731,6 +815,42 @@ impl IcebergFileIO {
                 "s3.secret-access-key" => Some("secret_access_key"),
                 "s3.region" | "client.region" => Some("region"),
                 "s3.session-token" => Some("session_token"),
+                "aws_access_key_id" => {
+                    if has_s3_credentials {
+                        None
+                    } else {
+                        Some("access_key_id")
+                    }
+                }
+                "aws_secret_access_key" => {
+                    if has_s3_credentials {
+                        None
+                    } else {
+                        Some("secret_access_key")
+                    }
+                }
+                "aws_session_token" | "aws_token" | "token" => {
+                    if has_s3_credentials {
+                        None
+                    } else {
+                        Some("session_token")
+                    }
+                }
+                "aws_region" | "region_name" => {
+                    if self.props.contains_key("s3.region")
+                        || self.props.contains_key("client.region")
+                    {
+                        None
+                    } else {
+                        Some("region")
+                    }
+                }
+                "aws_server_side_encryption" => Some("server_side_encryption"),
+                "aws_sse_kms_key_id" => Some("server_side_encryption_aws_kms_key_id"),
+                "aws_sse_customer_key_base64" => Some("server_side_encryption_customer_key"),
+                "aws_checksum_algorithm" => Some("checksum_algorithm"),
+                "aws_request_payer" => Some("request_payer"),
+                "aws_bucket" | "aws_bucket_name" | "bucket_name" => None,
                 "s3.path-style-access" => {
                     let enable_virtual_host_style =
                         !["true", "t", "1", "on"].contains(&value.to_lowercase().as_str());
@@ -751,6 +871,10 @@ impl IcebergFileIO {
                 "adls.account-name" | "azure.account-name" => Some("account_name"),
                 "adls.account-key" | "azure.account-key" => Some("account_key"),
                 "adls.sas-token" | "azure.sas-token" => Some("sas_token"),
+                "adls.tenant-id" => Some("tenant_id"),
+                "adls.client-id" => Some("client_id"),
+                "adls.client-secret" => Some("client_secret"),
+                "adls.authority-host" => Some("authority_host"),
                 _ => {
                     opendal_config.insert(key.clone(), value.clone());
                     None
@@ -759,6 +883,26 @@ impl IcebergFileIO {
 
             if let Some(opendal_key) = opendal_key {
                 opendal_config.insert(opendal_key.to_string(), value.clone());
+            }
+        }
+
+        // Azdls names the container `filesystem` and needs the account endpoint; both are in
+        // the location (`abfss://<filesystem>@<host>/...`), as iceberg-rust's own Azdls
+        // storage reads them.
+        if matches!(scheme, "abfs" | "abfss" | "wasb" | "wasbs") {
+            if !url.username().is_empty() {
+                opendal_config
+                    .entry("filesystem".to_string())
+                    .or_insert_with(|| url.username().to_string());
+            }
+            if let Some(host) = url.host_str() {
+                let http = match scheme {
+                    "abfs" | "wasb" => "http",
+                    _ => "https",
+                };
+                opendal_config
+                    .entry("endpoint".to_string())
+                    .or_insert_with(|| format!("{http}://{host}"));
             }
         }
 
@@ -788,5 +932,102 @@ impl OperatorRegistry for IcebergFileIO {
     fn get_operator_path<'a>(&self, location: &'a str) -> Result<(Operator, &'a str)> {
         let (op, pos) = self.build_operator(location)?;
         Ok((op, &location[pos..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::IcebergFileIO;
+
+    #[test]
+    fn iceberg_file_io_does_not_mix_catalog_token_with_explicit_s3_credentials() {
+        let file_io = IcebergFileIO {
+            scheme: "s3".to_string(),
+            props: HashMap::from([
+                ("aws_access_key_id".to_string(), "glue_access".to_string()),
+                (
+                    "aws_secret_access_key".to_string(),
+                    "glue_secret".to_string(),
+                ),
+                ("aws_session_token".to_string(), "glue_token".to_string()),
+                ("region_name".to_string(), "us-east-1".to_string()),
+                (
+                    "s3.endpoint".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("s3.access-key-id".to_string(), "s3_access".to_string()),
+                ("s3.secret-access-key".to_string(), "s3_secret".to_string()),
+            ]),
+        };
+
+        let res = file_io.build_operator("s3://bucket/path/to/file.parquet");
+
+        assert!(res.is_ok(), "operator build failed: {:?}", res.err());
+        let (_, path_pos) = res.unwrap();
+        assert_eq!(path_pos, "s3://bucket/".len());
+    }
+
+    #[test]
+    fn iceberg_file_io_azdls_path_skips_filesystem_in_authority() {
+        let file_io = IcebergFileIO {
+            scheme: "abfss".to_string(),
+            props: HashMap::from([("adls.sas-token".to_string(), "sv=token".to_string())]),
+        };
+
+        for prefix in [
+            "abfss://myfs@myaccount.dfs.core.windows.net/",
+            "abfss://myfs@onelake.dfs.fabric.microsoft.com/",
+        ] {
+            let location = format!("{prefix}lakehouse/Tables/ns/t/data/file.parquet");
+            let res = file_io.build_operator(&location);
+
+            assert!(res.is_ok(), "operator build failed: {:?}", res.err());
+            let (op, path_pos) = res.unwrap();
+            assert_eq!(path_pos, prefix.len());
+            assert_eq!(op.info().name(), "myfs");
+        }
+    }
+
+    #[test]
+    fn iceberg_file_io_rejects_partial_explicit_s3_credentials() {
+        let file_io = IcebergFileIO {
+            scheme: "s3".to_string(),
+            props: HashMap::from([
+                ("aws_access_key_id".to_string(), "glue_access".to_string()),
+                (
+                    "aws_secret_access_key".to_string(),
+                    "glue_secret".to_string(),
+                ),
+                ("s3.access-key-id".to_string(), "s3_access".to_string()),
+            ]),
+        };
+
+        let err = file_io
+            .build_operator("s3://bucket/path/to/file.parquet")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("s3.access-key-id and s3.secret-access-key must be configured together"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn iceberg_file_io_rejects_session_token_without_explicit_s3_key_pair() {
+        let file_io = IcebergFileIO {
+            scheme: "s3".to_string(),
+            props: HashMap::from([("s3.session-token".to_string(), "s3_token".to_string())]),
+        };
+
+        let err = file_io
+            .build_operator("s3://bucket/path/to/file.parquet")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("s3.session-token requires s3.access-key-id and s3.secret-access-key"),
+            "unexpected error: {err}"
+        );
     }
 }

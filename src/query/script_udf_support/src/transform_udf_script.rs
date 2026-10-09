@@ -20,9 +20,12 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
 
 use arrow_array::RecordBatch;
+use arrow_array::RecordBatchOptions;
+use arrow_schema::DataType as ArrowDataType;
+use arrow_schema::Field;
+use arrow_schema::Fields;
 use arrow_udf_runtime::javascript::FunctionOptions;
 use databend_common_base::runtime::GlobalIORuntime;
-use databend_common_cache::Cache;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
@@ -31,9 +34,13 @@ use databend_common_expression::DataField;
 use databend_common_expression::DataSchema;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::Value;
+use databend_common_expression::converts::arrow::ARROW_EXT_TYPE_INTERVAL;
+use databend_common_expression::converts::arrow::ARROW_EXT_TYPE_TIMESTAMP_TIMEZONE;
 use databend_common_expression::converts::arrow::ARROW_EXT_TYPE_VARIANT;
 use databend_common_expression::converts::arrow::EXTENSION_KEY;
 use databend_common_expression::types::DataType;
+use databend_common_expression::types::decimal::ARROW_UDF_DECIMAL_MAX_PRECISION;
+use databend_common_expression::types::decimal::ARROW_UDF_DECIMAL_MAX_SCALE;
 use databend_common_expression::variant_transform::contains_variant;
 use databend_common_expression::variant_transform::transform_variant;
 #[cfg_attr(not(feature = "python-udf"), allow(unused_imports))]
@@ -61,7 +68,7 @@ static PY_VERSION: LazyLock<String> =
 
 impl ScriptRuntime {
     pub fn try_create(func: &ScriptUdfFunctionDesc, _temp_dir: Option<TempDir>) -> Result<Self> {
-        let UDFType::Script(box UDFScriptCode { language, code, .. }) = &func.udf_type else {
+        let UDFType::Script(deref!(UDFScriptCode { language, code, .. })) = &func.udf_type else {
             unreachable!()
         };
         match language {
@@ -183,31 +190,17 @@ if '{dir}' not in sys.path:
                 batch
             }
             ScriptRuntime::WebAssembly(runtime) => {
-                let args_types: Vec<_> = input_batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
                 let return_type = func.data_type.as_ref().clone();
+                let declared_return_type = wasm_declared_return_type(&return_type);
                 let f = DataField::new(&func.func_name, return_type);
-                let return_f = arrow_schema::Field::from(&f);
-
-                let handle = runtime
-                    .find_function(&func.func_name, args_types, return_f)
-                    .map_err(|err| {
-                        ErrorCode::UDFRuntimeError(format!(
-                            "WASM UDF {:?} execution failed: {err}",
-                            func.func_name
-                        ))
-                    })?;
-
-                runtime.call(&handle, input_batch).map_err(|err| {
-                    ErrorCode::UDFRuntimeError(format!(
-                        "WASM UDF {:?} execution failed: {err}",
-                        func.func_name
-                    ))
-                })?
+                let return_field = arrow_schema::Field::from(&f);
+                call_wasm_function(
+                    runtime,
+                    &func.func_name,
+                    input_batch,
+                    &return_field,
+                    &declared_return_type,
+                )?
             }
         };
         Ok(result_batch)
@@ -277,9 +270,12 @@ if '{dir}' not in sys.path:
     #[cfg(feature = "python-udf")]
     fn collect_stage_sys_paths(func: &ScriptUdfFunctionDesc, temp_dir: &TempDir) -> Vec<String> {
         match &func.udf_type {
-            UDFType::Script(box UDFScriptCode {
-                imports_stage_info, ..
-            }) => imports_stage_info
+            UDFType::Script(
+                deref!(UDFScriptCode {
+                    imports_stage_info,
+                    ..
+                }),
+            ) => imports_stage_info
                 .iter()
                 .filter_map(|(_, stage_path)| {
                     let name = stage_path
@@ -303,6 +299,183 @@ if '{dir}' not in sys.path:
             _ => Vec::new(),
         }
     }
+}
+
+const ARROW_UDF_EXTENSION_KEY: &str = "ARROW:extension:name";
+const ARROW_UDF_DECIMAL: &str = "arrowudf.decimal";
+
+fn wasm_declared_return_type(data_type: &DataType) -> String {
+    data_type.remove_nullable().to_string()
+}
+
+fn call_wasm_function(
+    runtime: &arrow_udf_runtime::wasm::Runtime,
+    name: &str,
+    input_batch: &RecordBatch,
+    return_field: &Field,
+    declared_return_type: &str,
+) -> Result<RecordBatch> {
+    let input_batch = wasm_compatible_record_batch(input_batch).map_err(|err| {
+        ErrorCode::UDFRuntimeError(format!(
+            "WASM UDF {name:?} execution failed while converting arguments: {}",
+            err.message()
+        ))
+    })?;
+    let args_types = input_batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let return_type = wasm_compatible_field(return_field).map_err(|err| {
+        ErrorCode::UDFRuntimeError(format!(
+            "WASM UDF {name:?} execution failed while converting the return type: {}",
+            err.message()
+        ))
+    })?;
+    let handle = runtime
+        .find_function(name, args_types, return_type)
+        .map_err(|err| {
+            ErrorCode::UDFRuntimeError(format!("WASM UDF {name:?} execution failed: {err}"))
+        })?;
+    let result = runtime.call(&handle, &input_batch).map_err(|err| {
+        ErrorCode::UDFRuntimeError(format!("WASM UDF {name:?} execution failed: {err}"))
+    })?;
+    restore_wasm_result_batch(result, return_field, name, declared_return_type)
+}
+
+fn wasm_compatible_field(field: &Field) -> Result<Field> {
+    if let Some(extension) = field.metadata().get(EXTENSION_KEY)
+        && matches!(
+            extension.as_str(),
+            ARROW_EXT_TYPE_INTERVAL | ARROW_EXT_TYPE_TIMESTAMP_TIMEZONE
+        )
+    {
+        return Err(ErrorCode::UDFRuntimeError(format!(
+            "WASM UDF type {extension} is not supported"
+        )));
+    }
+
+    let mut metadata = field.metadata().clone();
+    let data_type = wasm_compatible_data_type(field.data_type())?;
+    if matches!(
+        field.data_type(),
+        ArrowDataType::Decimal64(_, _)
+            | ArrowDataType::Decimal128(_, _)
+            | ArrowDataType::Decimal256(_, _)
+    ) {
+        metadata.insert(
+            ARROW_UDF_EXTENSION_KEY.to_string(),
+            ARROW_UDF_DECIMAL.to_string(),
+        );
+    }
+    Ok(field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata))
+}
+
+fn wasm_compatible_data_type(data_type: &ArrowDataType) -> Result<ArrowDataType> {
+    Ok(match data_type {
+        ArrowDataType::Utf8View => ArrowDataType::Utf8,
+        ArrowDataType::Decimal64(precision, scale)
+        | ArrowDataType::Decimal128(precision, scale)
+        | ArrowDataType::Decimal256(precision, scale) => {
+            // The scale guard also protects Arrow types that Databend does not currently produce.
+            if *precision > ARROW_UDF_DECIMAL_MAX_PRECISION
+                || *scale < 0
+                || *scale > ARROW_UDF_DECIMAL_MAX_SCALE as i8
+            {
+                return Err(ErrorCode::UDFRuntimeError(format!(
+                    "WASM UDF decimal type {data_type} is not supported: the arrowudf.decimal ABI uses rust_decimal and supports precision up to {ARROW_UDF_DECIMAL_MAX_PRECISION} and scale between 0 and {ARROW_UDF_DECIMAL_MAX_SCALE}"
+                )));
+            }
+            ArrowDataType::Utf8
+        }
+        ArrowDataType::LargeList(field) => {
+            ArrowDataType::List(Arc::new(wasm_compatible_field(field)?))
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(Arc::new(wasm_compatible_field(field)?)),
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(Fields::from(
+            fields
+                .iter()
+                .map(|field| wasm_compatible_field(field))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        _ => data_type.clone(),
+    })
+}
+
+fn wasm_compatible_record_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| wasm_compatible_field(field))
+        .collect::<Result<Vec<_>>>()?;
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(fields.iter())
+        .map(|(array, field)| {
+            arrow_cast::cast_with_options(
+                array.as_ref(),
+                field.data_type(),
+                &arrow_cast::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )
+            .map_err(ErrorCode::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let schema = arrow_schema::Schema::new(fields).with_metadata(schema.metadata().clone());
+
+    RecordBatch::try_new_with_options(
+        Arc::new(schema),
+        columns,
+        &RecordBatchOptions::default().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(Into::into)
+}
+
+fn restore_wasm_result_batch(
+    batch: RecordBatch,
+    return_field: &Field,
+    name: &str,
+    declared_return_type: &str,
+) -> Result<RecordBatch> {
+    if batch.num_columns() == 0 {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields[0] = return_field.clone().with_name(fields[0].name());
+
+    let mut columns = batch.columns().to_vec();
+    columns[0] = arrow_cast::cast_with_options(
+        columns[0].as_ref(),
+        return_field.data_type(),
+        &arrow_cast::CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| {
+        ErrorCode::UDFRuntimeError(format!(
+            "WASM UDF {name:?} execution failed: return value cannot be converted to declared type {}; the value is invalid or out of range",
+            declared_return_type
+        ))
+        .add_detail_back(format!("Arrow cast error: {err}"))
+    })?;
+
+    let schema = arrow_schema::Schema::new(fields).with_metadata(schema.metadata().clone());
+    RecordBatch::try_new(Arc::new(schema), columns).map_err(Into::into)
 }
 
 pub struct JsRuntimeBuilder {
@@ -595,32 +768,34 @@ impl TransformUdfScript {
     pub fn init_runtime(funcs: &[ScriptUdfFunctionDesc]) -> Result<RuntimeTimeRes> {
         let mut script_runtimes = BTreeMap::new();
         for func in funcs {
-            let (code, code_str) = match &func.udf_type {
-                UDFType::Script(box script_code) => {
-                    (script_code, String::from_utf8(script_code.code.to_vec())?)
-                }
+            let code = match &func.udf_type {
+                UDFType::Script(deref!(script_code)) => script_code,
                 _ => continue,
             };
 
             let temp_dir = match &func.udf_type {
-                UDFType::Script(box UDFScriptCode {
-                    language: UDFLanguage::Python,
-                    packages,
-                    imports_stage_info,
-                    ..
-                }) => {
-                    let mut dependencies = Self::extract_deps(&code_str);
+                UDFType::Script(
+                    deref!(UDFScriptCode {
+                        language: UDFLanguage::Python,
+                        packages,
+                        imports_stage_info,
+                        ..
+                    }),
+                ) => tokio::task::block_in_place(|| -> Result<Option<TempDir>> {
+                    // Pipeline construction is synchronous, but runs on query workers.
+                    // Tell Tokio before waiting on an environment or doing pip/zip I/O.
+                    let code_str = String::from_utf8(code.code.to_vec())?;
+                    let mut dependencies = Self::extract_deps(&code_str)?;
                     dependencies.extend_from_slice(packages.as_slice());
 
                     let stage_fingerprints = Self::collect_stage_fingerprints(imports_stage_info)?;
 
                     if !dependencies.is_empty() || !stage_fingerprints.is_empty() {
-                        let key =
-                            venv::PyVenvKeyEntry::new(&dependencies, stage_fingerprints.clone());
-                        let mut w = venv::PY_VENV_CACHE.write();
-                        if let Some(entry) = w.get(&key) {
-                            Some(entry.materialize().map_err(ErrorCode::from_string)?)
-                        } else {
+                        let key = venv::PyVenvKeyEntry::new(&dependencies, stage_fingerprints);
+                        let entry = venv::cache_entry(key);
+                        // Only this environment is serialized. Never hold the global
+                        // cache lock across install, stage reads, or archive restoration.
+                        Ok(Some(entry.get_or_init(|| {
                             let temp_dir = venv::create_venv(PY_VERSION.as_str())?;
                             venv::install_deps(temp_dir.path(), &dependencies)?;
 
@@ -643,23 +818,19 @@ impl TransformUdfScript {
                                                 .await
                                         });
                                     }
-                                    let _ = futures::future::join_all(fts).await;
+                                    futures::future::try_join_all(fts).await?;
                                     Ok::<(), ErrorCode>(())
                                 })?;
                             }
 
                             let archive_path = venv::archive_env(temp_dir.path())
                                 .map_err(ErrorCode::from_string)?;
-                            let cache_entry =
-                                venv::PyVenvCacheEntry::new(temp_dir.clone(), archive_path);
-                            w.insert(key, cache_entry);
-
-                            Some(temp_dir)
-                        }
+                            Ok((temp_dir, archive_path))
+                        })?))
                     } else {
-                        None
+                        Ok(None)
                     }
-                }
+                })?,
                 _ => None,
             };
 
@@ -677,7 +848,7 @@ impl TransformUdfScript {
         Ok(script_runtimes)
     }
 
-    fn extract_deps(script: &str) -> Vec<String> {
+    fn extract_deps(script: &str) -> Result<Vec<String>> {
         let mut ss = String::new();
         let mut meta_start = false;
         for line in script.lines() {
@@ -693,19 +864,24 @@ impl TransformUdfScript {
             }
         }
 
-        let parsed = ss.parse::<toml::Value>().unwrap();
+        let parsed = ss.parse::<toml::Value>().map_err(|err| {
+            ErrorCode::SemanticError(format!(
+                "Failed to parse UDF script metadata as TOML: {err}"
+            ))
+        })?;
 
         if parsed.get("dependencies").is_none() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        if let Some(deps) = parsed["dependencies"].as_array() {
+        let deps = if let Some(deps) = parsed["dependencies"].as_array() {
             deps.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         } else {
             Vec::new()
-        }
+        };
+        Ok(deps)
     }
 
     fn prepare_block_entries(
@@ -869,6 +1045,7 @@ mod venv {
     use std::sync::LazyLock;
     use std::sync::Weak;
 
+    use databend_common_cache::Cache;
     use databend_common_cache::LruCache;
     use databend_common_cache::MemSized;
     use parking_lot::Mutex;
@@ -931,10 +1108,6 @@ mod venv {
 
         pub fn new() -> Result<Self, String> {
             let path = PY_VENV_WORK_DIR.join(Uuid::now_v7().to_string());
-            Self::new_impl(path)
-        }
-
-        pub fn new_with_path(path: PathBuf) -> Result<Self, String> {
             Self::new_impl(path)
         }
 
@@ -1074,12 +1247,15 @@ mod venv {
         }
     }
 
-    // cached temp dir for python udf
-    // Add this after the PY_VERSION LazyLock declaration
-    // A simple LRU cache for Python virtual environments
+    // Cache handles remain alive during initialization/materialization even if
+    // evicted from the LRU. Each environment has its own initialization lock.
+    #[derive(Clone, Default)]
     pub(crate) struct PyVenvCacheEntry {
-        temp_dir: Mutex<WeakTempDir>,
-        temp_dir_path: PathBuf,
+        env: Arc<Mutex<Option<PyVenvEnv>>>,
+    }
+
+    struct PyVenvEnv {
+        temp_dir: WeakTempDir,
         archive_path: PathBuf,
     }
 
@@ -1136,32 +1312,50 @@ mod venv {
 
     impl MemSized for PyVenvCacheEntry {
         fn mem_bytes(&self) -> usize {
-            std::mem::size_of::<Mutex<WeakTempDir>>() + 2 * std::mem::size_of::<PathBuf>()
+            std::mem::size_of::<Mutex<Option<PyVenvEnv>>>()
         }
     }
 
     impl PyVenvCacheEntry {
+        #[cfg(test)]
         pub fn new(temp_dir: TempDir, archive_path: PathBuf) -> Self {
             Self {
-                temp_dir: Mutex::new(temp_dir.downgrade()),
-                temp_dir_path: temp_dir.path().to_path_buf(),
-                archive_path,
+                env: Arc::new(Mutex::new(Some(PyVenvEnv {
+                    temp_dir: temp_dir.downgrade(),
+                    archive_path,
+                }))),
             }
         }
 
-        pub fn materialize(&self) -> Result<TempDir, String> {
-            if let Some(existing) = self.temp_dir.lock().upgrade() {
-                return Ok(existing);
+        pub fn get_or_init(
+            &self,
+            init: impl FnOnce() -> databend_common_exception::Result<(TempDir, PathBuf)>,
+        ) -> databend_common_exception::Result<TempDir> {
+            let mut env = self.env.lock();
+            if let Some(env) = env.as_mut() {
+                if let Some(existing) = env.temp_dir.upgrade() {
+                    return Ok(existing);
+                }
+
+                // Hold the per-entry lock throughout restoration. Use a fresh path
+                // so a concurrent final drop of the old TempDir cannot remove it.
+                let temp_dir = TempDir::new()?;
+                restore_env_into(&env.archive_path, temp_dir.path())?;
+                env.temp_dir.replace(&temp_dir);
+                return Ok(temp_dir);
             }
 
-            let temp_dir = TempDir::new_with_path(self.temp_dir_path.clone())?;
-            restore_env_into(&self.archive_path, temp_dir.path())?;
-            self.temp_dir.lock().replace(&temp_dir);
+            // Leave a failed entry uninitialized so a later query can retry.
+            let (temp_dir, archive_path) = init()?;
+            *env = Some(PyVenvEnv {
+                temp_dir: temp_dir.downgrade(),
+                archive_path,
+            });
             Ok(temp_dir)
         }
     }
 
-    impl Drop for PyVenvCacheEntry {
+    impl Drop for PyVenvEnv {
         fn drop(&mut self) {
             if let Err(e) = fs::remove_file(&self.archive_path)
                 && !matches!(e.kind(), io::ErrorKind::NotFound)
@@ -1175,6 +1369,383 @@ mod venv {
         }
     }
 
+    pub fn cache_entry(key: PyVenvKeyEntry) -> PyVenvCacheEntry {
+        let mut cache = PY_VENV_CACHE.write();
+        if let Some(entry) = cache.get(&key) {
+            return entry.clone();
+        }
+        let entry = PyVenvCacheEntry::default();
+        cache.insert(key, entry.clone());
+        entry
+    }
+
     pub static PY_VENV_CACHE: LazyLock<RwLock<LruCache<PyVenvKeyEntry, PyVenvCacheEntry>>> =
         LazyLock::new(|| RwLock::new(LruCache::with_items_capacity(64)));
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Array;
+    use arrow_array::Decimal64Array;
+    use arrow_array::Decimal128Array;
+    use arrow_array::LargeBinaryArray;
+    use arrow_array::StringArray;
+    use arrow_array::StringViewArray;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Decimal64Type;
+    use arrow_array::types::Decimal128Type;
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+    use databend_common_expression::converts::arrow::ARROW_EXT_TYPE_BITMAP;
+    use databend_common_expression::converts::arrow::ARROW_EXT_TYPE_GEOMETRY;
+
+    use super::*;
+
+    mod python_venv {
+        include!("tests/python_venv.rs");
+    }
+
+    #[test]
+    fn test_extract_deps_returns_error_for_malformed_toml() {
+        let err = TransformUdfScript::extract_deps(
+            r#"# /// script
+# dependencies = [
+# ///
+"#,
+        )
+        .expect_err("malformed UDF script metadata should return an error");
+
+        assert_eq!(err.code(), ErrorCode::SEMANTIC_ERROR);
+        assert!(
+            err.message()
+                .contains("Failed to parse UDF script metadata as TOML")
+        );
+    }
+
+    #[test]
+    fn test_wasm_compatible_record_batch_converts_utf8_view() {
+        let field = Field::new("input", ArrowDataType::Utf8View, true)
+            .with_metadata([("key".to_string(), "value".to_string())].into());
+        let schema = Schema::new(vec![field])
+            .with_metadata([("schema_key".to_string(), "schema_value".to_string())].into());
+        let input = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringViewArray::from(
+            vec![Some("{\"a\":1}"), None],
+        ))])
+        .unwrap();
+
+        let output = wasm_compatible_record_batch(&input).unwrap();
+
+        assert_eq!(output.schema().field(0).data_type(), &ArrowDataType::Utf8);
+        assert_eq!(output.schema().field(0).metadata()["key"], "value");
+        assert_eq!(output.schema().metadata()["schema_key"], "schema_value");
+        let values = output.column(0).as_string::<i32>();
+        assert_eq!(values.value(0), "{\"a\":1}");
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn test_wasm_compatible_record_batch_preserves_zero_column_row_count() {
+        let input = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::default().with_row_count(Some(5)),
+        )
+        .unwrap();
+
+        let output = wasm_compatible_record_batch(&input).unwrap();
+
+        assert_eq!(output.num_columns(), 0);
+        assert_eq!(output.num_rows(), 5);
+    }
+
+    #[test]
+    fn test_wasm_declared_return_type_omits_implicit_nullable() {
+        let data_type = DataType::Nullable(Box::new(DataType::Decimal(
+            databend_common_expression::types::DecimalSize::new(28, 28).unwrap(),
+        )));
+
+        assert_eq!(wasm_declared_return_type(&data_type), "Decimal(28, 28)");
+    }
+
+    #[test]
+    fn test_wasm_compatible_field_type_matrix() {
+        let unchanged = [
+            ArrowDataType::Null,
+            ArrowDataType::Boolean,
+            ArrowDataType::Int8,
+            ArrowDataType::Int16,
+            ArrowDataType::Int32,
+            ArrowDataType::Int64,
+            ArrowDataType::UInt8,
+            ArrowDataType::UInt16,
+            ArrowDataType::UInt32,
+            ArrowDataType::UInt64,
+            ArrowDataType::Float32,
+            ArrowDataType::Float64,
+            ArrowDataType::Date32,
+            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::Utf8,
+            ArrowDataType::LargeUtf8,
+        ];
+        for data_type in unchanged {
+            let field = Field::new("value", data_type.clone(), true);
+            assert_eq!(
+                wasm_compatible_field(&field).unwrap().data_type(),
+                &data_type
+            );
+        }
+
+        let converted = [
+            ArrowDataType::Utf8View,
+            ArrowDataType::Decimal64(18, 2),
+            ArrowDataType::Decimal128(28, 28),
+        ];
+        for data_type in converted {
+            let field = Field::new("value", data_type.clone(), true);
+            let field = wasm_compatible_field(&field).unwrap();
+            assert_eq!(field.data_type(), &ArrowDataType::Utf8);
+            if !matches!(data_type, ArrowDataType::Utf8View) {
+                assert_eq!(field.metadata()[ARROW_UDF_EXTENSION_KEY], ARROW_UDF_DECIMAL);
+            }
+        }
+
+        let decimal = Arc::new(Field::new(
+            "decimal",
+            ArrowDataType::Decimal128(28, 28),
+            true,
+        ));
+        let string = Arc::new(Field::new("string", ArrowDataType::Utf8View, true));
+        let nested = Field::new(
+            "nested",
+            ArrowDataType::Struct(Fields::from(vec![
+                Field::new("array", ArrowDataType::LargeList(string.clone()), true),
+                decimal.as_ref().clone(),
+            ])),
+            true,
+        );
+        let nested = wasm_compatible_field(&nested).unwrap();
+        let ArrowDataType::Struct(fields) = nested.data_type() else {
+            panic!("expected struct");
+        };
+        let ArrowDataType::List(item) = fields[0].data_type() else {
+            panic!("expected list");
+        };
+        assert_eq!(item.data_type(), &ArrowDataType::Utf8);
+        assert_eq!(fields[1].data_type(), &ArrowDataType::Utf8);
+        assert_eq!(
+            fields[1].metadata()[ARROW_UDF_EXTENSION_KEY],
+            ARROW_UDF_DECIMAL
+        );
+
+        for data_type in [
+            ArrowDataType::Decimal128(28, -1),
+            ArrowDataType::Decimal128(29, 0),
+            ArrowDataType::Decimal128(38, 10),
+            ArrowDataType::Decimal256(76, 30),
+        ] {
+            let err = wasm_compatible_field(&Field::new("wide", data_type, true)).unwrap_err();
+            assert!(err.message().contains("rust_decimal"));
+            assert!(err.message().contains(&format!(
+                "precision up to {ARROW_UDF_DECIMAL_MAX_PRECISION}"
+            )));
+            assert!(err.message().contains(&format!(
+                "scale between 0 and {ARROW_UDF_DECIMAL_MAX_SCALE}"
+            )));
+        }
+
+        let nested_wide_decimal = Field::new(
+            "nested",
+            ArrowDataType::LargeList(Arc::new(Field::new_list_field(
+                ArrowDataType::Struct(Fields::from(vec![Field::new(
+                    "wide",
+                    ArrowDataType::Decimal256(76, 30),
+                    true,
+                )])),
+                true,
+            ))),
+            true,
+        );
+        let err = wasm_compatible_field(&nested_wide_decimal).unwrap_err();
+        assert!(err.message().contains("Decimal256(76, 30)"));
+
+        for extension in [ARROW_EXT_TYPE_INTERVAL, ARROW_EXT_TYPE_TIMESTAMP_TIMEZONE] {
+            let field = Field::new("unsupported", ArrowDataType::Decimal128(38, 0), true)
+                .with_metadata([(EXTENSION_KEY.to_string(), extension.to_string())].into());
+            let err = wasm_compatible_field(&field).unwrap_err();
+            assert!(err.message().contains(extension));
+            assert!(err.message().contains("is not supported"));
+            assert!(!err.message().contains("rust_decimal"));
+        }
+    }
+
+    #[test]
+    fn test_restore_wasm_decimal_result_is_strict_and_rounds_half_up() {
+        let overflowing = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "result",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some("1.5")]))],
+        )
+        .unwrap();
+        let err = restore_wasm_result_batch(
+            overflowing,
+            &Field::new("result", ArrowDataType::Decimal128(28, 28), true),
+            "wasm_decimal_overflow",
+            "Decimal(28, 28)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), 1810);
+        assert!(err.display_text().contains("wasm_decimal_overflow"));
+        assert!(err.display_text().contains("Decimal(28, 28)"));
+        assert!(err.display_text().contains("invalid or out of range"));
+        assert!(!err.display_text().contains("Decimal128"));
+        assert!(err.detail().contains("1.5"));
+
+        let invalid = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "result",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some("not-a-decimal")]))],
+        )
+        .unwrap();
+        let err = restore_wasm_result_batch(
+            invalid,
+            &Field::new("result", ArrowDataType::Decimal128(10, 2), true),
+            "wasm_bad_decimal",
+            "Decimal(10, 2)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), 1810);
+        assert!(err.display_text().contains("wasm_bad_decimal"));
+        assert!(err.display_text().contains("Decimal(10, 2)"));
+        assert!(err.display_text().contains("invalid or out of range"));
+        assert!(!err.display_text().contains("Decimal128"));
+        assert!(err.detail().contains("not-a-decimal"));
+        assert!(err.detail().contains("Decimal128(38, 10)"));
+
+        let valid = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "result",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("1.005"),
+                Some("1.004"),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let restored = restore_wasm_result_batch(
+            valid,
+            &Field::new("result", ArrowDataType::Decimal128(10, 2), true),
+            "wasm_decimal_round",
+            "Decimal(10, 2)",
+        )
+        .unwrap();
+        let values = restored.column(0).as_primitive::<Decimal128Type>();
+        assert_eq!(values.value(0), 101);
+        assert_eq!(values.value(1), 100);
+        assert!(values.is_null(2));
+    }
+
+    #[test]
+    fn test_restore_wasm_result_preserves_databend_extension_metadata() {
+        for extension in [
+            ARROW_EXT_TYPE_VARIANT,
+            ARROW_EXT_TYPE_BITMAP,
+            ARROW_EXT_TYPE_GEOMETRY,
+        ] {
+            let wasm_result = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "result",
+                    ArrowDataType::LargeBinary,
+                    true,
+                )])),
+                vec![Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"value".as_slice()),
+                    None,
+                ]))],
+            )
+            .unwrap();
+            let return_field = Field::new("declared", ArrowDataType::LargeBinary, true)
+                .with_metadata([(EXTENSION_KEY.to_string(), extension.to_string())].into());
+
+            let restored =
+                restore_wasm_result_batch(wasm_result, &return_field, "wasm_extension", extension)
+                    .unwrap();
+            assert_eq!(restored.schema().field(0).name(), "result");
+            assert_eq!(
+                restored.schema().field(0).metadata()[EXTENSION_KEY],
+                extension
+            );
+            assert_eq!(restored.column(0).data_type(), &ArrowDataType::LargeBinary);
+            assert!(restored.column(0).is_null(1));
+        }
+    }
+
+    #[test]
+    fn test_wasm_decimal_arrays_round_trip() {
+        let fields = vec![
+            Field::new("decimal64", ArrowDataType::Decimal64(18, 2), true),
+            Field::new("decimal128", ArrowDataType::Decimal128(28, 28), true),
+        ];
+        let input = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), vec![
+            Arc::new(
+                Decimal64Array::from(vec![Some(12345), Some(-1), None])
+                    .with_precision_and_scale(18, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![Some(1234567890123456789012345678), Some(-1), None])
+                    .with_precision_and_scale(28, 28)
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        let wasm_batch = wasm_compatible_record_batch(&input).unwrap();
+        for field in wasm_batch.schema().fields() {
+            assert_eq!(field.data_type(), &ArrowDataType::Utf8);
+            assert_eq!(field.metadata()[ARROW_UDF_EXTENSION_KEY], ARROW_UDF_DECIMAL);
+        }
+        assert_eq!(wasm_batch.column(0).as_string::<i32>().value(0), "123.45");
+        assert_eq!(
+            wasm_batch.column(1).as_string::<i32>().value(0),
+            "0.1234567890123456789012345678"
+        );
+
+        for (index, return_field) in fields.iter().enumerate() {
+            let wasm_result = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![wasm_batch.schema().field(index).clone()])),
+                vec![wasm_batch.column(index).clone()],
+            )
+            .unwrap();
+            let restored =
+                restore_wasm_result_batch(wasm_result, return_field, "wasm_decimal", "Decimal")
+                    .unwrap();
+            assert_eq!(
+                restored.schema().field(0).data_type(),
+                return_field.data_type()
+            );
+            assert!(restored.column(0).is_null(2));
+            match index {
+                0 => assert_eq!(
+                    restored.column(0).as_primitive::<Decimal64Type>().values(),
+                    input.column(0).as_primitive::<Decimal64Type>().values()
+                ),
+                1 => assert_eq!(
+                    restored.column(0).as_primitive::<Decimal128Type>().values(),
+                    input.column(1).as_primitive::<Decimal128Type>().values()
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
 }

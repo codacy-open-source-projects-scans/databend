@@ -1,0 +1,62 @@
+=== array_index_access_binds ===
+description: Array index access should preserve the existing get-function rewrite and nullable result type.
+sql: [10, 20, 30][1]
+status: ok
+scalar: get([10, 20, 30], 1)
+type: UInt8 NULL
+
+=== array_expression_index_access_binds ===
+description: Non-literal array indices should bind through get with normal type checking.
+sql: array('a', 'b', 'c')[delta % 2]
+status: ok
+scalar: get(['a', 'b', 'c'], modulo(delta (#3), 2))
+type: String NULL
+
+=== array_dynamic_index_before_literal_path_binds ===
+description: Literal access after a dynamic index should preserve the remaining path.
+sql: [[10, 20], [30, 40]][delta][2]
+status: ok
+scalar: get(get([[10, 20], [30, 40]], delta (#3)), 2)
+type: UInt8 NULL
+
+=== array_dynamic_index_after_literal_path_binds ===
+description: A dynamic index should preserve preceding literal access.
+sql: [[10, 20], [30, 40]][1][delta]
+status: ok
+scalar: get([10, 20], delta (#3))
+type: UInt8 NULL
+
+=== map_expression_key_access_binds ===
+description: Computed map keys should use the existing get function.
+sql: {'k1': 1, 'k2': delta}[concat('k', '1')]
+status: ok
+scalar: get(map(['k1', 'k2'], array(1, delta (#3))), 'k1')
+type: Int32 NULL
+
+=== map_key_access_binds ===
+description: Map key access should preserve the existing get-function rewrite.
+sql: {'k1': 1, 'k2': delta}['k1']
+status: ok
+scalar: get(map(['k1', 'k2'], array(1, delta (#3))), 'k1')
+type: Int32 NULL
+
+=== variant_colon_access_binds ===
+description: Variant colon access should preserve the get_by_keypath rewrite.
+sql: to_variant({'k1': 1}):k1
+status: ok
+scalar: get_by_keypath('{"k1":1}', '{"k1"}')
+type: Variant NULL
+
+=== variant_get_with_quoted_unicode_key_stays_get ===
+description: A plain get call should not be lowered into a keypath expression before virtual-column resolution.
+sql: get(to_variant({'测试"💎': 'a'}), '测试"💎')
+status: ok
+scalar: '"a"'
+type: Variant
+
+=== map_accessor_requires_literal_path ===
+description: Map and variant accessors should reject unsupported bracket expressions during lowering.
+sql: to_variant({'k1': 1})[true]
+status: error
+code: 1065
+message: Unsupported accessor: Boolean(true)

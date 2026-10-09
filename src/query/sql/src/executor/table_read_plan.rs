@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use databend_common_base::base::ProgressValues;
+use databend_common_catalog::plan::BlockMetaOptions;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
 use databend_common_catalog::plan::InternalColumn;
@@ -48,12 +49,19 @@ impl ToReadDataSourcePlan for dyn Table {
     async fn read_plan(
         &self,
         ctx: Arc<dyn TableContext>,
-        push_downs: Option<PushDownInfo>,
+        mut push_downs: Option<PushDownInfo>,
         internal_columns: Option<BTreeMap<FieldIndex, InternalColumn>>,
         update_stream_columns: bool,
         dry_run: bool,
     ) -> Result<DataSourcePlan> {
         let start = std::time::Instant::now();
+
+        if let (Some(push_downs), Some(internal_columns)) = (&mut push_downs, &internal_columns) {
+            push_downs.add_internal_column_dependencies(
+                &self.schema_with_stream(),
+                internal_columns.values(),
+            )?;
+        }
 
         let (statistics, mut parts) = if let Some(PushDownInfo {
             filters:
@@ -130,7 +138,7 @@ impl ToReadDataSourcePlan for dyn Table {
                     schema.add_internal_field(
                         &field.name,
                         *field.data_type.clone(),
-                        field.column_id,
+                        field.query_column_id,
                     );
                 }
                 output_schema = Arc::new(schema);
@@ -154,6 +162,8 @@ impl ToReadDataSourcePlan for dyn Table {
             start.elapsed()
         ));
 
+        let query_internal_columns = internal_columns.is_some();
+
         Ok(DataSourcePlan {
             source_info,
             output_schema,
@@ -164,7 +174,9 @@ impl ToReadDataSourcePlan for dyn Table {
             push_downs,
             internal_columns,
             base_block_ids,
-            update_stream_columns,
+            block_meta_options: BlockMetaOptions::default()
+                .set_update_stream_columns(update_stream_columns)
+                .set_query_internal_columns(query_internal_columns),
             // Set a dummy id, will be set real id later
             table_index: usize::MAX,
             scan_id: usize::MAX,

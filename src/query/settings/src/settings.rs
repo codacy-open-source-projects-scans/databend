@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use chrono_tz::Tz;
 use dashmap::DashMap;
 use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
@@ -28,7 +29,6 @@ use databend_common_io::prelude::OutputFormatSettings;
 use databend_common_meta_app::principal::UserSettingValue;
 use databend_common_meta_app::tenant::Tenant;
 use itertools::Itertools;
-use jiff::tz::TimeZone;
 use serde::Deserializer;
 use serde::Serializer;
 
@@ -81,9 +81,9 @@ pub struct Settings {
 impl Settings {
     pub fn get_input_format_settings(&self) -> Result<InputFormatSettings> {
         let tz = self.get_timezone()?;
-        let jiff_timezone = TimeZone::get(&tz).map_err(|_| {
-            ErrorCode::InvalidTimezone("Invalid timezone format - jiff timezone parsing failed")
-        })?;
+        let timezone = tz
+            .parse::<Tz>()
+            .map_err(|_| ErrorCode::InvalidTimezone("Invalid timezone format"))?;
         let geometry_format = self.get_geometry_output_format()?;
         let binary_format = self.get_binary_output_format()?;
         let is_rounding_mode = self
@@ -93,7 +93,7 @@ impl Settings {
         let disable_variant_check = self.get_disable_variant_check()?;
         let enable_auto_detect_datetime_format = self.get_enable_auto_detect_datetime_format()?;
         Ok(InputFormatSettings {
-            jiff_timezone,
+            timezone,
             geometry_format,
             binary_format,
             is_rounding_mode,
@@ -104,15 +104,15 @@ impl Settings {
 
     pub fn get_output_format_settings(&self) -> Result<OutputFormatSettings> {
         let tz = self.get_timezone()?;
-        let jiff_timezone = TimeZone::get(&tz).map_err(|_| {
-            ErrorCode::InvalidTimezone("Invalid timezone format - jiff timezone parsing failed")
-        })?;
+        let timezone = tz
+            .parse::<Tz>()
+            .map_err(|_| ErrorCode::InvalidTimezone("Invalid timezone format"))?;
         let geometry_format = self.get_geometry_output_format()?;
         let binary_format = self.get_binary_output_format()?;
         let http_json_result_mode = self.get_http_json_result_mode()?;
         let format_null_as_str = self.get_format_null_as_str()?;
         Ok(OutputFormatSettings {
-            jiff_timezone,
+            timezone,
             geometry_format,
             binary_format,
             http_json_result_mode,
@@ -339,8 +339,43 @@ mod tests {
     use databend_common_meta_app::tenant::Tenant;
 
     use crate::ChangeValue;
+    use crate::DefaultSettings;
     use crate::ScopeLevel;
     use crate::Settings;
+
+    #[test]
+    fn test_recluster_inverted_index_merge_setting() -> Result<()> {
+        let settings = Settings::create(Tenant::new_literal("test"));
+        assert!(settings.get_enable_recluster_inverted_index_merge()?);
+        settings.set_setting("enable_recluster_inverted_index_merge".into(), "1".into())?;
+        let remote: Settings = serde_json::from_str(&serde_json::to_string(&settings)?)?;
+        assert!(remote.get_enable_recluster_inverted_index_merge()?);
+        assert!(
+            settings
+                .set_setting("enable_recluster_inverted_index_merge".into(), "2".into())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_recluster_multiway_merge_setting() -> Result<()> {
+        let settings = Settings::create(Tenant::new_literal("test_tenant"));
+        assert!(settings.get_enable_recluster_multiway_merge()?);
+        settings.set_setting("enable_recluster_multiway_merge".into(), "1".into())?;
+        assert!(settings.get_enable_recluster_multiway_merge()?);
+        // Flight's QueryEnv transports Settings by serde, including session changes.
+        let remote: Settings = serde_json::from_str(&serde_json::to_string(&settings)?)?;
+        assert!(remote.get_enable_recluster_multiway_merge()?);
+        assert!(
+            settings
+                .set_setting("enable_recluster_multiway_merge".into(), "2".into())
+                .is_err()
+        );
+        settings.set_setting("enable_recluster_multiway_merge".into(), "0".into())?;
+        assert!(!settings.get_enable_recluster_multiway_merge()?);
+        Ok(())
+    }
 
     #[test]
     fn test_serialize_and_deserialize_settings() -> Result<()> {
@@ -363,6 +398,15 @@ mod tests {
 
         assert_eq!(settings.tenant.tenant.as_str(), "test_tenant");
         assert_eq!(settings.changes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_writer_memory_pool_setting_default() -> Result<()> {
+        assert_eq!(
+            DefaultSettings::try_get_u64("spill_writer_memory_pool_size_mb")?,
+            20
+        );
         Ok(())
     }
 }

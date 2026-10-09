@@ -33,6 +33,29 @@ use crate::ToProtoOptionExt;
 use crate::VER;
 use crate::reader_check_msg;
 
+impl FromToProto for mt::principal::PublicKeyEntry {
+    type PB = pb::auth_info::PublicKeyEntry;
+    fn get_pb_ver(_p: &Self::PB) -> u64 {
+        0
+    }
+    fn from_pb(p: pb::auth_info::PublicKeyEntry) -> Result<Self, Incompatible>
+    where Self: Sized {
+        Ok(Self {
+            key: p.key,
+            label: p.label,
+            created_at: p.created_at,
+        })
+    }
+
+    fn to_pb(&self) -> pb::auth_info::PublicKeyEntry {
+        pb::auth_info::PublicKeyEntry {
+            key: self.key.clone(),
+            label: self.label.clone(),
+            created_at: self.created_at,
+        }
+    }
+}
+
 impl FromToProto for mt::principal::AuthInfo {
     type PB = pb::AuthInfo;
     fn get_pb_ver(p: &Self::PB) -> u64 {
@@ -49,6 +72,14 @@ impl FromToProto for mt::principal::AuthInfo {
             Some(pb::auth_info::Info::Jwt(pb::auth_info::Jwt {})) => {
                 Ok(mt::principal::AuthInfo::JWT)
             }
+            Some(pb::auth_info::Info::KeyPair(pb::auth_info::KeyPair { public_keys })) => {
+                Ok(mt::principal::AuthInfo::KeyPair {
+                    public_keys: public_keys
+                        .into_iter()
+                        .map(mt::principal::PublicKeyEntry::from_pb)
+                        .collect::<Result<Vec<_>, _>>()?,
+                })
+            }
             Some(pb::auth_info::Info::Password(pb::auth_info::Password {
                 hash_value,
                 hash_method,
@@ -64,12 +95,17 @@ impl FromToProto for mt::principal::AuthInfo {
         }
     }
 
-    fn to_pb(&self) -> Result<pb::AuthInfo, Incompatible> {
+    fn to_pb(&self) -> pb::AuthInfo {
         let info = match self {
             mt::principal::AuthInfo::None => {
                 Some(pb::auth_info::Info::None(pb::auth_info::None {}))
             }
             mt::principal::AuthInfo::JWT => Some(pb::auth_info::Info::Jwt(pb::auth_info::Jwt {})),
+            mt::principal::AuthInfo::KeyPair { public_keys } => {
+                Some(pb::auth_info::Info::KeyPair(pb::auth_info::KeyPair {
+                    public_keys: public_keys.iter().map(|e| e.to_pb()).collect(),
+                }))
+            }
             mt::principal::AuthInfo::Password {
                 hash_value,
                 hash_method,
@@ -80,11 +116,11 @@ impl FromToProto for mt::principal::AuthInfo {
                 need_change: Some(*need_change),
             })),
         };
-        Ok(pb::AuthInfo {
+        pb::AuthInfo {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             info,
-        })
+        }
     }
 }
 
@@ -111,8 +147,8 @@ impl FromToProto for mt::principal::UserOption {
             .with_must_change_password(p.must_change_password))
     }
 
-    fn to_pb(&self) -> Result<pb::UserOption, Incompatible> {
-        Ok(pb::UserOption {
+    fn to_pb(&self) -> pb::UserOption {
+        pb::UserOption {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             flags: self.flags().bits(),
@@ -123,7 +159,7 @@ impl FromToProto for mt::principal::UserOption {
             workload_group: self.workload_group().cloned(),
             disabled: self.disabled().cloned(),
             must_change_password: self.must_change_password().cloned(),
-        })
+        }
     }
 }
 
@@ -143,14 +179,14 @@ impl FromToProto for mt::principal::UserQuota {
         })
     }
 
-    fn to_pb(&self) -> Result<pb::UserQuota, Incompatible> {
-        Ok(pb::UserQuota {
+    fn to_pb(&self) -> pb::UserQuota {
+        pb::UserQuota {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             max_cpu: self.max_cpu,
             max_memory_in_bytes: self.max_memory_in_bytes,
             max_storage_in_bytes: self.max_storage_in_bytes,
-        })
+        }
     }
 }
 
@@ -219,7 +255,7 @@ impl FromToProto for mt::principal::GrantObject {
         }
     }
 
-    fn to_pb(&self) -> Result<pb::GrantObject, Incompatible> {
+    fn to_pb(&self) -> pb::GrantObject {
         let object = match self {
             mt::principal::GrantObject::Global => Some(pb::grant_object::Object::Global(
                 pb::grant_object::GrantGlobalObject {},
@@ -291,11 +327,11 @@ impl FromToProto for mt::principal::GrantObject {
                 ))
             }
         };
-        Ok(pb::GrantObject {
+        pb::GrantObject {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             object,
-        })
+        }
     }
 }
 
@@ -323,13 +359,13 @@ impl FromToProto for mt::principal::GrantEntry {
         ))
     }
 
-    fn to_pb(&self) -> Result<pb::GrantEntry, Incompatible> {
-        Ok(pb::GrantEntry {
+    fn to_pb(&self) -> pb::GrantEntry {
+        pb::GrantEntry {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
-            object: Some(self.object().to_pb()?),
+            object: Some(self.object().to_pb()),
             privileges: self.privileges().bits(),
-        })
+        }
     }
 }
 
@@ -344,15 +380,16 @@ impl FromToProto for mt::principal::UserGrantSet {
 
         let mut entries = Vec::new();
         for entry in p.entries.into_iter() {
-            // If we add new GrantObject in new version
-            // Rollback to old version, GrantEntry.object will be None
-            // GrantEntry::from_pb will return err so user can not login in old version.
-            // Silently dropping unrecognized grant entries and logging the error is
-            // intentional: the node must still start and serve other users even when
-            // some grant entries are unrecognizable (e.g. during a version rollback).
+            // If we add a new GrantObject in a newer version, after rollback its protobuf
+            // oneof variant is unknown and GrantEntry.object will be None.
+            // GrantEntry::from_pb will return an error. Dropping only that entry and logging
+            // a warning is intentional: the principal remains usable, while all other grants
+            // and role memberships are preserved.
             match mt::principal::GrantEntry::from_pb(entry) {
                 Ok(entry) => entries.push(entry),
-                Err(e) => log::error!("GrantEntry::from_pb with error : {e}"),
+                Err(error) => log::warn!(
+                    "Skipped one incompatible grant entry while decoding grants for a user or role: {error}. Impact: only this grant entry is ignored; all other grants and role memberships are preserved, and this incompatibility does not by itself block login"
+                ),
             }
         }
         let mut roles = HashSet::new();
@@ -362,10 +399,10 @@ impl FromToProto for mt::principal::UserGrantSet {
         Ok(mt::principal::UserGrantSet::new(entries, roles))
     }
 
-    fn to_pb(&self) -> Result<pb::UserGrantSet, Incompatible> {
+    fn to_pb(&self) -> pb::UserGrantSet {
         let mut entries = Vec::new();
         for entry in self.entries().iter() {
-            entries.push(entry.to_pb()?);
+            entries.push(entry.to_pb());
         }
 
         let roles = self
@@ -374,12 +411,12 @@ impl FromToProto for mt::principal::UserGrantSet {
             .map(|role| (role.clone(), true))
             .collect::<BTreeMap<_, _>>();
 
-        Ok(pb::UserGrantSet {
+        pb::UserGrantSet {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             entries,
             roles,
-        })
+        }
     }
 }
 
@@ -398,17 +435,17 @@ impl FromToProto for mt::principal::UserInfo {
             auth_info: mt::principal::AuthInfo::from_pb(p.auth_info.ok_or_else(|| {
                 Incompatible::new(format!(
                     "USER {}: UserInfo.auth_info cannot be None",
-                    &p.name
+                    p.name
                 ))
             })?)?,
             grants: mt::principal::UserGrantSet::from_pb(p.grants.ok_or_else(|| {
-                Incompatible::new(format!("user {}: UserInfo.grants cannot be None", &p.name))
+                Incompatible::new(format!("user {}: UserInfo.grants cannot be None", p.name))
             })?)?,
             quota: mt::principal::UserQuota::from_pb(p.quota.ok_or_else(|| {
-                Incompatible::new(format!("user {}: UserInfo.quota cannot be None", &p.name))
+                Incompatible::new(format!("user {}: UserInfo.quota cannot be None", p.name))
             })?)?,
             option: mt::principal::UserOption::from_pb(p.option.ok_or_else(|| {
-                Incompatible::new(format!("user {}: UserInfo.option cannot be None", &p.name))
+                Incompatible::new(format!("user {}: UserInfo.option cannot be None", p.name))
             })?)?,
             history_auth_infos: p
                 .history_auth_infos
@@ -435,31 +472,27 @@ impl FromToProto for mt::principal::UserInfo {
         })
     }
 
-    fn to_pb(&self) -> Result<pb::UserInfo, Incompatible> {
-        Ok(pb::UserInfo {
+    fn to_pb(&self) -> pb::UserInfo {
+        pb::UserInfo {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             name: self.name.clone(),
             hostname: self.hostname.clone(),
-            auth_info: Some(mt::principal::AuthInfo::to_pb(&self.auth_info)?),
-            grants: Some(mt::principal::UserGrantSet::to_pb(&self.grants)?),
-            quota: Some(mt::principal::UserQuota::to_pb(&self.quota)?),
-            option: Some(mt::principal::UserOption::to_pb(&self.option)?),
+            auth_info: Some(mt::principal::AuthInfo::to_pb(&self.auth_info)),
+            grants: Some(mt::principal::UserGrantSet::to_pb(&self.grants)),
+            quota: Some(mt::principal::UserQuota::to_pb(&self.quota)),
+            option: Some(mt::principal::UserOption::to_pb(&self.option)),
             history_auth_infos: self
                 .history_auth_infos
                 .iter()
                 .map(FromToProto::to_pb)
-                .collect::<Result<Vec<pb::AuthInfo>, Incompatible>>()?,
-            password_fails: self
-                .password_fails
-                .iter()
-                .map(FromToProto::to_pb)
-                .collect::<Result<Vec<String>, Incompatible>>()?,
-            password_update_on: self.password_update_on.to_pb_opt()?,
-            lockout_time: self.lockout_time.to_pb_opt()?,
-            created_on: Some(self.created_on.to_pb()?),
-            update_on: Some(self.update_on.to_pb()?),
-        })
+                .collect(),
+            password_fails: self.password_fails.iter().map(FromToProto::to_pb).collect(),
+            password_update_on: self.password_update_on.to_pb_opt(),
+            lockout_time: self.lockout_time.to_pb_opt(),
+            created_on: Some(self.created_on.to_pb()),
+            update_on: Some(self.update_on.to_pb()),
+        }
     }
 }
 
@@ -478,13 +511,13 @@ impl FromToProto for mt::principal::UserIdentity {
         })
     }
 
-    fn to_pb(&self) -> Result<pb::UserIdentity, Incompatible> {
-        Ok(pb::UserIdentity {
+    fn to_pb(&self) -> pb::UserIdentity {
+        pb::UserIdentity {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             username: self.username.clone(),
             hostname: self.hostname.clone(),
-        })
+        }
     }
 }
 
@@ -506,17 +539,17 @@ impl FromToProto for mt::principal::NetworkPolicy {
         })
     }
 
-    fn to_pb(&self) -> Result<pb::NetworkPolicy, Incompatible> {
-        Ok(pb::NetworkPolicy {
+    fn to_pb(&self) -> pb::NetworkPolicy {
+        pb::NetworkPolicy {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             name: self.name.clone(),
             allowed_ip_list: self.allowed_ip_list.clone(),
             blocked_ip_list: self.blocked_ip_list.clone(),
             comment: self.comment.clone(),
-            create_on: self.create_on.to_pb()?,
-            update_on: self.update_on.to_pb_opt()?,
-        })
+            create_on: self.create_on.to_pb(),
+            update_on: self.update_on.to_pb_opt(),
+        }
     }
 }
 
@@ -547,8 +580,8 @@ impl FromToProto for mt::principal::PasswordPolicy {
         })
     }
 
-    fn to_pb(&self) -> Result<pb::PasswordPolicy, Incompatible> {
-        Ok(pb::PasswordPolicy {
+    fn to_pb(&self) -> pb::PasswordPolicy {
+        pb::PasswordPolicy {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             name: self.name.clone(),
@@ -564,8 +597,8 @@ impl FromToProto for mt::principal::PasswordPolicy {
             lockout_time_mins: self.lockout_time_mins,
             history: self.history,
             comment: self.comment.clone(),
-            create_on: self.create_on.to_pb()?,
-            update_on: self.update_on.to_pb_opt()?,
-        })
+            create_on: self.create_on.to_pb(),
+            update_on: self.update_on.to_pb_opt(),
+        }
     }
 }

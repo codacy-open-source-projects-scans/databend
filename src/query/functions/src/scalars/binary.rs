@@ -46,20 +46,22 @@ pub fn register(registry: &mut FunctionRegistry) {
         .each_row(|val, _| val.len() as u64)
         .register();
 
-    registry
-        .scalar_builder("to_string")
-        .function()
-        .typed_1_arg::<BinaryType, StringType>()
-        .passthrough_nullable()
-        .calc_domain(|_, _| FunctionDomain::MayThrow)
-        .vectorized(eval_binary_to_string)
-        .register();
+    registry.register_context_dependent(|registry| {
+        registry
+            .scalar_builder("to_string")
+            .function()
+            .typed_1_arg::<BinaryType, StringType>()
+            .passthrough_nullable()
+            .calc_domain(|_, _| FunctionDomain::MayThrow)
+            .vectorized(eval_binary_to_string)
+            .register();
 
-    registry.register_combine_nullable_1_arg::<BinaryType, StringType, _, _>(
-        "try_to_string",
-        |_, _| FunctionDomain::Full,
-        error_to_null(eval_binary_to_string),
-    );
+        registry.register_combine_nullable_1_arg::<BinaryType, StringType, _, _>(
+            "try_to_string",
+            |_, _| FunctionDomain::Full,
+            error_to_null(eval_binary_to_string),
+        );
+    });
 
     registry
         .scalar_builder("to_jsonb_binary")
@@ -145,18 +147,20 @@ pub fn register(registry: &mut FunctionRegistry) {
         },
     );
 
-    registry
-        .scalar_builder("to_binary")
-        .function()
-        .typed_1_arg::<StringType, BinaryType>()
-        .passthrough_nullable()
-        .calc_domain(|_, _| FunctionDomain::Full)
-        .vectorized(|val, ctx| match ctx.func_ctx.binary_input_format {
-            BinaryDisplayFormat::Hex => eval_unhex(val, ctx),
-            BinaryDisplayFormat::Base64 => eval_from_base64(val, ctx),
-            BinaryDisplayFormat::Utf8 | BinaryDisplayFormat::Utf8Lossy => eval_utf8_bytes(val),
-        })
-        .register();
+    registry.register_context_dependent(|registry| {
+        registry
+            .scalar_builder("to_binary")
+            .function()
+            .typed_1_arg::<StringType, BinaryType>()
+            .passthrough_nullable()
+            .calc_domain(|_, _| FunctionDomain::Full)
+            .vectorized(|val, ctx| match ctx.func_ctx.binary_input_format {
+                BinaryDisplayFormat::Hex => eval_unhex(val, ctx),
+                BinaryDisplayFormat::Base64 => eval_from_base64(val, ctx),
+                BinaryDisplayFormat::Utf8 | BinaryDisplayFormat::Utf8Lossy => eval_utf8_bytes(val),
+            })
+            .register();
+    });
 
     registry.register_passthrough_nullable_2_arg::<StringType, StringType, BinaryType, _, _>(
         "to_binary",
@@ -184,17 +188,19 @@ pub fn register(registry: &mut FunctionRegistry) {
         },
     );
 
-    registry.register_combine_nullable_1_arg::<StringType, BinaryType, _, _>(
-        "try_to_binary",
-        |_, _| FunctionDomain::Full,
-        |val, ctx| match ctx.func_ctx.binary_input_format {
-            BinaryDisplayFormat::Hex => error_to_null(eval_unhex)(val, ctx),
-            BinaryDisplayFormat::Base64 => error_to_null(eval_from_base64)(val, ctx),
-            BinaryDisplayFormat::Utf8 | BinaryDisplayFormat::Utf8Lossy => {
-                eval_utf8_bytes_nullable(val)
-            }
-        },
-    );
+    registry.register_context_dependent(|registry| {
+        registry.register_combine_nullable_1_arg::<StringType, BinaryType, _, _>(
+            "try_to_binary",
+            |_, _| FunctionDomain::Full,
+            |val, ctx| match ctx.func_ctx.binary_input_format {
+                BinaryDisplayFormat::Hex => error_to_null(eval_unhex)(val, ctx),
+                BinaryDisplayFormat::Base64 => error_to_null(eval_from_base64)(val, ctx),
+                BinaryDisplayFormat::Utf8 | BinaryDisplayFormat::Utf8Lossy => {
+                    eval_utf8_bytes_nullable(val)
+                }
+            },
+        );
+    });
 
     registry.register_combine_nullable_2_arg::<StringType, StringType, BinaryType, _, _>(
         "try_to_binary",
@@ -220,7 +226,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry
         .scalar_builder("to_hex")
-        .aliases(&["hex", "hex_encode"])
+        .aliases(&["hex_encode"])
         .function()
         .typed_1_arg::<BinaryType, StringType>()
         .passthrough_nullable()
@@ -228,9 +234,22 @@ pub fn register(registry: &mut FunctionRegistry) {
         .vectorized(vectorize_binary_to_string(
             |col| col.total_bytes_len() * 2,
             |val, output, _| {
-                let extra_len = val.len() * 2;
-                output.row_buffer.resize(extra_len, 0);
-                hex::encode_to_slice(val, &mut output.row_buffer).unwrap();
+                write_hex_lower(val, output);
+                output.commit_row();
+            },
+        ))
+        .register();
+
+    registry
+        .scalar_builder("hex")
+        .function()
+        .typed_1_arg::<BinaryType, StringType>()
+        .passthrough_nullable()
+        .calc_domain(|_, _| FunctionDomain::Full)
+        .vectorized(vectorize_binary_to_string(
+            |col| col.total_bytes_len() * 2,
+            |val, output, _| {
+                write_hex_lower(val, output);
                 output.commit_row();
             },
         ))
@@ -347,6 +366,12 @@ fn eval_unhex(val: Value<StringType>, ctx: &mut EvalContext) -> Value<BinaryType
             output.commit_row();
         },
     )(val, ctx)
+}
+
+pub fn write_hex_lower(bytes: &[u8], output: &mut StringColumnBuilder) {
+    let old_len = output.row_buffer.len();
+    output.row_buffer.resize(old_len + bytes.len() * 2, 0);
+    hex::encode_to_slice(bytes, &mut output.row_buffer[old_len..]).unwrap();
 }
 
 fn eval_from_base64(val: Value<StringType>, ctx: &mut EvalContext) -> Value<BinaryType> {

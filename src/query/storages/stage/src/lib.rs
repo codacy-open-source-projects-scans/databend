@@ -14,8 +14,8 @@
 
 #![allow(internal_features)]
 #![feature(core_intrinsics)]
-#![feature(impl_trait_in_assoc_type)]
-#![feature(box_patterns)]
+#![allow(incomplete_features)]
+#![feature(deref_patterns)]
 #![feature(iter_intersperse)]
 #![allow(
     clippy::collapsible_if,
@@ -24,6 +24,7 @@
 )]
 
 mod append;
+mod avro_utils;
 mod compression;
 mod infer_schema;
 mod read;
@@ -35,6 +36,9 @@ pub use append::StageSinkTable;
 pub use compression::get_compression_with_path;
 pub use infer_schema::InferSchemaPartInfo;
 pub use read::LoadContext;
+pub use read::arrow::ArrowIpcMode;
+pub use read::arrow::infer_arrow_schema;
+pub use read::arrow::infer_arrow_schema_from_file;
 pub use read::row_based::BytesBatch;
 pub use read::row_based::BytesReader;
 pub use read::row_based::Decompressor;

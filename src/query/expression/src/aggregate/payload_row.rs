@@ -19,10 +19,11 @@ use databend_common_io::deserialize_bitmap;
 use databend_common_io::prelude::bincode_deserialize_from_slice;
 use databend_common_io::prelude::bincode_serialize_into_buf;
 
+use super::BATCH_SIZE;
 use super::RowID;
 use super::RowLayout;
+use super::RowMut;
 use super::RowPtr;
-use crate::BATCH_SIZE;
 use crate::BlockEntry;
 use crate::Column;
 use crate::ProjectedBlock;
@@ -36,6 +37,7 @@ use crate::types::DateType;
 use crate::types::DecimalDataKind;
 use crate::types::DecimalScalar;
 use crate::types::DecimalView;
+use crate::types::IntervalType;
 use crate::types::NumberColumn;
 use crate::types::NumberScalar;
 use crate::types::NumberType;
@@ -76,6 +78,7 @@ pub(super) fn rowformat_size(data_type: &DataType) -> usize {
         DataType::Array(_) | DataType::Map(_) | DataType::Tuple(_) | DataType::Vector(_) => 4 + 8,
         DataType::Generic(_) | DataType::StageLocation => unreachable!(),
         DataType::Opaque(size) => size * 8,
+        DataType::AggregateState(state) => rowformat_size(state.physical_type()),
     }
 }
 
@@ -84,7 +87,7 @@ pub(super) unsafe fn serialize_column_to_rowformat(
     arena: &Bump,
     column: &Column,
     select_vector: &[RowID],
-    address: &mut [RowPtr; BATCH_SIZE],
+    address: &mut [RowMut; BATCH_SIZE],
     offset: usize,
     scratch: &mut Vec<u8>,
 ) {
@@ -182,6 +185,13 @@ pub(super) unsafe fn serialize_column_to_rowformat(
                 }
             }
         }
+        Column::Interval(buffer) => {
+            for row in select_vector {
+                unsafe {
+                    address[*row].write(offset, &buffer[*row]);
+                }
+            }
+        }
         Column::Nullable(c) => unsafe {
             serialize_column_to_rowformat(arena, &c.column, select_vector, address, offset, scratch)
         },
@@ -207,14 +217,14 @@ pub(super) unsafe fn serialize_const_column_to_rowformat(
     scalar: &Scalar,
     data_type: &DataType,
     select_vector: &[RowID],
-    address: &mut [RowPtr; BATCH_SIZE],
+    address: &mut [RowMut; BATCH_SIZE],
     offset: usize,
     scratch: &mut Vec<u8>,
 ) {
     unsafe {
         match scalar {
             Scalar::Null => {
-                if let Some(box data_type) = data_type.as_nullable() {
+                if let Some(deref!(data_type)) = data_type.as_nullable() {
                     serialize_const_column_to_rowformat(
                         arena,
                         &Scalar::default_value(data_type),
@@ -299,7 +309,7 @@ pub(super) unsafe fn serialize_const_column_to_rowformat(
 unsafe fn serialize_fixed_size_column_to_rowformat<T>(
     column: &T::Column,
     select_vector: &[RowID],
-    address: &mut [RowPtr; BATCH_SIZE],
+    address: &mut [RowMut; BATCH_SIZE],
     offset: usize,
 ) where
     T: AccessType<Scalar: Copy>,
@@ -438,6 +448,9 @@ impl<'s> CompareState<'s> {
             Column::Date(buffer) => {
                 self.match_column_type::<DateType>(buffer, col_offset, validity, counts)
             }
+            Column::Interval(buffer) => {
+                self.match_column_type::<IntervalType>(buffer, col_offset, validity, counts)
+            }
             Column::String(str_view) => {
                 self.match_validity_with(counts, validity, |row, row_ptr| unsafe {
                     row_ptr.eq_string_view(col_offset, str_view, *row)
@@ -495,6 +508,9 @@ impl<'s> CompareState<'s> {
                 self.match_scalar_type::<TimestampType>(value, col_offset, counts)
             }
             Scalar::Date(value) => self.match_scalar_type::<DateType>(value, col_offset, counts),
+            Scalar::Interval(value) => {
+                self.match_scalar_type::<IntervalType>(value, col_offset, counts)
+            }
             Scalar::String(value) => self.match_with(counts, |_, row_ptr| unsafe {
                 row_ptr.is_bytes_eq(col_offset, value.as_bytes())
             }),
@@ -635,9 +651,9 @@ mod tests {
 
         let mut row0 = vec![0u8; row_size];
         let mut row1 = vec![0u8; row_size];
-        let mut addresses = [RowPtr::null(); BATCH_SIZE];
-        addresses[0] = RowPtr::new(row0.as_mut_ptr());
-        addresses[1] = RowPtr::new(row1.as_mut_ptr());
+        let mut row_muts: [RowMut; BATCH_SIZE] = std::array::from_fn(|_| RowMut::dangling());
+        row_muts[0] = RowMut::new(row0.as_mut_ptr());
+        row_muts[1] = RowMut::new(row1.as_mut_ptr());
 
         let select_vector = [RowID::from(0), RowID::from(1)];
         let mut scratch = Vec::new();
@@ -646,14 +662,15 @@ mod tests {
                 &arena,
                 &column,
                 &select_vector,
-                &mut addresses,
+                &mut row_muts,
                 0,
                 &mut scratch,
             );
         }
 
-        let bytes0 = unsafe { addresses[0].read_bytes(0) };
-        let bytes1 = unsafe { addresses[1].read_bytes(0) };
+        let row_refs = row_muts.map(RowMut::into_ref);
+        let bytes0 = unsafe { row_refs[0].read_bytes(0) };
+        let bytes1 = unsafe { row_refs[1].read_bytes(0) };
 
         assert_eq!(bytes0, bytes1);
         assert!(bytes0.starts_with(b"HB"));

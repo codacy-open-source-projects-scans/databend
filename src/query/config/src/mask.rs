@@ -44,6 +44,7 @@ impl Config {
     pub fn with_mask(self) -> Self {
         Config {
             query: self.query.mask_display(),
+            lineage: self.lineage,
             log: self.log,
             task: self.task,
             meta: self.meta.mask_display(),
@@ -216,9 +217,9 @@ impl SpillConfig {
             spill_local_disk_max_bytes,
             ref storage,
             sort_spilling_disk_quota_ratio,
+            materialized_cte_spilling_disk_quota_ratio,
             window_partition_spilling_disk_quota_ratio,
             result_set_spilling_disk_quota_ratio,
-            spill_buffer_pool_memory,
             spill_buffer_pool_workers,
         } = *self;
 
@@ -228,9 +229,9 @@ impl SpillConfig {
             spill_local_disk_max_bytes,
             storage: storage.as_ref().map(|storage| storage.mask_display()),
             sort_spilling_disk_quota_ratio,
+            materialized_cte_spilling_disk_quota_ratio,
             window_partition_spilling_disk_quota_ratio,
             result_set_spilling_disk_quota_ratio,
-            spill_buffer_pool_memory,
             spill_buffer_pool_workers,
         }
     }
@@ -386,9 +387,9 @@ mod tests {
             spill_local_disk_reserved_space_percentage: 30.0.into(),
             spill_local_disk_max_bytes: 10,
             sort_spilling_disk_quota_ratio: 60,
+            materialized_cte_spilling_disk_quota_ratio: 60,
             window_partition_spilling_disk_quota_ratio: 30,
             result_set_spilling_disk_quota_ratio: 0,
-            spill_buffer_pool_memory: 209715200,
             spill_buffer_pool_workers: 2,
             storage: Some(StorageConfig {
                 typ: "s3".to_string(),

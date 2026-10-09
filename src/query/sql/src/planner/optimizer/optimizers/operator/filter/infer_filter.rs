@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use databend_common_base::base::OrderedFloat;
 use databend_common_exception::Result;
 use databend_common_expression::Scalar;
+use databend_common_expression::conversion::common_super_type_with_conversion;
 use databend_common_expression::type_check::common_super_type;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::NumberDataType;
@@ -83,6 +84,10 @@ impl<'a> InferFilterOptimizer<'a> {
                     if right != func.arguments[1] {
                         func.arguments[1] = right;
                     }
+                    *func.return_type = ScalarExpr::passthrough_nullable_type(DataType::Boolean, [
+                        &func.arguments[0],
+                        &func.arguments[1],
+                    ]);
                 }
             }
         }
@@ -111,7 +116,7 @@ impl<'a> InferFilterOptimizer<'a> {
                         {
                             let (is_adjusted, constant) = adjust_scalar(
                                 constant.value.clone(),
-                                func.arguments[0].data_type()?,
+                                func.arguments[0].data_type().as_ref(),
                             );
                             if is_adjusted {
                                 self.add_expr_predicate(&func.arguments[0], Predicate {
@@ -127,7 +132,7 @@ impl<'a> InferFilterOptimizer<'a> {
                         {
                             let (is_adjusted, constant) = adjust_scalar(
                                 constant.value.clone(),
-                                func.arguments[1].data_type()?,
+                                func.arguments[1].data_type().as_ref(),
                             );
                             if is_adjusted {
                                 self.add_expr_predicate(&func.arguments[1], Predicate {
@@ -184,13 +189,21 @@ impl<'a> InferFilterOptimizer<'a> {
     }
 
     pub fn add_equal_expr(&mut self, left: &ScalarExpr, right: &ScalarExpr) -> bool {
-        let Ok(left_ty) = left.data_type() else {
-            return false;
-        };
-        let Ok(right_ty) = right.data_type() else {
-            return false;
-        };
-        if !Self::check_equal_expr_type(&left_ty, &right_ty) {
+        if left == right {
+            // Returning true tells the caller that this predicate has been absorbed and
+            // can be removed. However, a reflexive equality only forms a singleton
+            // equivalence class, so derive_predicates() will not reconstruct `expr = expr`.
+            // Removing it is valid for a non-nullable operand, but for a nullable operand
+            // the predicate is still needed to reject NULL rows. Return false so the caller
+            // keeps the original predicate.
+            return !left.data_type().is_nullable_or_null();
+        }
+
+        let left_ty = left.data_type();
+        let right_ty = right.data_type();
+        if !common_super_type_with_conversion(left_ty.as_ref(), right_ty.as_ref())
+            .is_some_and(|conversion| conversion.is_safe_for_equality_inference())
+        {
             return false;
         }
         match self.expr_index.get(left) {
@@ -204,26 +217,6 @@ impl<'a> InferFilterOptimizer<'a> {
         };
 
         true
-    }
-
-    // equal expr must have the same type, otherwise the function may fail on execution.
-    fn check_equal_expr_type(left_ty: &DataType, right_ty: &DataType) -> bool {
-        match (left_ty.remove_nullable(), right_ty.remove_nullable()) {
-            (DataType::Number(l), DataType::Number(r)) => {
-                (l.is_integer() && r.is_integer()) || (l.is_float() && r.is_float())
-            }
-            (DataType::Decimal(_), DataType::Decimal(_)) => true,
-            (DataType::Array(box l), DataType::Array(box r)) => Self::check_equal_expr_type(&l, &r),
-            (DataType::Map(box l), DataType::Map(box r)) => Self::check_equal_expr_type(&l, &r),
-            (DataType::Tuple(l_tys), DataType::Tuple(r_tys)) => {
-                l_tys.len() == r_tys.len()
-                    && l_tys
-                        .iter()
-                        .zip(r_tys.iter())
-                        .all(|(l_ty, r_ty)| Self::check_equal_expr_type(l_ty, r_ty))
-            }
-            (_, _) => left_ty.eq(right_ty),
-        }
     }
 
     fn add_expr_predicate(&mut self, expr: &ScalarExpr, new_predicate: Predicate) -> Result<()> {
@@ -269,16 +262,16 @@ impl<'a> InferFilterOptimizer<'a> {
         mut right: Predicate,
     ) -> Result<(MergeResult, Predicate)> {
         // Handle data type compatibility
-        let left_data_type = ScalarExpr::ConstantExpr(left.constant.clone()).data_type()?;
-        let right_data_type = ScalarExpr::ConstantExpr(right.constant.clone()).data_type()?;
+        let left_data_type = left.constant.value.as_ref().infer_data_type();
+        let right_data_type = right.constant.value.as_ref().infer_data_type();
         if left_data_type != right_data_type {
             let cast_rules = &BUILTIN_FUNCTIONS.get_auto_cast_rules("eq");
             let common_data_type = common_super_type(left_data_type, right_data_type, cast_rules);
             if let Some(data_type) = common_data_type {
                 let (left_is_adjusted, left_constant) =
-                    adjust_scalar(left.constant.value.clone(), data_type.clone());
+                    adjust_scalar(left.constant.value.clone(), &data_type);
                 let (right_is_adjusted, right_constant) =
-                    adjust_scalar(right.constant.value.clone(), data_type.clone());
+                    adjust_scalar(right.constant.value.clone(), &data_type);
                 if left_is_adjusted && right_is_adjusted {
                     left.constant = left_constant;
                     right.constant = right_constant;
@@ -700,12 +693,13 @@ impl<'a> InferFilterOptimizer<'a> {
             }
         }
 
-        // Construct predicates for each ScalarExpr.
-        for expr in self.exprs.iter() {
-            let index = self.expr_index.get(expr).unwrap();
-            let parent_index = Self::find(&mut parents, *index);
+        // Construct predicates for each ScalarExpr. `exprs` is indexed by the same
+        // positions recorded in `expr_index`, so the position is the expression index.
+        for (index, expr) in self.exprs.iter().enumerate() {
+            let parent_index = Self::find(&mut parents, index);
             let parent_predicates = &self.expr_predicates[parent_index];
             for predicate in parent_predicates.iter() {
+                let return_type = ScalarExpr::passthrough_nullable_type(DataType::Boolean, [expr]);
                 result.push(ScalarExpr::FunctionCall(FunctionCall {
                     span: None,
                     func_name: String::from(predicate.op.to_func_name()),
@@ -714,6 +708,7 @@ impl<'a> InferFilterOptimizer<'a> {
                         expr.clone(),
                         ScalarExpr::ConstantExpr(predicate.constant.clone()),
                     ],
+                    return_type: Box::new(return_type),
                 }));
             }
         }
@@ -728,6 +723,11 @@ impl<'a> InferFilterOptimizer<'a> {
                     let equal_indexes_len = equal_indexes.len();
                     for i in 0..equal_indexes_len {
                         for j in i + 1..equal_indexes_len {
+                            let return_type =
+                                ScalarExpr::passthrough_nullable_type(DataType::Boolean, [
+                                    &self.exprs[equal_indexes[i]],
+                                    &self.exprs[equal_indexes[j]],
+                                ]);
                             result.push(ScalarExpr::FunctionCall(FunctionCall {
                                 span: None,
                                 func_name: String::from(ComparisonOp::Equal.to_func_name()),
@@ -736,6 +736,7 @@ impl<'a> InferFilterOptimizer<'a> {
                                     self.exprs[equal_indexes[i]].clone(),
                                     self.exprs[equal_indexes[j]].clone(),
                                 ],
+                                return_type: Box::new(return_type),
                             }));
                         }
                     }
@@ -799,6 +800,13 @@ impl<'a> InferFilterOptimizer<'a> {
                     }
                 }
             }
+
+            fn visit_function_call(&mut self, function: &mut FunctionCall) -> Result<()> {
+                for argument in &mut function.arguments {
+                    self.visit(argument)?;
+                }
+                function.refresh_return_type()
+            }
         }
 
         let mut replace = ReplaceScalarExpr {
@@ -812,8 +820,7 @@ impl<'a> InferFilterOptimizer<'a> {
         for predicate in predicates {
             replace.reset();
             let mut new_predicate = predicate.clone();
-            replace.visit(&mut new_predicate).unwrap();
-            if !replace.can_replace {
+            if replace.visit(&mut new_predicate).is_err() || !replace.can_replace {
                 result_predicates.push(predicate);
                 continue;
             }
@@ -880,10 +887,10 @@ impl<'a> JoinProperty<'a> {
     }
 }
 
-pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr) {
+pub fn adjust_scalar(scalar: Scalar, data_type: &DataType) -> (bool, ConstantExpr) {
     match data_type {
         DataType::Number(NumberDataType::UInt8)
-        | DataType::Nullable(box DataType::Number(NumberDataType::UInt8)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::UInt8))) => {
             let (ok, v) = check_uint_range(u8::MAX as u64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -893,7 +900,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::UInt16)
-        | DataType::Nullable(box DataType::Number(NumberDataType::UInt16)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::UInt16))) => {
             let (ok, v) = check_uint_range(u16::MAX as u64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -903,7 +910,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::UInt32)
-        | DataType::Nullable(box DataType::Number(NumberDataType::UInt32)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::UInt32))) => {
             let (ok, v) = check_uint_range(u32::MAX as u64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -913,7 +920,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::UInt64)
-        | DataType::Nullable(box DataType::Number(NumberDataType::UInt64)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::UInt64))) => {
             let (ok, v) = check_uint_range(u64::MAX, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -923,7 +930,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Int8)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Int8)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Int8))) => {
             let (ok, v) = check_int_range(i8::MIN as i64, i8::MAX as i64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -933,7 +940,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Int16)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Int16)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Int16))) => {
             let (ok, v) = check_int_range(i16::MIN as i64, i16::MAX as i64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -943,7 +950,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Int32)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Int32)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Int32))) => {
             let (ok, v) = check_int_range(i32::MIN as i64, i32::MAX as i64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -953,7 +960,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Int64)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Int64)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Int64))) => {
             let (ok, v) = check_int_range(i64::MIN, i64::MAX, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -963,7 +970,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Float32)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Float32)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Float32))) => {
             let (ok, v) = check_float_range(f32::MIN as f64, f32::MAX as f64, &scalar);
             if ok {
                 return (true, ConstantExpr {
@@ -973,7 +980,7 @@ pub fn adjust_scalar(scalar: Scalar, data_type: DataType) -> (bool, ConstantExpr
             }
         }
         DataType::Number(NumberDataType::Float64)
-        | DataType::Nullable(box DataType::Number(NumberDataType::Float64)) => {
+        | DataType::Nullable(deref!(DataType::Number(NumberDataType::Float64))) => {
             let (ok, v) = check_float_range(f64::MIN, f64::MAX, &scalar);
             if ok {
                 return (true, ConstantExpr {

@@ -35,7 +35,7 @@ use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::ColumnId;
-use databend_common_expression::FILE_ROW_NUMBER_COLUMN_ID;
+use databend_common_expression::FILE_LAST_MODIFIED_COLUMN_ID;
 use databend_common_expression::FILENAME_COLUMN_ID;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
@@ -71,6 +71,7 @@ pub struct ParquetTable {
     pub(super) table_info: TableInfo,
     pub(super) arrow_schema: ArrowSchema,
     pub(super) schema_descr: SchemaDescPtr,
+    pub(super) schema_descr_from_arrow_fallback: bool,
     pub(super) files_to_read: Option<Vec<StageFileInfo>>,
     pub(super) schema_from: String,
     pub(super) compression_ratio: f64,
@@ -97,6 +98,7 @@ impl ParquetTable {
             files_info: info.files_info.clone(),
             files_to_read: info.files_to_read.clone(),
             schema_descr: info.schema_descr.clone(),
+            schema_descr_from_arrow_fallback: info.schema_descr_from_arrow_fallback,
             schema_from: info.schema_from.clone(),
             leaf_fields: info.leaf_fields.clone(),
             compression_ratio: info.compression_ratio,
@@ -116,6 +118,7 @@ impl ParquetTable {
         settings: Arc<Settings>,
         query_kind: QueryKind,
         fmt: &ParquetFileFormatParams,
+        has_column_name_ref: bool,
     ) -> Result<Arc<dyn Table>> {
         let operator = init_stage_operator(&stage_info)?;
         let first_file = match &files_to_read {
@@ -124,7 +127,13 @@ impl ParquetTable {
         };
 
         let Some(first_file) = first_file else {
-            return ctx.get_zero_table().await;
+            return if has_column_name_ref {
+                Err(ErrorCode::SemanticError(
+                    "no files found. specify a prefix/pattern/files that matches at least one file",
+                ))
+            } else {
+                ctx.get_zero_table().await
+            };
         };
 
         let first_file = first_file.path;
@@ -157,6 +166,7 @@ impl ParquetTable {
             operator,
             read_options,
             schema_descr,
+            schema_descr_from_arrow_fallback: false,
             leaf_fields,
             stage_info,
             files_info,
@@ -207,7 +217,7 @@ impl Table for ParquetTable {
     }
 
     fn supported_internal_column(&self, column_id: ColumnId) -> bool {
-        (FILE_ROW_NUMBER_COLUMN_ID..=FILENAME_COLUMN_ID).contains(&column_id)
+        (FILE_LAST_MODIFIED_COLUMN_ID..=FILENAME_COLUMN_ID).contains(&column_id)
     }
 
     fn support_prewhere(&self) -> bool {
@@ -225,6 +235,7 @@ impl Table for ParquetTable {
             read_options: self.read_options,
             stage_info: self.stage_info.clone(),
             schema_descr: self.schema_descr.clone(),
+            schema_descr_from_arrow_fallback: self.schema_descr_from_arrow_fallback,
             leaf_fields: self.leaf_fields.clone(),
             files_info: self.files_info.clone(),
             files_to_read: self.files_to_read.clone(),
@@ -314,7 +325,11 @@ impl Table for ParquetTable {
         let metas = read_metas_in_parallel(
             &self.operator,
             &file_locations, // The first file is already read.
-            (self.schema_descr.clone(), self.schema_from.clone()),
+            (
+                self.schema_descr.clone(),
+                self.schema_from.clone(),
+                self.schema_descr_from_arrow_fallback,
+            ),
             self.leaf_fields.clone(),
             self.max_threads,
             self.max_memory_usage,

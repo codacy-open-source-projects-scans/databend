@@ -131,8 +131,8 @@ impl DefaultSettings {
         Ok(Arc::clone(DEFAULT_SETTINGS.get_or_try_init(|| -> Result<Arc<DefaultSettings>> {
             let num_cpus = Self::num_cpus();
             let max_memory_usage = Self::max_memory_usage()?;
+            let max_query_memory_usage = max_memory_usage / 2;
             let recluster_block_size = Self::recluster_block_size(max_memory_usage);
-            let default_max_spill_io_requests = Self::spill_io_requests(num_cpus);
             let default_max_storage_io_requests = Self::storage_io_requests(num_cpus);
             let data_retention_time_in_days_max = Self::data_retention_time_in_days_max();
             let global_conf = GlobalConfig::try_get_instance();
@@ -188,6 +188,13 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(1..=3)),
                 }),
+                ("storage_delete_batch_size", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1000),
+                    desc: "Sets the number of object keys deleted per batch delete request (e.g. S3 DeleteObjects). Larger values reduce request count; defaults to the S3 batch limit of 1000.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=1000)),
+                }),
                 ("max_memory_usage", DefaultSettingValue {
                     value: UserSettingValue::UInt64(max_memory_usage),
                     desc: "Sets the maximum memory usage in bytes for processing a single query.",
@@ -196,14 +203,14 @@ impl DefaultSettings {
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
                 ("max_query_memory_usage", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(0),
+                    value: UserSettingValue::UInt64(max_query_memory_usage),
                     desc: "The maximum memory usage for query. If set to 0, memory usage is unlimited. This setting is the successor/replacement to the older max_memory_usage setting.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
                 ("query_out_of_memory_behavior", DefaultSettingValue {
-                    value: UserSettingValue::String(String::from("throw")),
+                    value: UserSettingValue::String(String::from("spilling")),
                     desc: "If the query memory limit is exceeded, the system will enforce predefined actions (e.g., throw or spilling).",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
@@ -237,13 +244,6 @@ impl DefaultSettings {
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
-                }),
-                ("max_spill_io_requests", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(default_max_spill_io_requests),
-                    desc: "Sets the maximum number of concurrent spill I/O requests.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(1..=1024)),
                 }),
                 ("grouping_sets_channel_size", DefaultSettingValue {
                     value: UserSettingValue::UInt64(2),
@@ -280,6 +280,13 @@ impl DefaultSettings {
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
+                }),
+                ("flight_query_leak_timeout_secs", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(180),
+                    desc: "Sets the maximum time in seconds a node waits after a distributed query environment is initialized for the coordinator to start the query. Once exceeded, the query is treated as leaked and cleaned up. Raise it when fragment preparation (e.g. lazy block pruning of a large DELETE across many nodes) takes longer than the default.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
                 }),
                 ("flight_client_keep_alive_time_secs", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
@@ -343,6 +350,7 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+
                 ("timezone", DefaultSettingValue {
                     value: UserSettingValue::String("UTC".to_owned()),
                     desc: "Sets the timezone.",
@@ -381,13 +389,6 @@ impl DefaultSettings {
                 ("min_max_runtime_filter_threshold", DefaultSettingValue {
                     value: UserSettingValue::UInt64(u64::MAX),
                     desc: "Sets the maximum number of rows for min-max runtime filter generation.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(0..=u64::MAX)),
-                }),
-                ("spatial_runtime_filter_threshold", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1024),
-                    desc: "Sets the maximum number of values in a spatial list for runtime filter generation.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
@@ -476,9 +477,23 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
+                ("enable_top_n", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Enables the fused TopN algorithm for ORDER BY with LIMIT.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("join_spilling_memory_ratio", DefaultSettingValue {
                     value: UserSettingValue::UInt64(60),
                     desc: "Sets the maximum memory ratio in bytes that hash join can use before spilling data to storage during query execution, 0 is unlimited",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=100)),
+                }),
+                ("materialized_cte_spilling_memory_ratio", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(60),
+                    desc: "Sets the maximum memory ratio in bytes that materialized CTE execution can use before spilling data to storage, 0 is unlimited",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=100)),
@@ -496,6 +511,13 @@ impl DefaultSettings {
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
+                }),
+                ("spill_writer_memory_pool_size_mb", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(20),
+                    desc: "Set the memory pool size (MB) for each spill writer.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
                 }),
                 ("spilling_file_format", DefaultSettingValue {
                     value: UserSettingValue::String("parquet".to_string()),
@@ -567,6 +589,20 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+                ("enable_spatial_join", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Enables spatial join for supported inner spatial joins. The smaller side is indexed locally with an R-tree. The setting is off by default.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("spatial_join_max_build_rows", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1_000_000),
+                    desc: "Maximum estimated rows allowed on the spatial join build side.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=u64::MAX)),
+                }),
                 ("join_runtime_filter_selectivity_threshold", DefaultSettingValue {
                     value: UserSettingValue::UInt64(10),
                     desc: "Selectivity threshold (percentage) for bloom join runtime filters. Bloom filters are enabled when (build_rows / build_table_rows * 100) < threshold. Default 10 means 10%.",
@@ -630,6 +666,13 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+                ("enable_cascading_grouping_sets", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Builds hierarchical grouping sets from the closest available parent grouping.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("storage_fetch_part_num", DefaultSettingValue {
                     value: UserSettingValue::UInt64(2),
                     desc: "Sets the number of partitions that are fetched in parallel from storage during query execution.",
@@ -646,7 +689,7 @@ impl DefaultSettings {
                 }),
                 ("hide_options_in_show_create_table", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
-                    desc: "Hides table-relevant information, such as SNAPSHOT_LOCATION and STORAGE_FORMAT, at the end of the result of SHOW TABLE CREATE.",
+                    desc: "Hides table-relevant information, such as SNAPSHOT_LOCATION and STORAGE_FORMAT, at the end of SHOW CREATE TABLE and SHOW CREATE MATERIALIZED VIEW.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -892,6 +935,24 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+                ("analyze_histogram_algorithm", DefaultSettingValue {
+                    value: UserSettingValue::String("window".to_string()),
+                    desc: "Sets the histogram algorithm used by ANALYZE TABLE: window, kll_fast, or kll_full.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::String(vec![
+                        "window".into(),
+                        "kll_fast".into(),
+                        "kll_full".into(),
+                    ])),
+                }),
+                ("analyze_histogram_kll_relative_error", DefaultSettingValue {
+                    value: UserSettingValue::String("0.01".to_string()),
+                    desc: "Sets the relative error used by the KLL analyze histogram algorithm.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: None,
+                }),
                 ("enable_auto_analyze", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
                     desc: "Enables automatically analyze after write, 0 for disable, 1 for enable",
@@ -902,6 +963,13 @@ impl DefaultSettings {
                 ("enable_aggregating_index_scan", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
                     desc: "Enables scanning aggregating index data while querying.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("enable_materialized_view_rewrite", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Enables rewriting queries to scan matching materialized views.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -922,7 +990,7 @@ impl DefaultSettings {
                 }),
                 ("auto_compaction_imperfect_blocks_threshold", DefaultSettingValue {
                     value: UserSettingValue::UInt64(25),
-                    desc: "Threshold for triggering auto compaction. This occurs when the number of imperfect blocks in a snapshot exceeds this value after write operations.",
+                    desc: "Threshold for triggering auto compaction after write. This occurs when the number of imperfect blocks in a snapshot exceeds this value after write operations. Set to 0 to disable auto compaction.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
@@ -962,6 +1030,20 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+                ("enable_recluster_inverted_index_merge", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Reuse compatible inverted indexes during horizontal multiway recluster.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("enable_recluster_multiway_merge", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Enable streaming multiway merge for horizontal recluster MergeBlocks tasks.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("recluster_timeout_secs", DefaultSettingValue {
                     value: UserSettingValue::UInt64(12 * 60 * 60),
                     desc: "Sets the seconds that recluster final will be timeout.",
@@ -991,7 +1073,7 @@ impl DefaultSettings {
                     desc: "Sets the maximum byte size of blocks for recluster",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(0..=u64::MAX)),
+                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
                 }),
                 ("compact_max_block_selection", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1000),
@@ -1099,6 +1181,13 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
                 }),
+                ("enable_table_schema_refresh", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Refresh table schemas from storage when listing system.tables, system.columns, or system.statistics, and refresh system.tables statistics. This reflects changes invisible to the meta server (currently only read-only ATTACH tables). Disabled by default; refreshing an ATTACH table may require multiple storage requests.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("enable_experimental_row_access_policy", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "experiment setting enable row access policy(disable by default).",
@@ -1156,8 +1245,8 @@ impl DefaultSettings {
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
                 ("enable_refresh_aggregating_index_after_write", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1),
-                    desc: "Refresh aggregating index after new data written",
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Deprecated: aggregating index refresh is disabled",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -1193,6 +1282,13 @@ impl DefaultSettings {
                 ("disable_variant_check", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Disable variant check to allow insert invalid JSON values",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("enable_parse_json_variant_reparse", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(1),
+                    desc: "Re-serialize and re-parse VARIANT inputs of parse_json/try_parse_json to repair legacy invalid JSONB values. Set to 0 to return the VARIANT value as is.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -1236,6 +1332,13 @@ impl DefaultSettings {
                 ("use_legacy_query_executor", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Fallback to legacy query executor",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("enable_decimal_sum_widening", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Automatically widen SUM arguments from Decimal(19..38, scale) to Decimal(76, scale).",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -1446,6 +1549,13 @@ impl DefaultSettings {
                     scope: SettingScope::Global,
                     range: None,
                 }),
+                ("max_public_keys_per_user", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(10),
+                    desc: "Maximum number of public keys allowed per user for key-pair authentication",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Global,
+                    range: Some(SettingRange::Numeric(2..=100)),
+                }),
                 ("stream_consume_batch_size_hint", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Hint for batch size during stream consumption. Set it to 0 to disable it. Larger values may improve throughput but could impose greater pressure on stream consumers.",
@@ -1453,33 +1563,19 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=u64::MAX)),
                 }),
+                ("enable_stream_batch_snapshot_forward_scan", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "Enable forward UUID-v7 snapshot scanning when applying a stream batch size hint.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
                 ("warehouse", DefaultSettingValue {
                     value: UserSettingValue::String("".to_string()),
                     desc: "Please use the <use warehouse> statement to set the warehouse, this settings is only used to synchronize the warehouse status between the client and the server.",
                     mode: SettingMode::Both,
                     scope: SettingScope::Session,
                     range: None,
-                }),
-                ("hilbert_num_range_ids", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1000),
-                    desc: "Specifies the domain of range IDs in Hilbert clustering. A larger value provides finer granularity, but may incur a performance cost.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(1..=65535)),
-                }),
-                ("hilbert_sample_size_per_block", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1000),
-                    desc: "Specifies the number of sample points per block used in Hilbert clustering.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
-                }),
-                ("hilbert_clustering_min_bytes", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(100 * 1024 * 1024 * 1024),
-                    desc: "Sets the minimum byte size of blocks for Hilbert Clustering.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(1..=3200 * 1024 * 1024 * 1024)),
                 }),
                 ("enable_prune_cache", DefaultSettingValue {
                     value: UserSettingValue::UInt64(1),
@@ -1519,6 +1615,13 @@ impl DefaultSettings {
                 ("force_aggregate_data_spill", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "For testing only. aggregate data will be forcibly spilled to external storage if enabled",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=1)),
+                }),
+                ("force_materialized_cte_spill", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(0),
+                    desc: "For testing only. materialized CTE data will be forcibly spilled to external storage if enabled",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=1)),
@@ -1566,15 +1669,8 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=100)),
                 }),
-                ("max_aggregate_restore_worker", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(16),
-                    desc: "Sets the maximum number of worker to aggregate restore.",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(1..=1024)),
-                }),
                 ("enable_experimental_virtual_column", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(0),
+                    value: UserSettingValue::UInt64(1),
                     desc: "Enables experimental virtual column",
                     mode: SettingMode::Both,
                     scope: SettingScope::Both,
@@ -1618,13 +1714,6 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::String(vec![S3StorageClass::Standard.to_string(), S3StorageClass::IntelligentTiering.to_string()])),
                 }),
-                ("enable_experiment_aggregate", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1),
-                    desc: "Enable experiment aggregate(enabled by default).",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(0..=1)),
-                }),
                 ("max_aggregate_spill_level", DefaultSettingValue {
                     value: UserSettingValue::UInt64(3),
                     desc: "Maximum recursion depth for the aggregate spill. Each recursion level repartition data into 4 smaller parts to ensure it fits in memory.",
@@ -1653,13 +1742,6 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::String(vec!["auto".into(),"row".into(), "bucket".into()])),
                 }),
-                ("enable_experiment_hash_index", DefaultSettingValue {
-                    value: UserSettingValue::UInt64(1),
-                    desc: "experiment setting enable hash index(enabled by default).",
-                    mode: SettingMode::Both,
-                    scope: SettingScope::Both,
-                    range: Some(SettingRange::Numeric(0..=1)),
-                }),
             ]);
 
             Ok(Arc::new(DefaultSettings {
@@ -1686,16 +1768,6 @@ impl DefaultSettings {
                 true => 48,
                 // This value is chosen based on the performance test of pruning phase on cloud platform.
                 false => 64,
-            },
-        }
-    }
-
-    fn spill_io_requests(num_cpus: u64) -> u64 {
-        match GlobalConfig::try_get_instance() {
-            None => std::cmp::min(num_cpus, 64),
-            Some(conf) => match conf.storage.params.is_fs() {
-                true => 48,
-                false => std::cmp::min(num_cpus, 64),
             },
         }
     }
@@ -1755,7 +1827,7 @@ impl DefaultSettings {
     fn recluster_block_size(max_memory_usage: u64) -> u64 {
         // The sort merge consumes more than twice as much memory,
         // so the block size is set relatively conservatively here.
-        std::cmp::min(max_memory_usage * 30 / 100, 80 * 1024 * 1024 * 1024)
+        std::cmp::min(max_memory_usage * 18 / 100, 80 * 1024 * 1024 * 1024)
     }
 
     /// Converts and validates a setting value based on its key.

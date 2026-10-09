@@ -26,20 +26,25 @@ killall -9 databend-query || true
 killall -9 databend-meta || true
 killall -9 vector || true
 rm -rf ./.databend
+mkdir -p ./.databend/config
 
 echo "Starting Databend Query cluster with 2 nodes enable history tables"
 
 for node in 1 2; do
-    CONFIG_FILE="./scripts/ci/deploy/config/databend-query-node-${node}.toml"
+    SOURCE_CONFIG="./scripts/ci/deploy/config/databend-query-node-${node}.toml"
+    CONFIG_FILE="./.databend/config/databend-query-node-${node}.toml"
 
     echo "Appending history table config to query node-${node}"
+    cp "$SOURCE_CONFIG" "$CONFIG_FILE"
     cat ./tests/logging/history_table/history_table.toml >> "$CONFIG_FILE"
 done
 
 for node in 1 2 3; do
-    CONFIG_FILE="./scripts/ci/deploy/config/databend-meta-node-${node}.toml"
+    SOURCE_CONFIG="./scripts/ci/deploy/config/databend-meta-node-${node}.toml"
+    CONFIG_FILE="./.databend/config/databend-meta-node-${node}.toml"
 
     echo "Appending history table config to meta node-${node}"
+    cp "$SOURCE_CONFIG" "$CONFIG_FILE"
     cat ./tests/logging/history_table/history_table_meta.toml >> "$CONFIG_FILE"
 done
 
@@ -48,35 +53,52 @@ echo 'Start Meta service HA cluster(3 nodes)...'
 
 mkdir -p ./.databend/
 
-nohup ./target/${BUILD_PROFILE}/databend-meta -c scripts/ci/deploy/config/databend-meta-node-1.toml >./.databend/meta-1.out 2>&1 &
+nohup ./target/${BUILD_PROFILE}/databend-meta -c ./.databend/config/databend-meta-node-1.toml >./.databend/meta-1.out 2>&1 &
 python3 scripts/ci/wait_tcp.py --timeout 30 --port 9191
 
 sleep 1
 
-nohup ./target/${BUILD_PROFILE}/databend-meta -c scripts/ci/deploy/config/databend-meta-node-2.toml >./.databend/meta-2.out 2>&1 &
+nohup ./target/${BUILD_PROFILE}/databend-meta -c ./.databend/config/databend-meta-node-2.toml >./.databend/meta-2.out 2>&1 &
 python3 scripts/ci/wait_tcp.py --timeout 30 --port 28202
 
 sleep 1
 
-nohup ./target/${BUILD_PROFILE}/databend-meta -c scripts/ci/deploy/config/databend-meta-node-3.toml >./.databend/meta-3.out 2>&1 &
+nohup ./target/${BUILD_PROFILE}/databend-meta -c ./.databend/config/databend-meta-node-3.toml >./.databend/meta-3.out 2>&1 &
 python3 scripts/ci/wait_tcp.py --timeout 30 --port 28302
 
 sleep 1
 
 # Start only 2 query nodes
 echo 'Start databend-query node-1'
-nohup env RUST_BACKTRACE=1 target/${BUILD_PROFILE}/databend-query -c scripts/ci/deploy/config/databend-query-node-1.toml --internal-enable-sandbox-tenant >./.databend/query-1.out 2>&1 &
+nohup env RUST_BACKTRACE=1 target/${BUILD_PROFILE}/databend-query -c ./.databend/config/databend-query-node-1.toml --internal-enable-sandbox-tenant >./.databend/query-1.out 2>&1 &
 
 echo "Waiting on node-1..."
-python3 scripts/ci/wait_tcp.py --timeout 30 --port 9091
+python3 scripts/ci/wait_tcp.py --timeout 50 --port 9091
 
 echo 'Start databend-query node-2'
-env "RUST_BACKTRACE=1" nohup target/${BUILD_PROFILE}/databend-query -c scripts/ci/deploy/config/databend-query-node-2.toml --internal-enable-sandbox-tenant >./.databend/query-2.out 2>&1 &
+env "RUST_BACKTRACE=1" nohup target/${BUILD_PROFILE}/databend-query -c ./.databend/config/databend-query-node-2.toml --internal-enable-sandbox-tenant >./.databend/query-2.out 2>&1 &
 
 echo "Waiting on node-2..."
-python3 scripts/ci/wait_tcp.py --timeout 30 --port 9092
+python3 scripts/ci/wait_tcp.py --timeout 50 --port 9092
 
 echo "Started 2-node cluster with history tables enabled..."
+
+# A tenant-level observer must see ETL state without joining the workers' cluster.
+sed -e 's/:9093"/:9094"/' -e 's/:8083"/:8084"/' -e 's/:7073"/:7074"/' \
+    -e 's/mysql_handler_port = 3309/mysql_handler_port = 3310/' \
+    -e 's/http_handler_port = 8003/http_handler_port = 8004/' \
+    -e 's/flight_sql_handler_port = 8903/flight_sql_handler_port = 8904/' \
+    -e 's/cluster_id = "test_cluster"/cluster_id = "history_etl_observer"/' \
+    -e 's/warehouse_id = "test_warehouse"/warehouse_id = "history_etl_observer"/' \
+    -e 's/logs_3/logs_observer/' -e 's/structlog_3/structlog_observer/' \
+    scripts/ci/deploy/config/databend-query-node-3.toml > ./.databend/config/history-etl-observer.toml
+# The base config has history logging disabled; only the other nodes run ETL.
+nohup target/${BUILD_PROFILE}/databend-query -c ./.databend/config/history-etl-observer.toml \
+    --internal-enable-sandbox-tenant > ./.databend/query-observer.out 2>&1 &
+observer_pid=$!
+trap 'kill "$observer_pid" 2>/dev/null || true' EXIT
+python3 scripts/ci/wait_tcp.py --timeout 50 --port 8004
+
 
 response=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d '{"sql": "select 123"}')
 drop_query_id=$(echo $response | jq -r '.id')
@@ -85,7 +107,9 @@ echo "Query ID: $drop_query_id"
 echo "Running test queries to test inner history tables"
 ./tests/logging/history_table/run_all_tests.sh
 
-response1=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d "{\"sql\": \"select * from system_history.log_history where query_id = '${drop_query_id}'\"}")
+# Check query events only: HTTP cleanup can emit new diagnostic logs with the same
+# query_id after the storage reset. Those are not records retained from the old table.
+response1=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d "{\"sql\": \"select * from system_history.log_history where query_id = '${drop_query_id}' and target = 'databend::log::query'\"}")
 
 meta_count_response=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d "{\"sql\": \"select count(*) from system_history.log_history where message like 'Databend Meta version%'\"}")
 
@@ -126,12 +150,14 @@ fi
 
 echo "Add a node with external history table enabled"
 
-CONFIG_FILE="./scripts/ci/deploy/config/databend-query-node-3.toml"
+SOURCE_CONFIG="./scripts/ci/deploy/config/databend-query-node-3.toml"
+CONFIG_FILE="./.databend/config/databend-query-node-3.toml"
 echo "Appending external history table config to node-3"
+cp "$SOURCE_CONFIG" "$CONFIG_FILE"
 cat ./tests/logging/history_table/history_table_external.toml >> "$CONFIG_FILE"
 
 echo 'Start databend-query node-3'
-env "RUST_BACKTRACE=1" nohup target/${BUILD_PROFILE}/databend-query -c scripts/ci/deploy/config/databend-query-node-3.toml --internal-enable-sandbox-tenant >./.databend/query-3.out 2>&1 &
+env "RUST_BACKTRACE=1" nohup target/${BUILD_PROFILE}/databend-query -c "$CONFIG_FILE" --internal-enable-sandbox-tenant >./.databend/query-3.out 2>&1 &
 
 echo "Waiting on node-3..."
 python3 scripts/ci/wait_tcp.py --timeout 30 --port 9093
@@ -143,9 +169,17 @@ echo "Running test queries to test external history tables"
 ./tests/logging/history_table/run_all_tests.sh
 
 
-response2=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d "{\"sql\": \"select * from system_history.log_history where query_id = '${drop_query_id}'\"}")
+response2=$(curl -s -u root: -XPOST "http://localhost:8000/v1/query" -H 'Content-Type: application/json' -d "{\"sql\": \"select * from system_history.log_history where query_id = '${drop_query_id}' and target = 'databend::log::query'\"}")
 
 echo "Validating responses..."
+
+for response in "$response1" "$response2"; do
+    if ! echo "$response" | jq -e '.state == "Succeeded" and .error == null' > /dev/null; then
+        echo "ERROR: failed to query history records for the storage reset check"
+        echo "$response"
+        exit 1
+    fi
+done
 
 # Check response1 data field is not empty
 response1_data=$(echo "$response1" | jq -r '.data')

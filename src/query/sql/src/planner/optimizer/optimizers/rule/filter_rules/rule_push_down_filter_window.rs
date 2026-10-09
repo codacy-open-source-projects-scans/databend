@@ -16,13 +16,16 @@ use std::sync::Arc;
 
 use crate::ColumnSet;
 use crate::optimizer::ir::Matcher;
+use crate::optimizer::ir::RelExpr;
 use crate::optimizer::ir::SExpr;
 use crate::optimizer::optimizers::rule::Rule;
 use crate::optimizer::optimizers::rule::RuleID;
 use crate::optimizer::optimizers::rule::TransformResult;
 use crate::plans::Filter;
 use crate::plans::RelOp;
+use crate::plans::RelOperator;
 use crate::plans::Window;
+use crate::plans::WindowGroup;
 
 /// Input:   Filter
 ///           \
@@ -56,13 +59,22 @@ impl RulePushDownFilterWindow {
     pub fn new() -> Self {
         Self {
             id: RuleID::PushDownFilterWindow,
-            matchers: vec![Matcher::MatchOp {
-                op_type: RelOp::Filter,
-                children: vec![Matcher::MatchOp {
-                    op_type: RelOp::Window,
-                    children: vec![Matcher::Leaf],
-                }],
-            }],
+            matchers: vec![
+                Matcher::MatchOp {
+                    op_type: RelOp::Filter,
+                    children: vec![Matcher::MatchOp {
+                        op_type: RelOp::Window,
+                        children: vec![Matcher::Leaf],
+                    }],
+                },
+                Matcher::MatchOp {
+                    op_type: RelOp::Filter,
+                    children: vec![Matcher::MatchOp {
+                        op_type: RelOp::WindowGroup,
+                        children: vec![Matcher::Leaf],
+                    }],
+                },
+            ],
         }
     }
 }
@@ -79,14 +91,31 @@ impl Rule for RulePushDownFilterWindow {
     ) -> databend_common_exception::Result<()> {
         let Filter { predicates } = s_expr.plan().clone().try_into()?;
         let window_expr = s_expr.child(0)?;
-        let window: Window = window_expr.plan().clone().try_into()?;
-        let allowed = window.partition_by_columns()?;
-        let rejected = ColumnSet::from_iter(
-            window
-                .order_by_columns()?
-                .into_iter()
-                .chain(window.function.used_columns()),
-        );
+        let (window_plan, allowed, rejected) =
+            if matches!(window_expr.plan(), RelOperator::WindowGroup(_)) {
+                let window_group: WindowGroup = window_expr.plan().clone().try_into()?;
+                let mut allowed = window_group_partition_by_columns(&window_group)?;
+                // WindowGroup evaluates its scalar inputs internally. A reused
+                // partition expression can reference a column that does not yet
+                // exist below the group.
+                let child_columns = RelExpr::with_s_expr(window_expr.child(0)?)
+                    .derive_relational_prop()?
+                    .output_columns
+                    .clone();
+                allowed.retain(|column| child_columns.contains(column));
+                let rejected = window_group_rejected_columns(&window_group)?;
+                (RelOperator::WindowGroup(window_group), allowed, rejected)
+            } else {
+                let window: Window = window_expr.plan().clone().try_into()?;
+                let allowed = window.partition_by_columns()?;
+                let rejected = ColumnSet::from_iter(
+                    window
+                        .order_by_columns()?
+                        .into_iter()
+                        .chain(window.function.used_columns()),
+                );
+                (RelOperator::Window(window), allowed, rejected)
+            };
 
         let (pushed_down, remaining): (Vec<_>, Vec<_>) =
             predicates.into_iter().partition(|predicate| {
@@ -102,7 +131,7 @@ impl Rule for RulePushDownFilterWindow {
         };
         let result = if remaining.is_empty() {
             SExpr::create_unary(
-                Arc::new(window.into()),
+                Arc::new(window_plan),
                 Arc::new(SExpr::create_unary(
                     Arc::new(pushed_down_filter.into()),
                     Arc::new(window_expr.child(0)?.clone()),
@@ -115,7 +144,7 @@ impl Rule for RulePushDownFilterWindow {
             let mut s_expr = SExpr::create_unary(
                 Arc::new(remaining_filter.into()),
                 Arc::new(SExpr::create_unary(
-                    Arc::new(window.into()),
+                    Arc::new(window_plan),
                     Arc::new(SExpr::create_unary(
                         Arc::new(pushed_down_filter.into()),
                         Arc::new(window_expr.child(0)?.clone()),
@@ -132,6 +161,34 @@ impl Rule for RulePushDownFilterWindow {
     fn matchers(&self) -> &[Matcher] {
         &self.matchers
     }
+}
+
+fn window_group_partition_by_columns(
+    window_group: &WindowGroup,
+) -> databend_common_exception::Result<ColumnSet> {
+    let Some(first) = window_group.windows.first() else {
+        return Ok(ColumnSet::new());
+    };
+
+    let mut allowed = first.partition_by_columns()?;
+    for window in window_group.windows.iter().skip(1) {
+        allowed = allowed
+            .intersection(&window.partition_by_columns()?)
+            .copied()
+            .collect();
+    }
+    Ok(allowed)
+}
+
+fn window_group_rejected_columns(
+    window_group: &WindowGroup,
+) -> databend_common_exception::Result<ColumnSet> {
+    let mut rejected = ColumnSet::new();
+    for window in &window_group.windows {
+        rejected.extend(window.order_by_columns()?);
+        rejected.extend(window.function.used_columns());
+    }
+    Ok(rejected)
 }
 
 impl Default for RulePushDownFilterWindow {

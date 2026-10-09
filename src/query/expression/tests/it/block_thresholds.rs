@@ -72,19 +72,44 @@ fn test_check_too_small() {
 }
 
 #[test]
-fn test_calc_rows_for_compact() {
+fn test_calc_compact_block_num() {
     let t = default_thresholds();
 
-    assert_eq!(t.calc_rows_for_compact(500_000, 1000), 1000);
+    assert_eq!(t.calc_compact_block_num(1000, 500_000), 1);
+    assert_eq!(t.calc_compact_block_num(1800, 500_000), 2);
+    assert_eq!(t.calc_compact_block_num(10_000, 500_000), 10);
+    assert_eq!(t.calc_compact_block_num(1000, 1_800_000), 2);
+    assert_eq!(t.calc_compact_block_num(1000, 4_000_000), 4);
+}
 
-    // Block number by rows wins → max_rows_per_block
+#[test]
+fn test_threshold_arithmetic_at_usize_limit() {
+    for value in [0, 1, 4, 5, 6, 1000, usize::MAX / 2, usize::MAX] {
+        let expected = ((value as u128 * 4).div_ceil(5)) as usize;
+        assert_eq!(BlockThresholds::min_block_threshold(value), expected);
+    }
+
+    let thresholds = BlockThresholds::new(usize::MAX, usize::MAX, usize::MAX, 4);
+    assert_eq!(thresholds.max_bytes_per_block, usize::MAX);
     assert_eq!(
-        t.calc_rows_for_compact(2_000_000, 10_000),
-        t.max_rows_per_block
+        default_thresholds()
+            .set_bytes_per_block(usize::MAX)
+            .max_bytes_per_block,
+        usize::MAX
     );
-
-    // Size-based block number wins
-    assert_eq!(t.calc_rows_for_compact(4_000_000, 2000), 400);
+    assert!(!thresholds.check_perfect_segment(4, usize::MAX - 1, 1, 1));
+    assert!(!thresholds.check_perfect_segment(4, 1, usize::MAX - 1, 1));
+    assert!(!thresholds.check_perfect_segment(4, 1, 1, usize::MAX - 1));
+    assert!(thresholds.check_for_compact(usize::MAX - 1, usize::MAX - 1));
+    assert!(!thresholds.check_too_large(usize::MAX - 1, usize::MAX - 1));
+    assert_eq!(
+        thresholds.calc_compact_block_num(usize::MAX - 1, usize::MAX - 1),
+        1
+    );
+    assert_eq!(
+        thresholds.calc_rows_for_recluster(usize::MAX - 1, usize::MAX - 1, usize::MAX - 1),
+        (usize::MAX - 1, usize::MAX.div_ceil(2))
+    );
 }
 
 #[test]
@@ -92,23 +117,35 @@ fn test_calc_rows_for_recluster() {
     let t = default_thresholds();
 
     // compact enough to skip further calculations
-    assert_eq!(t.calc_rows_for_recluster(1000, 500_000, 100_000), 1000);
-
-    // row-based block count exceeds compressed-based block count, use max rows per block.
     assert_eq!(
-        t.calc_rows_for_recluster(10_000, 2_000_000, 100_000),
-        t.max_rows_per_block
+        t.calc_rows_for_recluster(1000, 500_000, 100_000),
+        (1000, 1_000_000)
     );
 
-    // Case 1: If the block size is too bigger.
-    let result = t.calc_rows_for_recluster(4_000, 30_000_000, 600_000);
-    assert_eq!(result, 267);
+    // Row-based block count is the largest, so derive both targets from that block count.
+    assert_eq!(
+        t.calc_rows_for_recluster(10_000, 2_000_000, 100_000),
+        (834, 166_667)
+    );
 
-    // Case 2: If the block size is too smaller.
-    let result = t.calc_rows_for_recluster(4_000, 2_000_000, 600_000);
-    assert_eq!(result, 800);
+    // The max-byte constraint requires more blocks than rows and compressed size.
+    assert_eq!(
+        t.calc_rows_for_recluster(10_000, 30_000_000, 1_000_000),
+        (667, 2_000_000)
+    );
 
-    // Case 3: use the compressed-based block count.
-    let result = t.calc_rows_for_recluster(4_000, 10_000_000, 600_000);
-    assert_eq!(result, 667);
+    // The compressed-size target would create blocks below min_bytes_per_block.
+    assert_eq!(
+        t.calc_rows_for_recluster(1_000, 1_600_000, 600_000),
+        (500, 800_000)
+    );
+
+    // The smallest valid byte size still keeps the selected block count nonzero.
+    assert_eq!(t.calc_rows_for_recluster(2_000, 1, 300_000), (2_000, 1));
+
+    // The compressed-size target is within the byte-size range.
+    assert_eq!(
+        t.calc_rows_for_recluster(4_000, 10_000_000, 600_000),
+        (667, 1_666_667)
+    );
 }

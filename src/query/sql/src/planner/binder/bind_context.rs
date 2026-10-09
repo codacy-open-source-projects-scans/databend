@@ -39,11 +39,11 @@ use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchemaRef;
 use databend_common_expression::TableSchemaRefExt;
+use databend_common_expression::VIRTUAL_COLUMN_ID_START;
 use databend_common_expression::infer_schema_type;
 use databend_common_meta_app::principal::UserDefinedFunction;
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
-use itertools::Itertools;
 use jsonb::keypath::OwnedKeyPaths;
 use parking_lot::RwLock;
 
@@ -63,6 +63,39 @@ use crate::binder::window::WindowInfo;
 use crate::normalize_identifier;
 use crate::optimizer::ir::SExpr;
 use crate::plans::ScalarExpr;
+
+#[derive(Clone, Copy)]
+pub struct AliasLookup<'a> {
+    aliases: &'a [(String, ScalarExpr)],
+    indices: Option<&'a [usize]>,
+}
+
+impl<'a> AliasLookup<'a> {
+    pub fn all(aliases: &'a [(String, ScalarExpr)]) -> Self {
+        Self {
+            aliases,
+            indices: None,
+        }
+    }
+
+    pub fn indexed(aliases: &'a [(String, ScalarExpr)], indices: &'a [usize]) -> Self {
+        Self {
+            aliases,
+            indices: Some(indices),
+        }
+    }
+
+    fn len(self) -> usize {
+        self.indices.map_or(self.aliases.len(), <[usize]>::len)
+    }
+
+    fn iter(self) -> impl Iterator<Item = &'a (String, ScalarExpr)> {
+        (0..self.len()).map(move |index| {
+            let index = self.indices.map_or(index, |indices| indices[index]);
+            &self.aliases[index]
+        })
+    }
+}
 
 /// Context of current expression, this is used to check if
 /// the expression is valid in current context.
@@ -125,11 +158,88 @@ pub enum NameResolutionResult {
     Alias { alias: String, scalar: ScalarExpr },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Default)]
+struct NameResolutionCandidates {
+    first: Option<NameResolutionResult>,
+    ambiguous: bool,
+}
+
+impl NameResolutionCandidates {
+    fn push(&mut self, candidate: NameResolutionResult) {
+        match &self.first {
+            Some(first) if first != &candidate => self.ambiguous = true,
+            Some(_) => {}
+            None => self.first = Some(candidate),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct VirtualColumnName {
     pub table_index: IndexType,
     pub source_column_id: ColumnId,
     pub key_name: String,
+    /// The combination of `cast type` and `is try` originates from the `CAST(x AS T)`
+    /// and `TRY_CAST(x AS T)` functions, different types with the same `key_name`
+    /// will generate different virtual column binding.
+    pub target_cast: Option<(TableDataType, bool)>,
+    /// Cached sort key used by `Ord`/`Eq`, derived from `target_cast` once at construction.
+    sort_key: Option<Arc<str>>,
+}
+
+impl VirtualColumnName {
+    pub fn new(
+        table_index: IndexType,
+        source_column_id: ColumnId,
+        key_name: String,
+        target_cast: Option<(TableDataType, bool)>,
+    ) -> Self {
+        // Normalize: always store non-nullable target type so equivalent casts unify.
+        let target_cast = target_cast.map(|(ty, is_try)| (ty.remove_nullable(), is_try));
+        let sort_key = target_cast
+            .as_ref()
+            .map(|(ty, is_try)| Arc::<str>::from(format!("{}#{}", ty.wrapped_display(), *is_try)));
+        Self {
+            table_index,
+            source_column_id,
+            key_name,
+            target_cast,
+            sort_key,
+        }
+    }
+
+    fn cmp_key(&self) -> (IndexType, ColumnId, &str, Option<&str>) {
+        (
+            self.table_index,
+            self.source_column_id,
+            self.key_name.as_str(),
+            self.sort_key.as_deref(),
+        )
+    }
+}
+
+impl PartialEq for VirtualColumnName {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_key() == other.cmp_key()
+    }
+}
+
+impl Eq for VirtualColumnName {}
+
+impl Ord for VirtualColumnName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp_key().cmp(&other.cmp_key())
+    }
+}
+
+impl PartialOrd for VirtualColumnName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -190,9 +300,9 @@ pub struct BindContext {
 
     pub expr_context: ExprContext,
 
-    /// If true, the query is planning for aggregate index.
-    /// It's used to avoid infinite loop.
-    pub planning_agg_index: bool,
+    /// If true, the query is binding materialized-view rewrite candidates.
+    /// It's used to avoid recursively discovering candidates for candidate plans.
+    pub planning_materialized_view_rewrite: bool,
 
     pub window_definitions: DashMap<String, WindowSpec>,
 }
@@ -202,6 +312,9 @@ pub struct CteContext {
     /// If the `BindContext` is created from a CTE, record the cte name
     pub cte_name: Option<String>,
     pub cte_map: Box<IndexMap<String, CteInfo>>,
+    /// Pending output columns generated by materialized CTE virtual-column rewrite.
+    /// `init_cte` consumes this map and stores the per-CTE result in `CteInfo`.
+    pub virtual_column_outputs: HashMap<String, BTreeSet<String>>,
 }
 
 impl CteContext {
@@ -223,30 +336,44 @@ impl CteContext {
     // Set cte context to current `BindContext`.
     pub fn set_cte_context(&mut self, cte_context: CteContext) {
         self.cte_map = cte_context.cte_map;
+        self.virtual_column_outputs = cte_context.virtual_column_outputs;
     }
 
     // Set cte context to current `BindContext`.
     pub fn set_cte_context_and_name(&mut self, cte_context: CteContext) {
         self.cte_map = cte_context.cte_map;
         self.cte_name = cte_context.cte_name;
+        self.virtual_column_outputs = cte_context.virtual_column_outputs;
     }
 }
 
+/// `CteInfo` is cloned whenever a `CteContext` is cloned, which happens for every
+/// nested `BindContext` and every table reference. Keep the heavy payloads
+/// (`query`, `materialized_cte_info`) behind `Arc` so that cloning the map is
+/// cheap and does not deep-copy previously bound CTE definitions.
 #[derive(Clone, Debug)]
 pub struct CteInfo {
     pub columns_alias: Vec<String>,
-    pub query: Query,
+    pub virtual_column_outputs: BTreeSet<String>,
+    pub query: Arc<Query>,
     pub recursive: bool,
     pub logical_recursive_cte_id: Option<u32>,
     pub columns: Vec<ColumnBinding>,
-    pub materialized_cte_info: Option<MaterializedCTEInfo>,
+    pub materialized_cte_info: Option<Arc<MaterializedCTEInfo>>,
     pub user_specified_materialized: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct MaterializedCTEInfo {
+    pub cte_name: String,
     pub bound_s_expr: SExpr,
-    pub bound_context: BindContext,
+    /// Output column bindings of the producer side of this CTE.
+    ///
+    /// Only the columns are kept here. Storing the whole producer `BindContext`
+    /// would embed its `cte_map` (and therefore every previously bound CTE)
+    /// into this entry, making the size of `CteInfo` grow exponentially with
+    /// the number of materialized CTEs.
+    pub bound_columns: Vec<ColumnBinding>,
 }
 
 impl BindContext {
@@ -270,7 +397,7 @@ impl BindContext {
             vector_index_map: Box::default(),
             allow_virtual_column: false,
             expr_context: ExprContext::default(),
-            planning_agg_index: false,
+            planning_materialized_view_rewrite: false,
             window_definitions: DashMap::new(),
         }
     }
@@ -317,7 +444,7 @@ impl BindContext {
             vector_index_map: Box::default(),
             allow_virtual_column: parent.allow_virtual_column,
             expr_context: ExprContext::default(),
-            planning_agg_index: false,
+            planning_materialized_view_rewrite: parent.planning_materialized_view_rewrite,
             window_definitions: DashMap::new(),
         })
     }
@@ -398,9 +525,58 @@ impl BindContext {
         database: Option<&str>,
         table: Option<&str>,
         column: &Identifier,
-        available_aliases: &[(String, ScalarExpr)],
+        available_aliases: AliasLookup<'_>,
         name_resolution_ctx: &NameResolutionContext,
     ) -> Result<NameResolutionResult> {
+        let result = self.resolve_name_candidates(
+            database,
+            table,
+            column,
+            available_aliases,
+            name_resolution_ctx,
+        )?;
+        Self::finish_resolve_name(column, result)
+    }
+
+    pub(crate) fn resolve_name_with_alias_fallback(
+        &self,
+        database: Option<&str>,
+        table: Option<&str>,
+        column: &Identifier,
+        available_aliases: AliasLookup<'_>,
+        fallback_aliases: Option<AliasLookup<'_>>,
+        name_resolution_ctx: &NameResolutionContext,
+    ) -> Result<NameResolutionResult> {
+        let mut result = self.resolve_name_candidates(
+            database,
+            table,
+            column,
+            available_aliases,
+            name_resolution_ctx,
+        )?;
+        if result.is_empty()
+            && let Some(fallback_aliases) = fallback_aliases
+        {
+            result = self.resolve_name_candidates(
+                database,
+                table,
+                column,
+                fallback_aliases,
+                name_resolution_ctx,
+            )?;
+        }
+
+        Self::finish_resolve_name(column, result)
+    }
+
+    fn resolve_name_candidates(
+        &self,
+        database: Option<&str>,
+        table: Option<&str>,
+        column: &Identifier,
+        available_aliases: AliasLookup<'_>,
+        name_resolution_ctx: &NameResolutionContext,
+    ) -> Result<NameResolutionCandidates> {
         let name = &column.name;
         let column_case_sensitive = name_resolution_ctx.is_case_sensitive(column);
         if name_resolution_ctx.deny_column_reference {
@@ -414,9 +590,8 @@ impl BindContext {
             return Err(err.set_span(column.span));
         }
 
-        let mut result = vec![];
+        let mut result = NameResolutionCandidates::default();
         // Lookup parent context to resolve outer reference.
-        let mut alias_match_count = 0;
         if !self.expr_context.allow_resolve_alias() {
             self.search_bound_columns_recursively(
                 database,
@@ -426,18 +601,16 @@ impl BindContext {
                 &mut result,
             );
         } else if self.expr_context.prefer_resolve_alias() {
-            for (alias, scalar) in available_aliases {
+            for (alias, scalar) in available_aliases.iter() {
                 if database.is_none() && table.is_none() && name == alias {
                     result.push(NameResolutionResult::Alias {
                         alias: alias.clone(),
                         scalar: scalar.clone(),
                     });
-
-                    alias_match_count += 1;
                 }
             }
 
-            if alias_match_count == 0 {
+            if result.is_empty() {
                 self.search_bound_columns_recursively(
                     database,
                     table,
@@ -456,7 +629,7 @@ impl BindContext {
             );
 
             if result.is_empty() {
-                for (alias, scalar) in available_aliases {
+                for (alias, scalar) in available_aliases.iter() {
                     if database.is_none() && table.is_none() && name == alias {
                         result.push(NameResolutionResult::Alias {
                             alias: alias.clone(),
@@ -467,14 +640,24 @@ impl BindContext {
             }
         }
 
-        if result.len() > 1 && !result.iter().all_equal() {
+        Ok(result)
+    }
+
+    fn finish_resolve_name(
+        column: &Identifier,
+        result: NameResolutionCandidates,
+    ) -> Result<NameResolutionResult> {
+        let name = &column.name;
+        if result.ambiguous {
             return Err(ErrorCode::SemanticError(format!(
                 "column {name} reference or alias is ambiguous, please use another alias name",
             ))
             .set_span(column.span));
         }
 
-        if result.is_empty() {
+        if let Some(result) = result.first {
+            Ok(result)
+        } else {
             let err = if column.is_quoted() {
                 ErrorCode::SemanticError(format!(
                     "column {name} doesn't exist, do you mean '{name}'?"
@@ -483,8 +666,6 @@ impl BindContext {
                 ErrorCode::SemanticError(format!("column {name} doesn't exist"))
             };
             Err(err.set_span(column.span))
-        } else {
-            Ok(result.remove(0))
         }
     }
 
@@ -519,51 +700,24 @@ impl BindContext {
 
     // Search bound column recursively from the parent context.
     // If current context found results, it'll stop searching.
-    pub fn search_bound_columns_recursively(
+    fn search_bound_columns_recursively(
         &self,
         database: Option<&str>,
         table: Option<&str>,
         column: &Identifier,
         column_case_sensitive: bool,
-        result: &mut Vec<NameResolutionResult>,
+        result: &mut NameResolutionCandidates,
     ) {
         let mut bind_context: &BindContext = self;
         loop {
-            for column_binding in bind_context.columns.iter() {
-                if let Some(lower) = &column_binding.column_name_lower {
-                    if !column_case_sensitive
-                        && &column.name == lower
-                        && Self::match_column_binding_case_insensitive(
-                            database,
-                            table,
-                            column_binding,
-                        )
-                    {
-                        let mut binding = column_binding.clone();
-                        binding.column_name = lower.clone();
-                        result.push(NameResolutionResult::Column(binding));
-                        continue;
-                    }
-                }
-                if Self::match_column_binding(database, table, &column.name, column_binding) {
-                    result.push(NameResolutionResult::Column(column_binding.clone()));
-                }
-            }
-
-            if !result.is_empty() {
-                return;
-            }
-
-            // look up internal column
-            if let Some(internal_column) = INTERNAL_COLUMN_FACTORY.get_internal_column(&column.name)
-            {
-                let column_binding = InternalColumnBinding {
-                    database_name: database.map(|n| n.to_owned()),
-                    table_name: table.map(|n| n.to_owned()),
-                    internal_column,
-                };
-                result.push(NameResolutionResult::InternalColumn(column_binding));
-            }
+            Self::search_bound_columns_in_context(
+                bind_context,
+                database,
+                table,
+                column,
+                column_case_sensitive,
+                result,
+            );
 
             if !result.is_empty() {
                 return;
@@ -574,6 +728,46 @@ impl BindContext {
             } else {
                 break;
             }
+        }
+    }
+
+    fn search_bound_columns_in_context(
+        bind_context: &BindContext,
+        database: Option<&str>,
+        table: Option<&str>,
+        column: &Identifier,
+        column_case_sensitive: bool,
+        result: &mut NameResolutionCandidates,
+    ) {
+        for column_binding in bind_context.columns.iter() {
+            if let Some(lower) = &column_binding.column_name_lower {
+                if !column_case_sensitive
+                    && &column.name == lower
+                    && Self::match_column_binding_case_insensitive(database, table, column_binding)
+                {
+                    let mut binding = column_binding.clone();
+                    binding.column_name = lower.clone();
+                    result.push(NameResolutionResult::Column(binding));
+                    continue;
+                }
+            }
+            if Self::match_column_binding(database, table, &column.name, column_binding) {
+                result.push(NameResolutionResult::Column(column_binding.clone()));
+            }
+        }
+
+        if !result.is_empty() {
+            return;
+        }
+
+        // look up internal column
+        if let Some(internal_column) = INTERNAL_COLUMN_FACTORY.get_internal_column(&column.name) {
+            let column_binding = InternalColumnBinding {
+                database_name: database.map(|n| n.to_owned()),
+                table_name: table.map(|n| n.to_owned()),
+                internal_column,
+            };
+            result.push(NameResolutionResult::InternalColumn(column_binding));
         }
     }
 
@@ -852,52 +1046,41 @@ impl BindContext {
         {
             btree_map::Entry::Vacant(e) => {
                 let mut metadata = metadata.write();
-                let table_entry = metadata.table(table_index);
-                let table = table_entry.table();
-                let table_info = table.get_table_info();
-
-                let virtual_schema = table_info.meta.virtual_schema.as_ref()?;
-                let mut column_id = None;
-                for virtual_field in &virtual_schema.fields {
-                    if virtual_field.source_column_id == virtual_column_name.source_column_id
-                        && virtual_field.name == virtual_column_name.key_name
-                    {
-                        column_id = Some(virtual_field.column_id);
-                        break;
-                    }
-                }
-                let column_id = if let Some(column_id) = column_id {
-                    column_id
-                } else {
-                    // If the column_id does not exist, generate a temporary column_id.
-                    // This may occur in the following scenarios:
-                    // 1. The path is not an independent virtual column but is stored within shared data column.
-                    // 2. The path is an object composed of multiple virtual columns.
-                    // 3. The path is extracted from columns within a virtual column itself.
-                    let exists_virtual_columns =
-                        metadata.virtual_columns_by_table_index(table_index);
-                    let mut max_column_id = 0;
-                    for exists_virtual_column in exists_virtual_columns {
-                        if let ColumnEntry::VirtualColumn(VirtualColumn { column_id, .. }) =
-                            exists_virtual_column
-                        {
-                            if column_id > max_column_id {
-                                max_column_id = column_id;
-                            }
-                        }
-                    }
-                    if max_column_id >= virtual_schema.next_column_id {
-                        max_column_id + 1
-                    } else {
-                        virtual_schema.next_column_id
-                    }
-                };
+                // Allocate a query-time temporary virtual column id. This is not
+                // a persisted segment-local column id: every segment resolves the
+                // canonical path to its own physical column id during pruning/read.
+                let column_id = metadata
+                    .virtual_columns_by_table_index(table_index)
+                    .filter_map(|column| match column {
+                        ColumnEntry::VirtualColumn(VirtualColumn {
+                            query_column_id, ..
+                        }) => Some(*query_column_id),
+                        _ => None,
+                    })
+                    .max()
+                    .map_or(VIRTUAL_COLUMN_ID_START, |column_id| {
+                        column_id.saturating_add(1)
+                    });
 
                 let source_column_id = virtual_column_name.source_column_id;
-                let column_name = virtual_column_name.key_name.clone();
-                // todo
-                let table_data_type = TableDataType::Nullable(Box::new(TableDataType::Variant));
-                let is_try = true;
+
+                // If a target type is provided, the virtual column is cast to that type at the storage layer.
+                // `target_cast.ty` is non-nullable, wrap it in Nullable here because variant cast to
+                // other types are always Nullable.
+                let (table_data_type, is_try) = match virtual_column_name.target_cast.clone() {
+                    Some((ty, cast_is_try)) => (TableDataType::Nullable(Box::new(ty)), cast_is_try),
+                    None => (
+                        TableDataType::Nullable(Box::new(TableDataType::Variant)),
+                        true,
+                    ),
+                };
+                // Column display name must be unique per `(path, cast)` so that
+                // `TableScan.name_mapping` (keyed by column name) does not collapse
+                // `data['user']::String` and `data['user']` into a single field.
+                let column_name = format_virtual_column_name(
+                    &virtual_column_name.key_name,
+                    virtual_column_name.target_cast.as_ref(),
+                );
 
                 let column_index = metadata.add_virtual_column(
                     table_index,
@@ -999,4 +1182,30 @@ pub fn apply_alias_for_columns(
         columns[index].column_name = column_name;
     }
     Ok(())
+}
+
+/// Build a unique display name for a virtual column, encoding the optional pushdown cast so
+/// that different cast targets on the same path never share a schema field name.
+///
+/// Examples:
+/// - no cast: `data['user']`
+/// - strict cast: `data['user']::String`
+/// - try cast: `try_cast(data['user'] AS Int32)`
+fn format_virtual_column_name(
+    key_name: &str,
+    target_cast: Option<&(TableDataType, bool)>,
+) -> String {
+    match target_cast {
+        None => key_name.to_string(),
+        Some((ty, is_try)) => {
+            let target_type = ty.remove_nullable();
+            if matches!(target_type, TableDataType::Variant) {
+                key_name.to_string()
+            } else if *is_try {
+                format!("try_cast({} AS {})", key_name, target_type)
+            } else {
+                format!("{}::{}", key_name, target_type)
+            }
+        }
+    }
 }

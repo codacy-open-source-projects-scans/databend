@@ -99,14 +99,18 @@ impl Database for IcebergDatabase {
     #[async_backtrace::framed]
     async fn get_table(&self, table_name: &str) -> Result<Arc<dyn Table>> {
         let params = LoadParams {
-            location: format!("{}{}{}", self.name(), cache::SEP_STR, table_name),
+            location: cache::table_cache_key(
+                self.ctl.info().catalog_name(),
+                self.name(),
+                table_name,
+            ),
             len_hint: None,
             ver: 0,
             put_cache: true,
         };
         let reader =
             super::cache::iceberg_table_cache_reader(self.ctl.iceberg_catalog(), self.ctl.info());
-        reader.read(&params).await.map(|v| v.0.clone())
+        reader.read(&params).await.map(|v| v.table())
     }
 
     // trigger use will refresh the table meta cache in current databases
@@ -119,7 +123,11 @@ impl Database for IcebergDatabase {
     #[async_backtrace::framed]
     async fn refresh_table(&self, table_name: &str) -> Result<()> {
         let params = LoadParams {
-            location: format!("{}{}{}", self.name(), cache::SEP_STR, table_name),
+            location: cache::table_cache_key(
+                self.ctl.info().catalog_name(),
+                self.name(),
+                table_name,
+            ),
             len_hint: None,
             ver: 0,
             put_cache: true,
@@ -289,7 +297,11 @@ impl Database for IcebergDatabase {
             }
         } else {
             let params = LoadParams {
-                location: format!("{}{}{}", self.name(), cache::SEP_STR, table_name),
+                location: cache::table_cache_key(
+                    self.ctl.info().catalog_name(),
+                    self.name(),
+                    &req.table_name,
+                ),
                 len_hint: None,
                 ver: 0,
                 put_cache: true,

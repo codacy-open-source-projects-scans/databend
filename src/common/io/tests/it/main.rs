@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![allow(clippy::uninlined_format_args)]
-#![feature(assert_matches)]
 #![feature(cursor_split)]
 
 extern crate core;
@@ -23,5 +22,6 @@ mod bincode_serialization;
 mod borsh_serialization;
 mod cursor_ext;
 mod escape;
+mod geometry;
 mod interval;
 mod serialization_format_compatibility;

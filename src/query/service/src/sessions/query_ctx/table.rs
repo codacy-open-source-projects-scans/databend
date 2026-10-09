@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use databend_common_meta_app::schema::LockKey;
+
 use super::*;
 
 impl TableContextTableFactory for QueryContext {
@@ -140,8 +142,7 @@ impl TableContextTableAccess for QueryContext {
         tbl_name: &str,
         lock_opt: &LockTableOption,
     ) -> Result<Option<Arc<LockGuard>>> {
-        let enabled_table_lock = self.get_settings().get_enable_table_lock().unwrap_or(false);
-        if !enabled_table_lock {
+        if !self.get_settings().get_enable_table_lock().unwrap_or(false) {
             return Ok(None);
         }
 
@@ -153,16 +154,40 @@ impl TableContextTableAccess for QueryContext {
             return Ok(None);
         }
 
-        let table_lock = LockManager::create_table_lock(tbl.get_table_info().clone())?;
-        let lock_guard = match lock_opt {
-            LockTableOption::LockNoRetry => table_lock.try_lock(self.clone(), false).await?,
-            LockTableOption::LockWithRetry => table_lock.try_lock(self.clone(), true).await?,
-            LockTableOption::NoLock => None,
-        };
+        let lock_guard = self
+            .clone()
+            .acquire_table_lock_by_id(catalog_name, tbl.get_id(), lock_opt)
+            .await?;
         if lock_guard.is_some() {
             self.evict_table_from_cache(catalog_name, db_name, tbl_name)?;
         }
         Ok(lock_guard)
+    }
+
+    async fn acquire_table_lock_by_id(
+        self: Arc<Self>,
+        catalog_name: &str,
+        table_id: u64,
+        lock_opt: &LockTableOption,
+    ) -> Result<Option<Arc<LockGuard>>> {
+        if !self.get_settings().get_enable_table_lock().unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let should_retry = match lock_opt {
+            LockTableOption::LockWithRetry => true,
+            LockTableOption::LockNoRetry => false,
+            LockTableOption::NoLock => return Ok(None),
+        };
+        let tenant = self.get_tenant();
+        CoordinationManager::instance()
+            .try_table_lock(
+                self,
+                LockKey::Table { tenant, table_id },
+                catalog_name,
+                should_retry,
+            )
+            .await
     }
 
     fn get_temp_table_prefix(&self) -> Result<String> {
@@ -334,56 +359,26 @@ impl TableContextQueryProfile for QueryContext {
     }
 }
 
-#[async_trait::async_trait]
 impl TableContextStage for QueryContext {
     fn get_stage_attachment(&self) -> Option<StageAttachment> {
         self.shared.get_stage_attachment()
     }
-
-    #[async_backtrace::framed]
-    async fn get_file_format(&self, name: &str) -> Result<FileFormatParams> {
-        match StageFileFormatType::from_str(name) {
-            Ok(typ) => FileFormatParams::default_by_type(typ),
-            Err(_) => {
-                let user_mgr = UserApiProvider::instance();
-                let tenant = self.get_tenant();
-                Ok(user_mgr
-                    .get_file_format(&tenant, name)
-                    .await?
-                    .file_format_params)
-            }
-        }
-    }
-
-    async fn get_connection(&self, name: &str) -> Result<UserDefinedConnection> {
-        if self
-            .get_settings()
-            .get_enable_experimental_connection_privilege_check()?
-        {
-            let visibility_checker = self
-                .get_visibility_checker(false, Object::Connection)
-                .await?;
-            if !visibility_checker.check_connection_visibility(name) {
-                return Err(ErrorCode::PermissionDenied(format!(
-                    "Permission denied: privilege AccessConnection is required on connection {name} for user {}",
-                    &self.get_current_user()?.identity().display(),
-                )));
-            }
-        }
-        self.shared.get_connection(name).await
-    }
 }
 
-#[async_trait::async_trait]
-impl TableContextTableManagement for QueryContext {
-    fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
-        self.shared.evict_table_from_cache(catalog, database, table)
-    }
-
-    fn get_table_meta_timestamps(
+impl QueryContext {
+    pub(crate) fn get_table_meta_timestamps_without_txn_record(
         &self,
         table: &dyn Table,
         previous_snapshot: Option<Arc<TableSnapshot>>,
+    ) -> Result<TableMetaTimestamps> {
+        self.get_table_meta_timestamps_impl(table, previous_snapshot, false)
+    }
+
+    fn get_table_meta_timestamps_impl(
+        &self,
+        table: &dyn Table,
+        previous_snapshot: Option<Arc<TableSnapshot>>,
+        record_txn_begin_timestamp: bool,
     ) -> Result<TableMetaTimestamps> {
         let table_id = table.get_id();
 
@@ -435,7 +430,7 @@ impl TableContextTableManagement for QueryContext {
             Some(validation_context),
         );
 
-        {
+        if record_txn_begin_timestamp {
             let txn_mgr_ref = self.txn_mgr();
             let mut txn_mgr = txn_mgr_ref.lock();
 
@@ -465,22 +460,20 @@ impl TableContextTableManagement for QueryContext {
 
         Ok(table_meta_timestamps)
     }
+}
 
-    #[async_backtrace::framed]
-    async fn load_datalake_schema(
+#[async_trait::async_trait]
+impl TableContextTableManagement for QueryContext {
+    fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
+        self.shared.evict_table_from_cache(catalog, database, table)
+    }
+
+    fn get_table_meta_timestamps(
         &self,
-        kind: &str,
-        sp: &StorageParams,
-    ) -> Result<(TableSchema, String)> {
-        match kind {
-            "delta" => {
-                let table = DeltaTable::load(sp).await?;
-                DeltaTable::get_meta(&table).await
-            }
-            _ => Err(ErrorCode::Internal(
-                "Unsupported datalake type for schema loading",
-            )),
-        }
+        table: &dyn Table,
+        previous_snapshot: Option<Arc<TableSnapshot>>,
+    ) -> Result<TableMetaTimestamps> {
+        self.get_table_meta_timestamps_impl(table, previous_snapshot, true)
     }
 
     #[cfg(feature = "storage-stage")]
@@ -490,19 +483,12 @@ impl TableContextTableManagement for QueryContext {
         files_info: StageFilesInfo,
         files_to_copy: Option<Vec<StageFileInfo>>,
         max_column_position: usize,
+        has_column_name_ref: bool,
         on_error_mode: Option<OnErrorMode>,
     ) -> Result<Arc<dyn Table>> {
         let copy_options = CopyIntoTableOptions {
             on_error: on_error_mode.unwrap_or_default(),
             ..Default::default()
-        };
-        let operator = init_stage_operator(&stage_info)?;
-        let info = operator.info();
-        let stage_root = format!("{}{}", info.name(), info.root());
-        let stage_root = if stage_root.ends_with('/') {
-            stage_root
-        } else {
-            format!("{}/", stage_root)
         };
         match &stage_info.file_format_params {
             FileFormatParams::Parquet(fmt) => {
@@ -534,6 +520,7 @@ impl TableContextTableManagement for QueryContext {
                         self.get_settings(),
                         self.get_query_kind(),
                         fmt,
+                        has_column_name_ref,
                     )
                     .await
                 } else {
@@ -550,7 +537,6 @@ impl TableContextTableManagement for QueryContext {
                         is_select: true,
                         default_exprs: None,
                         copy_into_table_options: copy_options.clone(),
-                        stage_root,
                         is_variant: true,
                         parquet_metas: None,
                     };
@@ -573,13 +559,12 @@ impl TableContextTableManagement for QueryContext {
                     stage_info,
                     files_info,
                     files_to_copy,
-                    stage_root,
                     is_variant,
                     is_select: true,
                     copy_into_table_options: copy_options.clone(),
                     ..Default::default()
                 };
-                OrcTable::try_create(self, info).await
+                OrcTable::try_create(self, info, has_column_name_ref).await
             }
             FileFormatParams::NdJson(..) | FileFormatParams::Avro(..) => {
                 let schema = Arc::new(TableSchema::new(vec![TableField::new(
@@ -593,10 +578,49 @@ impl TableContextTableManagement for QueryContext {
                     files_to_copy,
                     is_select: true,
                     is_variant: true,
-                    stage_root,
                     copy_into_table_options: copy_options.clone(),
                     ..Default::default()
                 };
+                StageTable::try_create(info)
+            }
+            FileFormatParams::Arrow(..) | FileFormatParams::ArrowStream(..) => {
+                if max_column_position > 0 {
+                    return Err(ErrorCode::SemanticError(
+                        "Query from Arrow file does not support column positions. Query Arrow fields by name.",
+                    ));
+                }
+                let mode = match &stage_info.file_format_params {
+                    FileFormatParams::Arrow(..) => ArrowIpcMode::File,
+                    FileFormatParams::ArrowStream(..) => ArrowIpcMode::Stream,
+                    _ => unreachable!(),
+                };
+                let mut info = StageTableInfo {
+                    schema: Arc::new(TableSchema::empty()),
+                    stage_info,
+                    files_info,
+                    files_to_copy,
+                    is_select: true,
+                    is_variant: false,
+                    copy_into_table_options: copy_options.clone(),
+                    ..Default::default()
+                };
+                let files = match &info.files_to_copy {
+                    Some(files) => files.clone(),
+                    None => {
+                        let thread_num = self.get_settings().get_max_threads()? as usize;
+                        info.list_files(thread_num, None).await?
+                    }
+                };
+                let Some(file) = files.into_iter().find(|f| f.size > 0) else {
+                    return if has_column_name_ref {
+                        Err(ErrorCode::BadBytes(
+                            "no non-empty Arrow file to infer schema",
+                        ))
+                    } else {
+                        self.get_zero_table().await
+                    };
+                };
+                info.schema = infer_arrow_schema_from_file(&info.stage_info, &file, mode).await?;
                 StageTable::try_create(info)
             }
             FileFormatParams::Csv(..) | FileFormatParams::Text(..) => {
@@ -635,7 +659,6 @@ impl TableContextTableManagement for QueryContext {
                     files_info,
                     files_to_copy,
                     is_select: true,
-                    stage_root,
                     copy_into_table_options: copy_options.clone(),
                     ..Default::default()
                 };
@@ -643,7 +666,7 @@ impl TableContextTableManagement for QueryContext {
             }
             _ => {
                 return Err(ErrorCode::Unimplemented(format!(
-                    "Unsupported file format in query stage. Supported formats: Parquet, NDJson, AVRO, CSV, TEXT. Provided: '{}'",
+                    "Unsupported file format in query stage. Supported formats: Parquet, NDJson, AVRO, CSV, TEXT, ARROW, ARROW_STREAM. Provided: '{}'",
                     stage_info.file_format_params
                 )));
             }
@@ -657,6 +680,7 @@ impl TableContextTableManagement for QueryContext {
         _files_info: StageFilesInfo,
         _files_to_copy: Option<Vec<StageFileInfo>>,
         _max_column_position: usize,
+        _has_column_name_ref: bool,
         _on_error_mode: Option<OnErrorMode>,
     ) -> Result<Arc<dyn Table>> {
         Err(ErrorCode::Unimplemented(

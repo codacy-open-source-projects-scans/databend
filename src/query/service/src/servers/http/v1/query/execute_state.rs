@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use ExecuteState::*;
 use databend_common_base::base::ProgressValues;
 use databend_common_base::base::SpillProgress;
+use databend_common_base::base::mask_connection_info;
 use databend_common_base::runtime::CatchUnwindFuture;
 use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
@@ -335,6 +336,7 @@ impl Executor {
                         SystemTime::now(),
                         Some(e.clone()),
                         false,
+                        &[],
                     )
                     .unwrap_or_else(|e| error!("Failed to write query_log: {:?}", e));
                 }
@@ -358,7 +360,7 @@ impl Executor {
             Running(r) => {
                 info!(
                     "Query {} state transitioning from Running to Stopped, reason: {:?}",
-                    &guard.query_id, reason,
+                    guard.query_id, reason,
                 );
                 if let Err(e) = &reason {
                     if e.code() != ErrorCode::CLOSED_QUERY {
@@ -381,14 +383,14 @@ impl Executor {
             Stopped(s) => {
                 debug!(
                     "Query {} already in Stopped state, original reason: {:?}, new reason: {:?}",
-                    &guard.query_id, s.reason, reason
+                    guard.query_id, s.reason, reason
                 );
                 return;
             }
         };
         info!(
             "Query {} state changed to Stopped, reason: {:?}",
-            &guard.query_id, reason
+            guard.query_id, reason
         );
         guard.state = Stopped(Box::new(state));
     }
@@ -407,14 +409,15 @@ impl ExecuteState {
         arrow_features: Option<ArrowFeatures>,
         mut block_sender: Sender,
     ) -> Result<(), ExecutionError> {
-        let make_error = || format!("failed to start query: {sql}");
+        let masked_sql = mask_connection_info(&sql);
+        let make_error = || format!("failed to start query: {masked_sql}");
 
         info!("Preparing to plan SQL query");
 
         // Use interpreter_plan_sql, we can write the query log if an error occurs.
         let (plan, _, queue_guard) = interpreter_plan_sql(ctx.clone(), &sql, true, params.as_ref())
             .await
-            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(|err| err.display_with_sql(&masked_sql))
             .with_context(make_error)?;
 
         Self::apply_settings(
@@ -552,8 +555,10 @@ impl ExecuteState {
                                 .with_context(make_error)?;
                         }
                         Err(err) => {
+                            let err = err.with_context(make_error());
+                            Executor::stop(&executor, Err(err.clone()));
                             sender.abort();
-                            return Err(err.with_context(make_error()));
+                            return Err(err);
                         }
                     };
                 }
@@ -604,6 +609,9 @@ impl ExecuteState {
                 location_prefix,
                 disk_spill,
                 use_parquet: settings.get_spilling_file_format()?.is_parquet(),
+                writer_pool_bytes: settings
+                    .get_spill_writer_memory_pool_size_mb()?
+                    .saturating_mul(1024 * 1024),
             };
             let op = DataOperator::instance().spill_operator();
             Some(LiteSpiller::new(op, config)?)

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Write;
@@ -32,6 +33,7 @@ use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
+use databend_common_expression::converts::datavalues::scalar_to_datavalue;
 use databend_common_expression::type_check;
 use databend_common_expression::type_check::check_function;
 use databend_common_expression::types::AnyType;
@@ -50,14 +52,20 @@ use databend_common_expression::types::UInt8Type;
 use databend_common_expression::types::VariantType;
 use databend_common_expression::types::map::KvColumn;
 use databend_common_expression::types::map::KvPair;
+use databend_common_expression_test_support::parse_raw_expr;
 use databend_common_functions::BUILTIN_FUNCTIONS;
-use databend_common_sql_test_support::parse_raw_expr;
 use databend_storages_common_index::BloomIndex;
 use databend_storages_common_index::BloomIndexBuilder;
 use databend_storages_common_index::BloomIndexType;
+use databend_storages_common_index::DEFAULT_NGRAM_FALSE_POSITIVE_RATE;
 use databend_storages_common_index::FilterEvalResult;
 use databend_storages_common_index::Index;
 use databend_storages_common_index::NgramArgs;
+use databend_storages_common_index::NgramHashAlgorithm;
+use databend_storages_common_index::filters::Filter;
+use databend_storages_common_index::filters::FilterBuilder;
+use databend_storages_common_index::filters::FilterImpl;
+use databend_storages_common_index::filters::Xor8Builder;
 use databend_storages_common_index::filters::Xor8Filter;
 use databend_storages_common_table_meta::meta::ColumnStatistics;
 use goldenfile::Mint;
@@ -71,6 +79,169 @@ fn test_bloom_filter() {
     test_specify(file);
     test_long_string(file);
     test_cast(file);
+}
+
+/// Pins the raw-bit digests that pre-canonicalization writers persisted for
+/// zero and NaN class members. `BloomIndex::find` probes these when reading
+/// existing V3/V4 filters, so they must never drift.
+#[test]
+fn test_bloom_filter_raw_bits_digest_golden_vectors() {
+    let f64_vectors: [(f64, u64); 6] = [
+        (0.0, 0xbd60_acb6_58c7_9e45),
+        (-0.0, 0xef08_26fa_9ec0_9086),
+        (f64::NAN, 0xe958_07fc_db9b_69f5),
+        (-f64::NAN, 0x9e6c_f27b_2190_3322),
+        (f64::INFINITY, 0x5845_4220_dbdd_1e32),
+        (f64::NEG_INFINITY, 0x2659_e363_3561_49e9),
+    ];
+    for (value, expected) in f64_vectors {
+        assert_eq!(
+            BloomIndex::raw_bits_digest(&value.to_bits()),
+            expected,
+            "f64 {value:?} ({:#x})",
+            value.to_bits()
+        );
+    }
+    let f32_vectors: [(f32, u64); 6] = [
+        (0.0, 0xcc22_47b7_9ac4_8af0),
+        (-0.0, 0x189c_380b_6dec_58b3),
+        (f32::NAN, 0x8cdf_dbd6_3bde_4733),
+        (-f32::NAN, 0x1ee6_34d9_faee_78f5),
+        (f32::INFINITY, 0x8f4c_fa33_eeb7_5ea4),
+        (f32::NEG_INFINITY, 0x0e00_3b0a_987b_db5e),
+    ];
+    for (value, expected) in f32_vectors {
+        assert_eq!(
+            BloomIndex::raw_bits_digest(&value.to_bits()),
+            expected,
+            "f32 {value:?} ({:#x})",
+            value.to_bits()
+        );
+    }
+}
+
+/// Filters written before float canonicalization hold raw-bit digests.
+/// Probing them must stay sound: a zero target finds either sign of zero, a
+/// NaN target never prunes (any payload may have been stored), and unrelated
+/// values are still pruned.
+#[test]
+fn test_bloom_filter_legacy_float_classes() -> anyhow::Result<()> {
+    #[derive(Clone, Copy, Debug)]
+    enum Class {
+        Zero,
+        Nan,
+        One,
+    }
+    fn class_of(value: f64) -> Class {
+        if value.is_nan() {
+            Class::Nan
+        } else if value == 0.0 {
+            Class::Zero
+        } else {
+            Class::One
+        }
+    }
+
+    let func_ctx = FunctionContext::default();
+    for number_type in [NumberDataType::Float32, NumberDataType::Float64] {
+        let data_type = DataType::Number(number_type);
+        let field = TableField::new("x", TableDataType::Number(number_type));
+        let schema = Arc::new(TableSchema::new(vec![field.clone()]));
+        // f32 payloads are derived from the f64 ones by keeping the sign and
+        // the quiet bit, so every stored/probe pair still has distinct bits.
+        let scalar = |value: f64| {
+            Scalar::Number(match number_type {
+                NumberDataType::Float32 => NumberScalar::Float32((value as f32).into()),
+                NumberDataType::Float64 => NumberScalar::Float64(value.into()),
+                _ => unreachable!(),
+            })
+        };
+        let stored_values = [0.0, -0.0, 1.0, f64::from_bits(0x7ff8_0000_0000_0001)];
+        let probes = [0.0, -0.0, 1.0, f64::NAN, -f64::NAN, (-1.0f64).sqrt()];
+
+        for version in [2, 3, 4] {
+            // Reproduce the old writer: V2 hashed DataValue; V3/V4 hashed raw bits.
+            for stored in stored_values {
+                let mut builder = Xor8Builder::create();
+                for value in [stored, 2.0] {
+                    if version == 2 {
+                        builder.add_key(&scalar_to_datavalue(&scalar(value)));
+                    } else {
+                        let digest = match number_type {
+                            NumberDataType::Float32 => {
+                                BloomIndex::raw_bits_digest(&(value as f32).to_bits())
+                            }
+                            NumberDataType::Float64 => {
+                                BloomIndex::raw_bits_digest(&value.to_bits())
+                            }
+                            _ => unreachable!(),
+                        };
+                        builder.add_digest(digest);
+                    }
+                }
+                let bytes = builder.build()?.to_bytes()?;
+                let filter = FilterImpl::from_bytes(&bytes)?.0;
+                let filter_schema = Arc::new(TableSchema::new(vec![TableField::new(
+                    &BloomIndex::build_filter_bloom_name(version, &field)?,
+                    TableDataType::Binary,
+                )]));
+                let index = BloomIndex::from_filter_block(
+                    func_ctx.clone(),
+                    filter_schema,
+                    vec![Arc::new(filter)],
+                    version,
+                )?;
+
+                for probe in probes {
+                    let target = scalar(probe);
+                    let digest =
+                        BloomIndex::calculate_scalar_digest(&func_ctx, &target, &data_type)?;
+                    let expr = check_function(
+                        None,
+                        "eq",
+                        &[],
+                        &[
+                            Expr::ColumnRef(ColumnRef {
+                                span: None,
+                                id: "x".to_string(),
+                                data_type: data_type.clone(),
+                                display_name: "x".to_string(),
+                            }),
+                            Expr::Constant(Constant {
+                                span: None,
+                                scalar: target.clone(),
+                                data_type: data_type.clone(),
+                            }),
+                        ],
+                        &BUILTIN_FUNCTIONS,
+                    )?;
+                    let result = index.apply(
+                        expr,
+                        &HashMap::from([(target, digest)]),
+                        &HashMap::new(),
+                        &[],
+                        &HashMap::new(),
+                        schema.clone(),
+                    )?;
+                    let expected = match (class_of(stored), class_of(probe)) {
+                        (_, Class::Nan) => FilterEvalResult::Uncertain,
+                        (Class::Zero, Class::Zero) | (Class::One, Class::One) => {
+                            FilterEvalResult::Uncertain
+                        }
+                        _ => FilterEvalResult::MustFalse,
+                    };
+                    assert_eq!(
+                        result,
+                        expected,
+                        "v{version} {number_type:?}: stored={stored:?} ({:#x}), probe={probe:?} ({:#x})",
+                        stored.to_bits(),
+                        probe.to_bits()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -190,10 +361,12 @@ fn test_bloom_filter_rewrites_string_literal_integer_comparison() {
             schema,
         )
         .unwrap();
-    let folded = ConstantFolder::fold_with_domain(&expr, &domains, &func_ctx, &BUILTIN_FUNCTIONS).0;
+    let folded =
+        ConstantFolder::fold_with_domain(Cow::Owned(expr), &domains, &func_ctx, &BUILTIN_FUNCTIONS)
+            .0;
 
     assert!(matches!(
-        folded,
+        folded.as_ref(),
         Expr::Constant(Constant {
             scalar: Scalar::Boolean(false),
             ..
@@ -661,7 +834,7 @@ fn eval_text(
 
     let raw_expr = parse_raw_expr(text, &columns, &BUILTIN_FUNCTIONS);
     let expr = type_check::check(&raw_expr, &BUILTIN_FUNCTIONS).unwrap();
-    let expr = type_check::rewrite_function_to_cast(expr);
+    let expr = type_check::rewrite_function_to_cast(expr, &BUILTIN_FUNCTIONS);
     let expr = expr
         .project_column_ref(|i| Ok(columns[*i].0.to_string()))
         .unwrap();
@@ -681,12 +854,13 @@ fn eval_index_expr(
     writeln!(file, "expr     : {expr}").unwrap();
 
     let func_ctx = FunctionContext::default();
-    let (fold_expr, _) = ConstantFolder::fold(&expr, &func_ctx, &BUILTIN_FUNCTIONS);
-    let expr = if fold_expr != expr {
-        writeln!(file, "fold_expr: {fold_expr}").unwrap();
-        fold_expr
-    } else {
-        expr
+    let (fold_expr, _) = ConstantFolder::fold(Cow::Borrowed(&expr), &func_ctx, &BUILTIN_FUNCTIONS);
+    let expr = match fold_expr {
+        Cow::Borrowed(_) => expr,
+        Cow::Owned(fold_expr) => {
+            writeln!(file, "fold_expr: {fold_expr}").unwrap();
+            fold_expr
+        }
     };
 
     let bloom_fields = bloom_columns.values().cloned().collect::<Vec<_>>();
@@ -703,24 +877,23 @@ fn eval_index_expr(
         });
     }
 
-    let mut like_scalar_map = HashMap::<Scalar, Vec<u64>>::new();
-    for (field, (_, scalar)) in result
-        .ngram_fields
-        .iter()
-        .zip(result.ngram_scalars.into_iter())
-    {
-        let Some(ngram_arg) = ngram_args.iter().find(|arg| arg.field() == field) else {
-            continue;
-        };
-        let Some(digests) = BloomIndex::calculate_ngram_nullable_column(
+    let mut like_scalar_map = HashMap::<usize, HashMap<Scalar, Vec<u64>>>::new();
+    for (index, scalar) in result.ngram_scalars {
+        let ngram_arg = &ngram_args[index];
+        let mut digests = Vec::new();
+        BloomIndex::calculate_ngram_digests(
             Value::Scalar(scalar.clone()),
             ngram_arg.gram_size(),
-            BloomIndex::ngram_hash,
-        )
-        .next() else {
-            continue;
-        };
-        like_scalar_map.entry(scalar).or_insert(digests);
+            ngram_arg.hash_algorithm(),
+            |digest| digests.push(digest),
+        );
+        if !digests.is_empty() {
+            like_scalar_map
+                .entry(index)
+                .or_default()
+                .entry(scalar)
+                .or_insert(digests);
+        }
     }
 
     let mut builder = BloomIndexBuilder::create(
@@ -765,14 +938,21 @@ fn eval_index_expr(
             schema,
         )
         .unwrap();
-    let result =
-        match ConstantFolder::fold_with_domain(&expr, &domains, &func_ctx, &BUILTIN_FUNCTIONS).0 {
-            Expr::Constant(Constant {
-                scalar: Scalar::Boolean(false),
-                ..
-            }) => FilterEvalResult::MustFalse,
-            _ => FilterEvalResult::Uncertain,
-        };
+    let result = match ConstantFolder::fold_with_domain(
+        Cow::Borrowed(&expr),
+        &domains,
+        &func_ctx,
+        &BUILTIN_FUNCTIONS,
+    )
+    .0
+    .as_ref()
+    {
+        Expr::Constant(Constant {
+            scalar: Scalar::Boolean(false),
+            ..
+        }) => FilterEvalResult::MustFalse,
+        _ => FilterEvalResult::Uncertain,
+    };
     let domains = BTreeMap::from_iter(domains);
 
     writeln!(file, "filter   : {expr}").unwrap();
@@ -887,7 +1067,14 @@ fn ngram_args(schema: &TableSchema, cols: &[FieldIndex]) -> Vec<NgramArgs> {
         let table_field = schema.field(i);
         let data_type = DataType::from(table_field.data_type());
         if Xor8Filter::supported_type(&data_type) {
-            ngram_args.push(NgramArgs::new(i, table_field.clone(), 3, 1024))
+            ngram_args.push(NgramArgs::new(
+                i,
+                table_field.clone(),
+                3,
+                1024,
+                DEFAULT_NGRAM_FALSE_POSITIVE_RATE,
+                NgramHashAlgorithm::City64V0,
+            ))
         }
     }
     ngram_args

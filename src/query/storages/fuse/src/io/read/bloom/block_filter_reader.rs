@@ -25,7 +25,6 @@ use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_base::runtime::Runtime;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::ColumnId;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
@@ -40,14 +39,13 @@ use databend_storages_common_table_meta::meta::SingleColumnMeta;
 use futures_util::future::try_join_all;
 use opendal::Operator;
 use parquet::arrow::ArrowSchemaConverter;
-use parquet::format::FileMetaData;
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::schema::types::SchemaDescPtr;
-use parquet::thrift::TSerializable;
-use thrift::protocol::TCompactInputProtocol;
 
 use crate::index::filters::BlockBloomFilterIndexVersion;
 use crate::index::filters::BlockFilter;
 use crate::io::MetaReaders;
+use crate::io::read::bloom::BloomIndexColumnOrdinal;
 use crate::io::read::bloom::column_filter_reader::BloomColumnFilterReader;
 
 #[async_trait::async_trait]
@@ -115,7 +113,7 @@ pub async fn load_bloom_filter_by_columns<'a>(
     for column_name in column_needed {
         for (idx, (name, column_meta)) in index_column_chunk_metas.iter().enumerate() {
             if name == column_name {
-                col_metas.insert(idx as ColumnId, (name, column_meta));
+                col_metas.insert(BloomIndexColumnOrdinal::new(idx), (name, column_meta));
                 break;
             }
         }
@@ -166,7 +164,7 @@ pub async fn load_bloom_filter_by_columns<'a>(
 /// read data from cache, or populate cache items if possible
 #[fastrace::trace]
 async fn load_column_bloom_filter<'a>(
-    idx: ColumnId,
+    column_ordinal: BloomIndexColumnOrdinal,
     filter_name: &str,
     col_chunk_meta: &'a SingleColumnMeta,
     index_path: &'a str,
@@ -178,7 +176,7 @@ async fn load_column_bloom_filter<'a>(
     let bytes = {
         let column_data_reader = BloomColumnFilterReader::new(
             index_path.to_owned(),
-            idx,
+            column_ordinal,
             filter_name,
             col_chunk_meta,
             dal.clone(),
@@ -254,7 +252,7 @@ fn should_read_whole_bloom_index(path: &str, settings: &ReadSettings, index_leng
 fn load_index_meta_from_bytes(data: &Bytes) -> Result<BloomIndexMeta> {
     const HEADER_SIZE: usize = 4;
     const FOOTER_SIZE: usize = 8;
-    const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+    const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
     if data.len() < HEADER_SIZE + FOOTER_SIZE {
         return Err(ErrorCode::StorageOther(
@@ -280,10 +278,9 @@ fn load_index_meta_from_bytes(data: &Bytes) -> Result<BloomIndexMeta> {
     }
 
     let remaining = data.len() - footer_len as usize;
-    let mut prot = TCompactInputProtocol::new(&data[remaining..]);
-    let thrift_meta = FileMetaData::read_from_in_protocol(&mut prot)
+    let parquet_meta = ParquetMetaDataReader::decode_metadata(&data[remaining..])
         .map_err(|err| ErrorCode::StorageOther(format!("read bloom index meta failed, {err}")))?;
-    BloomIndexMeta::try_from(thrift_meta)
+    BloomIndexMeta::try_from(parquet_meta)
 }
 
 #[async_trait::async_trait]
@@ -311,11 +308,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::OnceLock;
 
-    use databend_common_base::base::GlobalInstance;
-    use databend_common_base::runtime::GlobalIORuntime;
-    use databend_common_config::CacheConfig;
     use databend_common_exception::Result;
     use databend_common_expression::DataBlock;
     use databend_common_expression::FromData;
@@ -326,7 +319,6 @@ mod tests {
     use databend_common_expression::types::Int32Type;
     use databend_storages_common_blocks::blocks_to_parquet;
     use databend_storages_common_cache::CacheAccessor;
-    use databend_storages_common_cache::CacheManager;
     use databend_storages_common_cache::CachedObject;
     use databend_storages_common_index::BloomIndex;
     use databend_storages_common_index::BloomIndexBuilder;
@@ -336,16 +328,7 @@ mod tests {
     use databend_storages_common_table_meta::table::TableCompression;
 
     use super::*;
-
-    fn init_test_globals() -> Result<()> {
-        static INIT: OnceLock<Result<()>> = OnceLock::new();
-        INIT.get_or_init(|| {
-            GlobalInstance::init_production();
-            GlobalIORuntime::init(1)?;
-            CacheManager::init(&CacheConfig::default(), &(1024 * 1024), "test", false)
-        })
-        .clone()
-    }
+    use crate::test_utils::init_test_globals;
 
     fn write_bloom_index_bytes() -> Result<(Vec<u8>, String)> {
         let schema = TableSchema::new(vec![TableField::new(
@@ -365,15 +348,15 @@ mod tests {
         let bloom_index = builder.finalize()?.unwrap();
 
         let index_block = bloom_index.serialize_to_data_block()?;
-        let mut data = Vec::new();
-        let _ = blocks_to_parquet(
+        let data = blocks_to_parquet(
             &bloom_index.filter_schema,
             vec![index_block],
-            &mut data,
             TableCompression::None,
             false,
             None,
-        )?;
+        )?
+        .payload
+        .concat();
 
         let filter_name = BloomIndex::build_filter_bloom_name(
             BlockFilter::VERSION,

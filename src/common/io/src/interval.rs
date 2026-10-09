@@ -17,6 +17,8 @@ use std::fmt::Formatter;
 
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use jiff::Span;
+use jiff::fmt::temporal::SpanParser;
 
 pub trait BufferReadIntervalExt {
     fn read_interval_text(&mut self) -> Result<Interval>;
@@ -102,30 +104,30 @@ impl IntervalToStringCast {
                 buffer[length] = b' ';
                 length += 1;
             }
-            let mut micros = interval.micros;
+            let mut micros = i128::from(interval.micros);
             if micros < 0 {
                 buffer[length] = b'-';
                 length += 1;
                 micros = -micros;
             }
-            let hour = micros / MICROS_PER_HOUR;
-            micros -= hour * MICROS_PER_HOUR;
-            let min = micros / MICROS_PER_MINUTE;
-            micros -= min * MICROS_PER_MINUTE;
-            let sec = micros / MICROS_PER_SEC;
-            micros -= sec * MICROS_PER_SEC;
+            let hour = micros / i128::from(MICROS_PER_HOUR);
+            micros -= hour * i128::from(MICROS_PER_HOUR);
+            let min = micros / i128::from(MICROS_PER_MINUTE);
+            micros -= min * i128::from(MICROS_PER_MINUTE);
+            let sec = micros / i128::from(MICROS_PER_SEC);
+            micros -= sec * i128::from(MICROS_PER_SEC);
 
-            Self::format_signed_number(hour, buffer, &mut length);
+            Self::format_signed_number(hour as i64, buffer, &mut length);
             buffer[length] = b':';
             length += 1;
-            Self::format_two_digits(min, buffer, &mut length);
+            Self::format_two_digits(min as i64, buffer, &mut length);
             buffer[length] = b':';
             length += 1;
-            Self::format_two_digits(sec, buffer, &mut length);
+            Self::format_two_digits(sec as i64, buffer, &mut length);
             if micros != 0 {
                 buffer[length] = b'.';
                 length += 1;
-                Self::format_micros(micros, buffer, &mut length);
+                Self::format_micros(micros as i64, buffer, &mut length);
             }
         } else if length == 0 {
             buffer[..8].copy_from_slice(b"00:00:00");
@@ -156,16 +158,23 @@ impl Interval {
         if len == 0 {
             return Err(ErrorCode::BadArguments("Empty string".to_string()));
         }
-        match str[pos] {
-            b'@' => {
-                pos += 1;
-            }
-            b'P' | b'p' => {
-                return Err(ErrorCode::BadArguments(
-                    "Posix intervals not supported yet".to_string(),
-                ));
+        if str[pos] == b'@' {
+            pos += 1;
+        }
+
+        let mut iso_pos = pos;
+        while iso_pos < len && matches!(str[iso_pos], b' ' | b'\t' | b'\n') {
+            iso_pos += 1;
+        }
+        let iso_start = iso_pos;
+        match str.get(iso_pos) {
+            Some(b'-') | Some(b'+') => {
+                iso_pos += 1;
             }
             _ => {}
+        }
+        if iso_pos < len && matches!(str[iso_pos], b'P' | b'p') {
+            return parse_iso8601_duration(&str[iso_start..]);
         }
 
         while pos < len {
@@ -180,7 +189,7 @@ impl Interval {
                     let (specifier, next_pos) = parse_identifier(&str[pos..]);
 
                     pos += next_pos;
-                    let _ = apply_specifier(&mut result, number, fraction, &specifier);
+                    apply_specifier(&mut result, number, fraction, &specifier)?;
                     found_any = true;
                 }
                 b'-' => {
@@ -194,7 +203,7 @@ impl Interval {
                     let (specifier, next_pos) = parse_identifier(&str[pos..]);
 
                     pos += next_pos;
-                    let _ = apply_specifier(&mut result, number, fraction, &specifier);
+                    apply_specifier(&mut result, number, fraction, &specifier)?;
                     found_any = true;
                 }
                 b'a' | b'A' => {
@@ -219,9 +228,18 @@ impl Interval {
                             }
                         }
                     }
-                    result.months = -result.months;
-                    result.days = -result.days;
-                    result.micros = -result.micros;
+                    result.months = result
+                        .months
+                        .checked_neg()
+                        .ok_or(ErrorCode::BadArguments("Interval overflow"))?;
+                    result.days = result
+                        .days
+                        .checked_neg()
+                        .ok_or(ErrorCode::BadArguments("Interval overflow"))?;
+                    result.micros = result
+                        .micros
+                        .checked_neg()
+                        .ok_or(ErrorCode::BadArguments("Interval overflow"))?;
                     return Ok(result);
                 }
                 _ => {
@@ -242,18 +260,22 @@ impl Interval {
     }
 }
 
-fn parse_number(bytes: &[u8]) -> Result<(i64, i64, usize)> {
-    let mut number: i64 = 0;
-    let mut fraction: i64 = 0;
+fn parse_integer(bytes: &[u8]) -> Result<(i64, usize)> {
+    let mut value: i64 = 0;
     let mut pos = 0;
-
     while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-        number = number
+        value = value
             .checked_mul(10)
-            .ok_or(ErrorCode::BadArguments("Number too large"))?
-            + (bytes[pos] - b'0') as i64;
+            .and_then(|value| value.checked_add(i64::from(bytes[pos] - b'0')))
+            .ok_or(ErrorCode::BadArguments("Number too large"))?;
         pos += 1;
     }
+    Ok((value, pos))
+}
+
+fn parse_number(bytes: &[u8]) -> Result<(i64, i64, usize)> {
+    let (number, mut pos) = parse_integer(bytes)?;
+    let mut fraction: i64 = 0;
 
     if pos < bytes.len() && bytes[pos] == b'.' {
         pos += 1;
@@ -269,12 +291,12 @@ fn parse_number(bytes: &[u8]) -> Result<(i64, i64, usize)> {
     if pos < bytes.len() && bytes[pos] == b':' {
         let time_bytes = &bytes[pos..];
         let mut time_pos = 0;
-        let mut total_micros: i64 = number * 60 * 60 * MICROS_PER_SEC;
+        let mut total_micros = i128::from(number) * i128::from(MICROS_PER_HOUR);
         let mut colon_count = 0;
 
         while colon_count < 2 && time_bytes.len() > time_pos {
             let (minute, _, next_pos) = parse_time_part(&time_bytes[time_pos..])?;
-            let minute_nanos = minute * 60 * MICROS_PER_SEC;
+            let minute_nanos = i128::from(minute) * i128::from(MICROS_PER_MINUTE);
             total_micros += minute_nanos;
             time_pos += next_pos;
 
@@ -287,9 +309,11 @@ fn parse_number(bytes: &[u8]) -> Result<(i64, i64, usize)> {
         }
         if time_bytes.len() > time_pos {
             let (seconds, micros, next_pos) = parse_time_part_with_micros(&time_bytes[time_pos..])?;
-            total_micros += seconds * MICROS_PER_SEC + micros;
+            total_micros += i128::from(seconds) * i128::from(MICROS_PER_SEC) + i128::from(micros);
             time_pos += next_pos;
         }
+        let total_micros = i64::try_from(total_micros)
+            .map_err(|_| ErrorCode::BadArguments("Interval overflow"))?;
         return Ok((total_micros, 0, pos + time_pos));
     }
 
@@ -301,30 +325,13 @@ fn parse_number(bytes: &[u8]) -> Result<(i64, i64, usize)> {
 }
 
 fn parse_time_part(bytes: &[u8]) -> Result<(i64, i64, usize)> {
-    let mut number: i64 = 0;
-    let mut pos = 0;
-    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-        number = number
-            .checked_mul(10)
-            .ok_or(ErrorCode::BadArguments("Number too large"))?
-            + (bytes[pos] - b'0') as i64;
-        pos += 1;
-    }
+    let (number, pos) = parse_integer(bytes)?;
     Ok((number, 0, pos))
 }
 
 fn parse_time_part_with_micros(bytes: &[u8]) -> Result<(i64, i64, usize)> {
-    let mut number: i64 = 0;
+    let (number, mut pos) = parse_integer(bytes)?;
     let mut fraction: i64 = 0;
-    let mut pos = 0;
-
-    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-        number = number
-            .checked_mul(10)
-            .ok_or(ErrorCode::BadArguments("Number too large"))?
-            + (bytes[pos] - b'0') as i64;
-        pos += 1;
-    }
 
     if pos < bytes.len() && bytes[pos] == b'.' {
         pos += 1;
@@ -339,6 +346,97 @@ fn parse_time_part_with_micros(bytes: &[u8]) -> Result<(i64, i64, usize)> {
     }
 
     Ok((number, fraction, pos))
+}
+
+fn parse_iso8601_duration(bytes: &[u8]) -> Result<Interval> {
+    SpanParser::new()
+        .parse_span(bytes)
+        .map_err(|e| ErrorCode::BadArguments(format!("Invalid ISO 8601 duration: {}", e)))
+        .and_then(span_to_interval)
+}
+
+fn add_months(result: &mut Interval, months: i64) -> Result<()> {
+    result.months = result
+        .months
+        .checked_add(
+            months
+                .try_into()
+                .map_err(|_| ErrorCode::BadArguments("Overflow".to_string()))?,
+        )
+        .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?;
+    Ok(())
+}
+
+fn add_days(result: &mut Interval, days: i64) -> Result<()> {
+    result.days = result
+        .days
+        .checked_add(
+            days.try_into()
+                .map_err(|_| ErrorCode::BadArguments("Overflow".to_string()))?,
+        )
+        .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?;
+    Ok(())
+}
+
+fn add_micros(result: &mut Interval, micros: i64) -> Result<()> {
+    result.micros = result
+        .micros
+        .checked_add(micros)
+        .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?;
+    Ok(())
+}
+
+fn span_to_interval(span: Span) -> Result<Interval> {
+    let mut result = Interval::default();
+    add_months(
+        &mut result,
+        i64::from(span.get_years())
+            .checked_mul(MONTHS_PER_YEAR as i64)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_months(&mut result, i64::from(span.get_months()))?;
+    add_days(
+        &mut result,
+        i64::from(span.get_weeks())
+            .checked_mul(DAYS_PER_WEEK as i64)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_days(&mut result, i64::from(span.get_days()))?;
+    add_micros(
+        &mut result,
+        i64::from(span.get_hours())
+            .checked_mul(MICROS_PER_HOUR)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_micros(
+        &mut result,
+        span.get_minutes()
+            .checked_mul(MICROS_PER_MINUTE)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_micros(
+        &mut result,
+        span.get_seconds()
+            .checked_mul(MICROS_PER_SEC)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_micros(
+        &mut result,
+        span.get_milliseconds()
+            .checked_mul(MICROS_PER_MSEC)
+            .ok_or(ErrorCode::BadArguments("Overflow".to_string()))?,
+    )?;
+    add_micros(&mut result, span.get_microseconds())?;
+
+    let nanoseconds = span.get_nanoseconds();
+    if nanoseconds % 1_000 != 0 {
+        return Err(ErrorCode::BadArguments(
+            "ISO 8601 durations with sub-microsecond precision are not supported".to_string(),
+        ));
+    }
+    add_micros(&mut result, nanoseconds / 1_000)?;
+
+    Ok(result)
 }
 
 fn parse_identifier(s: &[u8]) -> (String, usize) {

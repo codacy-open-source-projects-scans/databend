@@ -53,7 +53,7 @@ use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::arrow_reader::RowSelector;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::metadata::RowGroupMetaData;
-use parquet::format::PageLocation;
+use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::SchemaDescPtr;
 
 use crate::DeleteType;
@@ -96,11 +96,12 @@ static DELETES_FILE_PUSHDOWN_INFO: LazyLock<PushDownInfo> = LazyLock::new(|| Pus
     order_by: vec![],
     virtual_column: None,
     lazy_materialization: false,
-    agg_index: None,
     change_type: None,
     inverted_index: None,
     vector_index: None,
     sample: None,
+    read_partitions_pruning_mode: Default::default(),
+    secure_filters: None,
 });
 
 enum DeleteResult {
@@ -127,8 +128,9 @@ pub struct RowGroupReader {
 
     pub(super) table_schema: TableSchemaRef,
     pub(super) schema_desc: SchemaDescPtr,
+    pub(super) schema_desc_from: Option<String>,
+    pub(super) schema_desc_from_arrow_fallback: bool,
     pub(super) arrow_schema: Option<arrow_schema::Schema>,
-    pub(super) partition_columns: Vec<String>,
     pub(super) transformer: Option<RecordBatchTransformer>,
     // Options
     pub(super) batch_size: usize,
@@ -141,6 +143,14 @@ impl RowGroupReader {
 
     pub fn schema_desc(&self) -> &SchemaDescPtr {
         &self.schema_desc
+    }
+
+    pub fn schema_desc_from(&self) -> Option<&str> {
+        self.schema_desc_from.as_deref()
+    }
+
+    pub fn schema_desc_from_arrow_fallback(&self) -> bool {
+        self.schema_desc_from_arrow_fallback
     }
 
     /// Read a row group and return a reader with certain policy.
@@ -236,7 +246,6 @@ impl RowGroupReader {
                 &prewhere_info,
                 &self.table_schema,
                 &self.schema_desc,
-                &self.partition_columns,
                 self.arrow_schema.as_ref(),
             )?;
             *delete_filter = Some(DeleteFilter {
@@ -311,7 +320,7 @@ impl RowGroupReader {
         .with_push_downs(Some(info));
         let reader = builder.build_full_reader(ParquetSourceType::Iceberg, false)?;
         let mut stream = reader
-            .prepare_data_stream(path, meta.content_length(), None)
+            .prepare_data_stream(path, meta.content_length())
             .await?;
         let mut positional_deletes = Vec::new();
 

@@ -25,9 +25,13 @@ use tokio::net::TcpSocket;
 use tokio_stream::StreamExt;
 
 use crate::args::KeysLayoutArgs;
+use crate::grpc_client_config::GrpcClientConfig;
 
 /// Get snapshot keys layout from a running meta-service node
-pub async fn keys_layout_from_running_node(args: &KeysLayoutArgs) -> Result<(), anyhow::Error> {
+pub async fn keys_layout_from_running_node(
+    args: &KeysLayoutArgs,
+    client_config: &GrpcClientConfig,
+) -> Result<(), anyhow::Error> {
     eprintln!();
     eprintln!("Keys Layout:");
     eprintln!("    From: online meta-service: {}", args.grpc_api_address);
@@ -35,7 +39,7 @@ pub async fn keys_layout_from_running_node(args: &KeysLayoutArgs) -> Result<(), 
 
     let grpc_api_addr = get_available_socket_addr(args.grpc_api_address.as_str()).await?;
     let addr = grpc_api_addr.to_string();
-    keys_layout_from_grpc(addr.as_str(), args.depth).await?;
+    keys_layout_from_grpc(addr.as_str(), args.depth, client_config).await?;
     Ok(())
 }
 
@@ -59,14 +63,18 @@ async fn get_available_socket_addr(endpoint: &str) -> Result<SocketAddr, anyhow:
     Err(anyhow!("no metasrv running on: {}", endpoint))
 }
 
-pub async fn keys_layout_from_grpc(addr: &str, depth: Option<u32>) -> anyhow::Result<()> {
+pub async fn keys_layout_from_grpc(
+    addr: &str,
+    depth: Option<u32>,
+    client_config: &GrpcClientConfig,
+) -> anyhow::Result<()> {
     let client = MetaGrpcClient::<DatabendRuntime>::try_create(
         vec![addr.to_string()],
-        "root",
-        "xxx",
+        client_config.auth.username(),
+        client_config.auth.expose_password(),
         None,
         None,
-        None,
+        client_config.tls.clone(),
         DEFAULT_GRPC_MESSAGE_SIZE,
     )?;
 

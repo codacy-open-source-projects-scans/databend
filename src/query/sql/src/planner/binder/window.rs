@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use databend_common_ast::Span;
@@ -21,7 +23,6 @@ use databend_common_ast::ast::WindowSpec;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use itertools::Itertools;
 
 use super::select::SelectList;
 use crate::BindContext;
@@ -49,17 +50,65 @@ use crate::plans::Window;
 use crate::plans::WindowFunc;
 use crate::plans::WindowFuncFrame;
 use crate::plans::WindowFuncType;
+use crate::plans::WindowGroup;
 use crate::plans::WindowOrderBy;
 use crate::plans::WindowPartition;
 use crate::plans::walk_expr_mut;
 
+/// Deterministic window inputs available to consumers in the same query block.
+/// Record the final column IDs after WindowGroup input canonicalization.
+#[derive(Default)]
+pub(super) struct WindowInputColumns {
+    scalars: HashMap<ScalarExpr, ScalarExpr>,
+}
+
+impl WindowInputColumns {
+    fn extend<'a>(&mut self, items: impl IntoIterator<Item = &'a ScalarItem>) -> Result<()> {
+        for item in items {
+            if matches!(
+                item.scalar,
+                ScalarExpr::FunctionCall(_) | ScalarExpr::CastExpr(_)
+            ) && item.scalar.is_deterministic()
+            {
+                self.scalars
+                    .entry(item.scalar.clone())
+                    .or_insert(item.bound_column_expr("window_input".to_string())?);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl VisitorMut<'_> for WindowInputColumns {
+    fn visit(&mut self, expr: &mut ScalarExpr) -> Result<()> {
+        if let Some(column) = self.scalars.get(expr)
+            && column.data_type().as_ref() == expr.data_type().as_ref()
+        {
+            *expr = column.clone();
+            return Ok(());
+        }
+        // Only rewrite row-local consumers in this query block. Lambdas,
+        // subqueries, aggregates and window functions have separate scopes.
+        match expr {
+            ScalarExpr::FunctionCall(func) => {
+                for argument in &mut func.arguments {
+                    self.visit(argument)?;
+                }
+            }
+            ScalarExpr::CastExpr(cast) => self.visit(&mut cast.argument)?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 impl Binder {
-    pub(super) fn bind_window_function(
+    pub(super) fn bind_window_functions(
         &mut self,
-        window_info: &WindowFunctionInfo,
+        window_infos: &[WindowFunctionInfo],
         child: SExpr,
-    ) -> Result<SExpr> {
-        bind_window_function_info(&self.ctx, window_info, child)
+    ) -> Result<(SExpr, WindowInputColumns)> {
+        bind_window_function_infos(&self.ctx, window_infos, child)
     }
 
     pub(super) fn analyze_window_definition(
@@ -95,9 +144,25 @@ impl Binder {
         let mut window_specs = HashMap::new();
         let mut resolved_window_specs = HashMap::new();
         for window in window_list {
-            window_specs.insert(window.name.name.clone(), window.spec.clone());
-            if window.spec.existing_window_name.is_none() {
-                resolved_window_specs.insert(window.name.name.clone(), window.spec.clone());
+            let window_name = self.normalize_identifier(&window.name).name;
+            let mut window_spec = window.spec.clone();
+            if let Some(existing_window_name) = &mut window_spec.existing_window_name {
+                *existing_window_name = self.normalize_identifier(existing_window_name);
+            }
+
+            match window_specs.entry(window_name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(window_spec.clone());
+                }
+                Entry::Occupied(_) => {
+                    return Err(ErrorCode::SemanticError(format!(
+                        "Duplicate window name: {window_name}"
+                    )));
+                }
+            }
+
+            if window_spec.existing_window_name.is_none() {
+                resolved_window_specs.insert(window_name, window_spec);
             }
         }
         Ok((window_specs, resolved_window_specs))
@@ -193,7 +258,7 @@ pub struct WindowInfo {
 impl WindowInfo {
     pub fn reorder(&mut self) {
         self.window_functions
-            .sort_by(|a, b| b.order_by_items.len().cmp(&a.order_by_items.len()));
+            .sort_by_key(|a| std::cmp::Reverse(a.order_by_items.len()));
 
         self.window_functions_map.clear();
         for (i, window) in self.window_functions.iter().enumerate() {
@@ -275,11 +340,9 @@ impl<'a> WindowRewriter<'a> {
                     let (replaced_expr, scalar) = self.replace_expr(&name, &expr)?;
 
                     let index = replaced_expr.column.index;
-                    let is_reuse_index = window_args.iter().map(|item| item.index).contains(&index);
                     window_args.push(ScalarItem { index, scalar });
                     replaced_sort_descs.push(AggregateFunctionScalarSortDesc {
                         expr: replaced_expr.into(),
-                        is_reuse_index,
                         nulls_first: desc.nulls_first,
                         asc: desc.asc,
                     });
@@ -447,7 +510,7 @@ impl<'a> WindowRewriter<'a> {
                     let column = ColumnBindingBuilder::new(
                         "group_item".to_string(),
                         group_expr.index,
-                        Box::new(group_expr.scalar.data_type()?),
+                        Box::new(group_expr.scalar.data_type().into_owned()),
                         Visibility::Visible,
                     )
                     .build();
@@ -460,7 +523,7 @@ impl<'a> WindowRewriter<'a> {
                 }
             }
 
-            let ty = arg.data_type()?;
+            let ty = arg.data_type().into_owned();
             let index = self
                 .metadata
                 .write()
@@ -595,19 +658,22 @@ pub fn bind_window_function_info(
         order_by: window_info.order_by_items.clone(),
         frame: window_info.frame.clone(),
         limit: None,
+        top: None,
     };
 
     // eval scalars before sort
     // Generate a `EvalScalar` as the input of `Window`.
     let mut scalar_items: Vec<ScalarItem> = Vec::new();
-    for arg in &window_plan.arguments {
-        scalar_items.push(arg.clone());
-    }
-    for part in &window_plan.partition_by {
-        scalar_items.push(part.clone());
-    }
-    for order in &window_plan.order_by {
-        scalar_items.push(order.order_by_item.clone())
+    let mut scalar_indexes = HashSet::new();
+    for item in std::iter::chain(&window_plan.arguments, &window_plan.partition_by).chain(
+        window_plan
+            .order_by
+            .iter()
+            .map(|order| &order.order_by_item),
+    ) {
+        if scalar_indexes.insert(item.index) {
+            scalar_items.push(item.clone());
+        }
     }
 
     let child = if !scalar_items.is_empty() {
@@ -669,6 +735,146 @@ pub fn bind_window_function_info(
         Arc::new(window_plan.into()),
         Arc::new(child),
     ))
+}
+
+fn bind_window_function_infos(
+    ctx: &Arc<dyn TableContext>,
+    window_infos: &[WindowFunctionInfo],
+    child: SExpr,
+) -> Result<(SExpr, WindowInputColumns)> {
+    let mut inputs = WindowInputColumns::default();
+    if window_infos.is_empty() {
+        return Ok((child, inputs));
+    }
+
+    if let [window] = window_infos {
+        inputs.extend(
+            window
+                .arguments
+                .iter()
+                .chain(&window.partition_by_items)
+                .chain(
+                    window
+                        .order_by_items
+                        .iter()
+                        .map(|order| &order.order_by_item),
+                ),
+        )?;
+        return Ok((bind_window_function_info(ctx, window, child)?, inputs));
+    }
+
+    let mut groups = Vec::new();
+    let mut windows = Vec::new();
+    let mut scalar_items = Vec::new();
+    let mut current_window_key: Option<WindowGroupKey> = None;
+    let mut scalar_indexes = HashSet::new();
+    let mut partition_order_scalar_indexes = HashMap::new();
+
+    for window_info in window_infos {
+        let mut window_plan = Window {
+            span: window_info.span,
+            index: window_info.index,
+            function: window_info.func.clone(),
+            arguments: window_info.arguments.clone(),
+            partition_by: window_info.partition_by_items.clone(),
+            order_by: window_info.order_by_items.clone(),
+            frame: window_info.frame.clone(),
+            limit: None,
+            top: None,
+        };
+
+        let arguments = window_plan.arguments.clone();
+        for item in &mut window_plan.partition_by {
+            canonicalize_window_group_scalar_item(item, &mut partition_order_scalar_indexes);
+        }
+        for order in &mut window_plan.order_by {
+            canonicalize_window_group_scalar_item(
+                &mut order.order_by_item,
+                &mut partition_order_scalar_indexes,
+            );
+        }
+
+        let window_key = WindowGroupKey::from_window(&window_plan);
+        if current_window_key
+            .as_ref()
+            .is_some_and(|current| current != &window_key)
+        {
+            groups.push(WindowGroup {
+                windows: std::mem::take(&mut windows),
+                scalar_items: std::mem::take(&mut scalar_items),
+            });
+            scalar_indexes.clear();
+            partition_order_scalar_indexes.clear();
+        }
+        current_window_key = Some(window_key);
+
+        for item in arguments.iter() {
+            if scalar_indexes.insert(item.index) {
+                scalar_items.push(item.clone());
+            }
+        }
+        for item in &window_plan.partition_by {
+            if scalar_indexes.insert(item.index) {
+                scalar_items.push(item.clone());
+            }
+        }
+        for order in &window_plan.order_by {
+            if scalar_indexes.insert(order.order_by_item.index) {
+                scalar_items.push(order.order_by_item.clone());
+            }
+        }
+        windows.push(window_plan);
+    }
+
+    groups.push(WindowGroup {
+        windows,
+        scalar_items,
+    });
+    groups.sort_by_key(|group| {
+        group
+            .windows
+            .first()
+            .is_none_or(|window| window.partition_by.is_empty())
+    });
+
+    // Prefer the outermost group's result when several groups evaluate the
+    // same expression, so consumers do not retain an earlier duplicate column.
+    for group in groups.iter().rev() {
+        inputs.extend(&group.scalar_items)?;
+    }
+    let child = groups.into_iter().fold(child, |child, window_group| {
+        SExpr::create_unary(Arc::new(window_group.into()), Arc::new(child))
+    });
+    Ok((child, inputs))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowGroupKey {
+    partition_by: Vec<ScalarExpr>,
+}
+
+impl WindowGroupKey {
+    fn from_window(window: &Window) -> Self {
+        Self {
+            partition_by: window
+                .partition_by
+                .iter()
+                .map(|item| item.scalar.clone())
+                .collect(),
+        }
+    }
+}
+
+fn canonicalize_window_group_scalar_item(
+    item: &mut ScalarItem,
+    scalar_item_indexes: &mut HashMap<ScalarExpr, Symbol>,
+) {
+    if let Some(index) = scalar_item_indexes.get(&item.scalar) {
+        item.index = *index;
+        return;
+    }
+
+    scalar_item_indexes.insert(item.scalar.clone(), item.index);
 }
 
 impl Binder {

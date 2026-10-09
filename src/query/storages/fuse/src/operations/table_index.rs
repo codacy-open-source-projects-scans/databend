@@ -129,8 +129,7 @@ pub async fn do_refresh_table_index(
     // Read data here to keep the order of blocks in segment.
     let projection = Projection::Columns(field_indices);
 
-    let block_reader =
-        fuse_table.create_block_reader(ctx.clone(), projection, false, false, false)?;
+    let block_reader = fuse_table.create_block_reader(ctx.clone(), projection, false)?;
 
     let meta_locations = fuse_table.meta_location_generator().clone();
     let segment_reader = MetaReaders::segment_info_reader(fuse_table.get_operator(), table_schema);
@@ -264,7 +263,7 @@ pub async fn do_refresh_table_index(
             fuse_table,
             ctx.clone(),
             snapshot.segments.clone(),
-            vec![],
+            Default::default(),
             vec![],
             Statistics::default(),
             MutationKind::Refresh,
@@ -279,13 +278,14 @@ pub async fn do_refresh_table_index(
             fuse_table,
             ctx.clone(),
             None,
-            vec![],
+            Default::default(),
             snapshot_gen.clone(),
             input,
             None,
             Some(prev_snapshot_id),
             None,
             table_meta_timestamps,
+            false,
         )
     })?;
 
@@ -318,6 +318,7 @@ fn build_refresh_index_arg(
                         arg.column_id(),
                         arg.gram_size(),
                         arg.bloom_size(),
+                        arg.hash_algorithm(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -817,6 +818,7 @@ impl AsyncTransform for NgramIndexTransform {
             block_meta: new_block_meta,
             draft_virtual_block_meta: None,
             column_hlls: column_hlls.clone().map(BlockHLLState::Serialized),
+            column_top_n: None,
         };
 
         let entry = MutationLogEntry::ReplacedBlock {
@@ -825,6 +827,7 @@ impl AsyncTransform for NgramIndexTransform {
         };
         let meta = MutationLogs {
             entries: vec![entry],
+            ..Default::default()
         };
         let new_block = DataBlock::empty_with_meta(Box::new(meta));
         Ok(new_block)
@@ -883,7 +886,7 @@ impl AsyncTransform for VectorIndexTransform {
 
         let vector_index_location = self.meta_locations.block_vector_index_location();
         let existing_location = &block_meta.vector_index_location;
-        let state = builder
+        let vector_result = builder
             .finalize_with_existing(
                 self.operator.clone(),
                 &self.settings,
@@ -893,15 +896,24 @@ impl AsyncTransform for VectorIndexTransform {
                 index_meta.clone(),
             )
             .await?;
+        let Some(state) = vector_result.index_state else {
+            return Err(ErrorCode::Internal("Failed to build vector index"));
+        };
 
         new_block_meta.vector_index_size = Some(state.size);
         new_block_meta.vector_index_location = Some(vector_index_location);
+        let mut vector_stats = block_meta.vector_stats.clone().unwrap_or_default();
+        if let Some(new_vector_stats) = vector_result.vector_stats {
+            vector_stats.extend(new_vector_stats);
+        }
+        new_block_meta.vector_stats = (!vector_stats.is_empty()).then_some(vector_stats);
         BlockWriter::write_down_vector_index_state(&self.operator, Some(state)).await?;
 
         let extended_block_meta = ExtendedBlockMeta {
             block_meta: new_block_meta,
             draft_virtual_block_meta: None,
             column_hlls: column_hlls.clone().map(BlockHLLState::Serialized),
+            column_top_n: None,
         };
 
         let entry = MutationLogEntry::ReplacedBlock {
@@ -910,6 +922,7 @@ impl AsyncTransform for VectorIndexTransform {
         };
         let meta = MutationLogs {
             entries: vec![entry],
+            ..Default::default()
         };
         let new_block = DataBlock::empty_with_meta(Box::new(meta));
         Ok(new_block)
@@ -1007,6 +1020,7 @@ impl AsyncTransform for SpatialIndexTransform {
             block_meta: new_block_meta,
             draft_virtual_block_meta: None,
             column_hlls: column_hlls.clone().map(BlockHLLState::Serialized),
+            column_top_n: None,
         };
 
         let entry = MutationLogEntry::ReplacedBlock {
@@ -1015,6 +1029,7 @@ impl AsyncTransform for SpatialIndexTransform {
         };
         let meta = MutationLogs {
             entries: vec![entry],
+            ..Default::default()
         };
         let new_block = DataBlock::empty_with_meta(Box::new(meta));
         Ok(new_block)

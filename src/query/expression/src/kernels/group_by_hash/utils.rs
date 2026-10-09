@@ -23,6 +23,7 @@ use crate::types::NullableColumn;
 use crate::types::NumberColumn;
 use crate::types::binary::BinaryColumnBuilder;
 use crate::types::decimal::DecimalColumn;
+use crate::types::number::Number;
 use crate::types::vector::VectorScalarRef;
 use crate::utils::bitmap::normalize_bitmap_column;
 use crate::with_decimal_type;
@@ -64,7 +65,7 @@ pub unsafe fn serialize_column_binary(column: &Column, row: usize, row_space: &m
             Column::Null { .. } | Column::EmptyArray { .. } | Column::EmptyMap { .. } => {}
             Column::Number(v) => with_number_mapped_type!(|NUM_TYPE| match v {
                 NumberColumn::NUM_TYPE(v) => {
-                    row_space.store_value_uncheckd(&v[row]);
+                    row_space.store_value_uncheckd(&v[row].canonicalize());
                 }
             }),
             Column::Decimal(v) => {
@@ -131,7 +132,7 @@ pub unsafe fn serialize_column_binary(column: &Column, row: usize, row_space: &m
                 with_vector_number_type!(|NUM_TYPE| match scalar {
                     VectorScalarRef::NUM_TYPE(vals) => {
                         for val in vals {
-                            row_space.store_value_uncheckd(val);
+                            row_space.store_value_uncheckd(&val.canonicalize());
                         }
                     }
                 })
@@ -146,7 +147,7 @@ fn normalize_bitmap_in_column(column: Column) -> Column {
             std::borrow::Cow::Borrowed(_) => Column::Bitmap(col),
             std::borrow::Cow::Owned(col) => Column::Bitmap(col),
         },
-        Column::Nullable(box nullable) => {
+        Column::Nullable(deref!(nullable)) => {
             let (col, validity) = nullable.destructure();
             Column::Nullable(Box::new(NullableColumn::<AnyType> {
                 column: normalize_bitmap_in_column(col),

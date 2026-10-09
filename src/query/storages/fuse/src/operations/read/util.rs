@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use databend_common_catalog::merge_into_join::MergeIntoJoinType;
+use databend_common_catalog::plan::BlockMetaOptions;
 use databend_common_catalog::plan::InternalColumnMeta;
 use databend_common_catalog::plan::gen_mutation_stream_meta;
 use databend_common_catalog::table_context::TableContext;
@@ -43,13 +44,11 @@ pub(crate) fn add_data_block_meta(
     fuse_part: &FuseBlockPartInfo,
     offsets: Option<RoaringTreemap>,
     base_block_ids: Option<Scalar>,
-    update_stream_columns: bool,
-    query_internal_columns: bool,
-    need_reserve_block_info: bool,
+    block_meta_options: &BlockMetaOptions,
 ) -> Result<DataBlock> {
     // for merge into target build
     let mut meta: Option<BlockMetaInfoPtr> =
-        if need_reserve_block_info && fuse_part.block_meta_index.is_some() {
+        if block_meta_options.reserve_block_index && fuse_part.block_meta_index.is_some() {
             let block_meta_index = fuse_part.block_meta_index.as_ref().unwrap();
             Some(Box::new(BlockMetaIndex {
                 segment_idx: block_meta_index.segment_idx,
@@ -59,13 +58,13 @@ pub(crate) fn add_data_block_meta(
             None
         };
 
-    if update_stream_columns {
+    if block_meta_options.update_stream_columns {
         // Fill `BlockMetaInfoPtr` if update stream columns
         let stream_meta = gen_mutation_stream_meta(meta, &fuse_part.location)?;
         meta = Some(Box::new(stream_meta));
     }
 
-    if query_internal_columns {
+    if block_meta_options.query_internal_columns {
         // Fill `BlockMetaInfoPtr` if query internal columns
         let block_meta = fuse_part.block_meta_index().unwrap();
 
@@ -79,7 +78,7 @@ pub(crate) fn add_data_block_meta(
                     debug_assert_eq!(rows.len(), scores.len());
                     let mut filtered_rows = Vec::with_capacity(rows.len());
                     let mut filtered_scores = Vec::with_capacity(scores.len());
-                    for (idx, score) in rows.into_iter().zip(scores.into_iter()) {
+                    for (idx, score) in rows.into_iter().zip(scores) {
                         if offsets.contains(idx as u64) {
                             let rank = offsets.rank(idx as u64);
                             debug_assert!(rank > 0);

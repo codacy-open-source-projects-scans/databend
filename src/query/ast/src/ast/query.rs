@@ -743,18 +743,36 @@ impl Display for ChangesInterval {
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum TemporalClause {
-    TimeTravel(TimeTravelPoint),
+    TimeTravel {
+        point: TimeTravelPoint,
+        no_check: bool,
+    },
     Changes(ChangesInterval),
 }
 
 impl Display for TemporalClause {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            TemporalClause::TimeTravel(point) => {
-                write!(f, "AT {}", point)?;
+            TemporalClause::TimeTravel { point, no_check } => {
+                if *no_check {
+                    write!(f, "AT ")?;
+                    match point {
+                        TimeTravelPoint::Snapshot(expr) => {
+                            write!(f, "(SNAPSHOT => {expr}, NO_CHECK => true)")?;
+                        }
+                        TimeTravelPoint::Timestamp(ts) => {
+                            write!(f, "(TIMESTAMP => {ts}, NO_CHECK => true)")?;
+                        }
+                        _ => {
+                            write!(f, "{point}")?;
+                        }
+                    }
+                } else {
+                    write!(f, "AT {point}")?;
+                }
             }
             TemporalClause::Changes(changes) => {
-                write!(f, "{}", changes)?;
+                write!(f, "{changes}")?;
             }
         }
         Ok(())
@@ -1058,6 +1076,9 @@ impl Display for TableReference {
                     JoinOperator::RightAsof => {
                         write!(f, " ASOF RIGHT JOIN")?;
                     }
+                    JoinOperator::FullAsof => {
+                        write!(f, " ASOF FULL JOIN")?;
+                    }
                     JoinOperator::InnerAny => {
                         write!(f, " INNER ANY JOIN")?;
                     }
@@ -1114,7 +1135,7 @@ pub struct TableAlias {
 
 impl Display for TableAlias {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{}", &self.name)?;
+        write!(f, "{}", self.name)?;
         if !self.columns.is_empty() {
             write!(f, "(")?;
             write_comma_separated_list(f, &self.columns)?;
@@ -1149,6 +1170,7 @@ pub enum JoinOperator {
     Asof,
     LeftAsof,
     RightAsof,
+    FullAsof,
     // Any
     InnerAny,
     LeftAny,

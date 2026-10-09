@@ -19,11 +19,13 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use bytes::Bytes;
 use databend_common_column::binview::BinaryViewColumnGeneric;
+use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
 use databend_common_expression::DataSchema;
+use databend_common_expression::ScalarRef;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableSchema;
 use databend_common_expression::types::Buffer;
@@ -37,12 +39,14 @@ use super::BLOCK_SIZE;
 use super::BLOOM_FILTER_INDEX_SIZE;
 use super::COMPRESSION;
 use super::FILE_SIZE;
+use super::INVERTED_INDEX_METAS;
 use super::LOCATION_PATH;
 use super::ROW_COUNT;
 use super::block_meta::AbstractBlockMeta;
 use super::block_meta::ColumnOrientedBlockMeta;
 use super::meta_name;
 use super::stat_name;
+use crate::meta::BlockIndexMeta;
 use crate::meta::BlockMeta;
 use crate::meta::CompactSegmentInfo;
 use crate::meta::MetaCompression;
@@ -166,6 +170,19 @@ impl ColumnOrientedSegment {
             .clone()
     }
 
+    pub fn inverted_index_metas(&self, row: usize) -> Result<Option<Vec<BlockIndexMeta>>> {
+        let Some(column) = self.col_by_name(&[INVERTED_INDEX_METAS]) else {
+            return Ok(None);
+        };
+        match column.index(row) {
+            None | Some(ScalarRef::Null) => Ok(None),
+            Some(ScalarRef::Binary(bytes)) => decode(&MetaEncoding::MessagePack, bytes).map(Some),
+            Some(value) => Err(ErrorCode::Internal(format!(
+                "invalid inverted index metadata value: {value:?}"
+            ))),
+        }
+    }
+
     pub fn compression_col(&self) -> Buffer<u8> {
         self.col_by_name(&[COMPRESSION])
             .unwrap()
@@ -270,7 +287,7 @@ impl AbstractSegment for ColumnOrientedSegment {
             // TODO(Sky): Construct the optimal props, enabling compression, encoding, etc., if performance is better.
             let props = Some(
                 WriterProperties::builder()
-                    .set_max_row_group_size(usize::MAX)
+                    .set_max_row_group_row_count(Some(usize::MAX))
                     .build(),
             );
             let arrow_schema = Arc::new(Schema::from(&self.segment_schema));

@@ -35,6 +35,7 @@ use databend_common_tracing::Config as LogConfig;
 use databend_meta_client::DEFAULT_GRPC_MESSAGE_SIZE;
 use databend_meta_client::RpcClientConf;
 use databend_meta_client::RpcClientTlsConfig;
+use databend_meta_client::Secret;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -43,6 +44,7 @@ pub use super::config::CacheStorageTypeConfig;
 use super::config::Config;
 pub use super::config::DiskCacheConfig;
 pub use super::config::DiskCacheKeyReloadPolicy;
+pub use super::config::LineageConfig;
 pub use super::config::MetaConfig;
 use super::config::QueryConfig as OuterQueryConfig;
 pub use super::config::TaskConfig;
@@ -56,6 +58,8 @@ use crate::BuiltInConfig;
 pub struct InnerConfig {
     // Query engine config.
     pub query: QueryConfig,
+
+    pub lineage: LineageConfig,
 
     pub log: LogConfig,
 
@@ -167,6 +171,7 @@ impl Debug for InnerConfig {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("InnerConfig")
             .field("query", &self.query.sanitize())
+            .field("lineage", &self.lineage)
             .field("log", &self.log)
             .field("meta", &self.meta)
             .field("storage", &self.storage)
@@ -293,7 +298,7 @@ impl MetaConfig {
             embedded_dir,
             endpoints: self.endpoints.clone(),
             username: self.username.clone(),
-            password: self.password.clone(),
+            password: Secret::new(self.password.clone()),
             tls_conf: if self.is_tls_enabled() {
                 Some(self.to_rpc_client_tls_config())
             } else {
@@ -426,6 +431,10 @@ pub struct SpillConfig {
     /// bytes limit).
     pub sort_spilling_disk_quota_ratio: u64,
 
+    /// Maximum percentage of the global local spill quota that materialized
+    /// CTE execution may use for one query.
+    pub materialized_cte_spilling_disk_quota_ratio: u64,
+
     /// Maximum percentage of the global local spill quota that window
     /// partitioners may use for one query.
     pub window_partition_spilling_disk_quota_ratio: u64,
@@ -433,9 +442,6 @@ pub struct SpillConfig {
     /// Maximum percentage of the global local spill quota that HTTP
     /// result-set spilling may use for one query.
     pub result_set_spilling_disk_quota_ratio: u64,
-
-    /// Total memory for the spill buffer pool in bytes.
-    pub buffer_pool_memory: u64,
 
     /// Number of worker tasks in the spill buffer pool.
     pub buffer_pool_workers: usize,
@@ -487,6 +493,11 @@ impl SpillConfig {
         self.quota_bytes_from_ratio(self.sort_spilling_disk_quota_ratio)
     }
 
+    /// Per-query quota for materialized CTE execution.
+    pub fn materialized_cte_spill_bytes_limit(&self) -> usize {
+        self.quota_bytes_from_ratio(self.materialized_cte_spilling_disk_quota_ratio)
+    }
+
     /// Per-query quota for window partitioners.
     pub fn window_partition_spill_bytes_limit(&self) -> usize {
         self.quota_bytes_from_ratio(self.window_partition_spilling_disk_quota_ratio)
@@ -506,10 +517,10 @@ impl SpillConfig {
             storage_params: None,
             // Use the same defaults as the external config.
             sort_spilling_disk_quota_ratio: 60,
+            materialized_cte_spilling_disk_quota_ratio: 60,
             window_partition_spilling_disk_quota_ratio: 60,
             // TODO: keep 0 to avoid deleting local result-set spill dir before HTTP pagination finishes.
             result_set_spilling_disk_quota_ratio: 0,
-            buffer_pool_memory: 200 * 1024 * 1024,
             buffer_pool_workers: 2,
         }
     }
@@ -524,10 +535,10 @@ impl Default for SpillConfig {
             global_bytes_limit: u64::MAX,
             storage_params: None,
             sort_spilling_disk_quota_ratio: 60,
+            materialized_cte_spilling_disk_quota_ratio: 60,
             window_partition_spilling_disk_quota_ratio: 60,
             // TODO: keep 0 to avoid deleting local result-set spill dir before HTTP pagination finishes.
             result_set_spilling_disk_quota_ratio: 0,
-            buffer_pool_memory: 200 * 1024 * 1024,
             buffer_pool_workers: 2,
         }
     }
