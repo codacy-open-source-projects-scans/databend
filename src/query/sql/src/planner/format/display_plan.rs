@@ -21,20 +21,31 @@ use super::display::FormatOptions;
 use super::display::IdHumanizer;
 use super::display::MetadataIdHumanizer;
 use super::display::TreeHumanizer;
-use crate::optimizer::ir::Expr;
-use crate::optimizer::ir::RelExprKind;
+use crate::optimizer::ir::PExpr;
+use crate::optimizer::ir::SExpr;
 use crate::optimizer::ir::StatContext;
 use crate::plans::CreateTablePlan;
 use crate::plans::Plan;
 
-impl<K: RelExprKind> Expr<K> {
-    pub(crate) fn to_format_tree<I: IdHumanizer>(
-        &self,
-        id_humanizer: &I,
-    ) -> Result<FormatTreeNode> {
-        let operator_humanizer = DefaultOperatorHumanizer;
-        let tree_humanizer = TreeHumanizer::new(id_humanizer, &operator_humanizer);
-        tree_humanizer.humanize_expr(self)
+impl SExpr {
+    pub(crate) fn to_format_tree<I: IdHumanizer>(&self, ids: &I) -> Result<FormatTreeNode> {
+        TreeHumanizer::new(ids, &DefaultOperatorHumanizer).humanize_expr(self)
+    }
+
+    pub fn pretty_format(&self, metadata: &crate::Metadata, stats: &StatContext) -> Result<String> {
+        let ids = MetadataIdHumanizer::new(metadata, FormatOptions { verbose: false }, stats);
+        Ok(self.to_format_tree(&ids)?.format_pretty()?)
+    }
+}
+
+impl PExpr {
+    pub(crate) fn to_format_tree<I: IdHumanizer>(&self, ids: &I) -> Result<FormatTreeNode> {
+        TreeHumanizer::new(ids, &DefaultOperatorHumanizer).humanize_expr(self)
+    }
+
+    pub fn pretty_format(&self, metadata: &crate::Metadata, stats: &StatContext) -> Result<String> {
+        let ids = MetadataIdHumanizer::new(metadata, FormatOptions { verbose: false }, stats);
+        Ok(self.to_format_tree(&ids)?.format_pretty()?)
     }
 }
 
@@ -128,6 +139,7 @@ impl Plan {
             Plan::DropTableConstraint(_) => Ok("DropTableConstraint".to_string()),
             Plan::AlterTableClusterKey(_) => Ok("AlterTableClusterKey".to_string()),
             Plan::AlterTablePartitionBy(_) => Ok("AlterTablePartitionBy".to_string()),
+            Plan::DropTablePartitionKey(_) => Ok("DropTablePartitionKey".to_string()),
             Plan::DropTableClusterKey(_) => Ok("DropTableClusterKey".to_string()),
             Plan::AlterTableTtl(_) => Ok("AlterTableTtl".to_string()),
             Plan::RefreshTableCache(_) => Ok("RefreshTableCache".to_string()),
@@ -174,9 +186,6 @@ impl Plan {
             Plan::RefreshDynamicTable(_) => Ok("RefreshDynamicTable".to_string()),
 
             // Indexes
-            Plan::CreateIndex(_) => Ok("CreateIndex".to_string()),
-            Plan::DropIndex(_) => Ok("DropIndex".to_string()),
-            Plan::RefreshIndex(_) => Ok("RefreshIndex".to_string()),
             Plan::CreateTableIndex(_) => Ok("CreateTableIndex".to_string()),
             Plan::DropTableIndex(_) => Ok("DropTableIndex".to_string()),
             Plan::RefreshTableIndex(_) => Ok("RefreshTableIndex".to_string()),
